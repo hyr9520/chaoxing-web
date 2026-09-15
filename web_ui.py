@@ -1119,6 +1119,8 @@ PAGE = """<!DOCTYPE html>
       <span id="picked" class="tag">已选 0</span>
       <button class="ghost" id="btnAll">全选</button>
       <button class="ghost" id="btnNone">全不选</button>
+      <button class="ghost" id="btnAllQuiz">全选测验</button>
+      <button class="ghost" id="btnNoQuiz">全不选测验</button>
       <button class="ghost" id="btnAllWork">全选作业</button>
       <button class="ghost" id="btnNoWork">全不选作业</button>
       <button id="btnStart">开始</button>
@@ -1382,10 +1384,15 @@ $('btnLogin').onclick = async () => {
 };
 
 // ---- 课程列表 ----
-// 每门课可以单独勾「刷课」和「作业」，也可用上方"全选/全选作业"批量操作。
+// 每门课可以单独勾「视频 / 测验 / 作业」三个维度，也可用上方按钮批量操作。
 // 默认**全部不勾**（2026-09-14 改）：此前默认把每门课的"刷课"都预勾上，
 // 登录后直接点「开始」会把整个账号的课程全刷一遍（含不该动的正式课）。
-// 要批量请点"全选"；只刷一部分就逐门勾。
+//
+// 2026-09-15 拆维度：原「刷课」= 视频 + 章节测验（两者同属章节任务点，绑在一起跑）。
+// 用户要求能单做测验而不刷视频，故拆成两个独立勾选框：
+//   视频 → 只放视频/音频任务点
+//   测验 → 只做章节检测（workid）
+// 三个都不勾的课程不会被提交（课程 ID 不进任何列表）。
 function render() {
   $('list').innerHTML = courses.map((c, i) =>
     `<label class="course" data-i="${i}">
@@ -1393,11 +1400,12 @@ function render() {
        <div><div class="t">${escapeHtml(c.title)}</div>
        <div class="m">课程ID ${c.courseId} · 班级ID ${c.clazzId}</div>
        <div class="modes">
-         <span class="mode"><input type="checkbox" class="ck-video2" data-i="${i}">刷课</span>
+         <span class="mode"><input type="checkbox" class="ck-video2" data-i="${i}">视频</span>
+         <span class="mode"><input type="checkbox" class="ck-quiz" data-i="${i}">测验</span>
          <span class="mode"><input type="checkbox" class="ck-work" data-i="${i}">作业</span>
        </div></div>
      </label>`).join('');
-  // 主勾选框 = 「刷课」勾选框，两者联动
+  // 主勾选框 = 「视频」勾选框，两者联动
   $('list').querySelectorAll('input.ck-video').forEach(cb => cb.onchange = () => {
     const i = cb.dataset.i;
     const w = $('list').querySelector(`input.ck-video2[data-i="${i}"]`);
@@ -1405,13 +1413,25 @@ function render() {
     cb.closest('.course').classList.toggle('on', cb.checked);
     update();
   });
+  // 测验：只做章节测验，不碰视频。主勾选框点亮保证该课程会被提交。
+  $('list').querySelectorAll('input.ck-quiz').forEach(cb => cb.onchange = () => {
+    const i = cb.dataset.i;
+    const v = $('list').querySelector(`input.ck-video2[data-i="${i}"]`);
+    const w = $('list').querySelector(`input.ck-work[data-i="${i}"]`);
+    const main = $('list').querySelector(`input.ck-video[data-i="${i}"]`);
+    if (cb.checked && main) { main.checked = true; }
+    const any = (v && v.checked) || cb.checked || (w && w.checked);
+    cb.closest('.course').classList.toggle('on', any);
+    update();
+  });
   $('list').querySelectorAll('input.ck-work').forEach(cb => cb.onchange = () => {
     const i = cb.dataset.i;
     const v = $('list').querySelector(`input.ck-video2[data-i="${i}"]`);
+    const q = $('list').querySelector(`input.ck-quiz[data-i="${i}"]`);
     const main = $('list').querySelector(`input.ck-video[data-i="${i}"]`);
     // 只勾作业不刷课：主勾选框也点亮，保证该课程会被提交
     if (cb.checked && v && main) { main.checked = true; }
-    const any = (v && v.checked) || cb.checked;
+    const any = (v && v.checked) || (q && q.checked) || cb.checked;
     cb.closest('.course').classList.toggle('on', any);
     update();
   });
@@ -1461,15 +1481,19 @@ function collectJobs() {
   return [...$('list').querySelectorAll('.course')].map(el => {
     const i = +el.dataset.i;
     const v = el.querySelector('input.ck-video2');
+    const q = el.querySelector('input.ck-quiz');
     const w = el.querySelector('input.ck-work');
-    return {i, video: !!(v && v.checked), work: !!(w && w.checked)};
-  }).filter(x => x.video || x.work);
+    return {i, video: !!(v && v.checked), quiz: !!(q && q.checked),
+            work: !!(w && w.checked)};
+  }).filter(x => x.video || x.quiz || x.work);
 }
 function update() {
   const picked = collectJobs();
   const nv = picked.filter(x => x.video).length;
+  const nq = picked.filter(x => x.quiz).length;
   const nw = picked.filter(x => x.work).length;
-  $('picked').textContent = `已选 ${picked.length} 门（刷课 ${nv} · 作业 ${nw}）`;
+  $('picked').textContent =
+    `已选 ${picked.length} 门（视频 ${nv} · 测验 ${nq} · 作业 ${nw}）`;
   $('picked').className = 'tag' + (picked.length ? ' ok' : '');
 }
 function escapeHtml(s) {
@@ -1486,17 +1510,35 @@ const setAll = v => {
   });
   update();
 };
-// 全选/全不选作业（不动刷课勾选）
+// 全选/全不选作业（不动视频、测验勾选）
 const setAllWork = v => {
   $('list').querySelectorAll('.course').forEach(el => {
     if (el.classList.contains('hide')) return;   // 只作用于当前筛选出的课程
     const v2 = el.querySelector('input.ck-video2');
+    const q = el.querySelector('input.ck-quiz');
     const w = el.querySelector('input.ck-work');
     const main = el.querySelector('input.ck-video');
     if (w) { w.checked = v; }
     // 只勾作业不刷课：主勾选框也点亮，保证该课程会被提交
     if (v && w && w.checked && main) main.checked = true;
-    el.classList.toggle('on', !!(v2 && v2.checked) || !!(w && w.checked));
+    el.classList.toggle('on',
+      !!(v2 && v2.checked) || !!(q && q.checked) || !!(w && w.checked));
+  });
+  update();
+};
+// 全选/全不选测验（不动视频、作业勾选）
+const setAllQuiz = v => {
+  $('list').querySelectorAll('.course').forEach(el => {
+    if (el.classList.contains('hide')) return;   // 只作用于当前筛选出的课程
+    const v2 = el.querySelector('input.ck-video2');
+    const q = el.querySelector('input.ck-quiz');
+    const w = el.querySelector('input.ck-work');
+    const main = el.querySelector('input.ck-video');
+    if (q) { q.checked = v; }
+    // 只勾测验不刷视频：主勾选框也点亮，保证该课程会被提交
+    if (v && q && q.checked && main) main.checked = true;
+    el.classList.toggle('on',
+      !!(v2 && v2.checked) || !!(q && q.checked) || !!(w && w.checked));
   });
   update();
 };
@@ -1504,6 +1546,8 @@ $('btnAll').onclick = () => setAll(true);
 $('btnNone').onclick = () => setAll(false);
 if ($('btnAllWork')) $('btnAllWork').onclick = () => setAllWork(true);
 if ($('btnNoWork')) $('btnNoWork').onclick = () => setAllWork(false);
+if ($('btnAllQuiz')) $('btnAllQuiz').onclick = () => setAllQuiz(true);
+if ($('btnNoQuiz')) $('btnNoQuiz').onclick = () => setAllQuiz(false);
 if ($('courseFilter')) $('courseFilter').oninput = applyFilter;
 
 // ---- 切换账号：清掉服务端登录态，回登录页 ----
@@ -1521,15 +1565,16 @@ $('btnLogout').onclick = async () => {
 // ---- 开始 ----
 $('btnStart').onclick = async () => {
   const picked = collectJobs();
-  if (!picked.length) { $('msg2').textContent = '请至少勾选一门课程并选择内容（刷课/作业）'; return; }
+  if (!picked.length) { $('msg2').textContent = '请至少勾选一门课程并选择内容（视频/测验/作业）'; return; }
   // 二次确认（2026-09-14）：误触即开跑，而章节测验提交后不可重做、无法回滚，
   // 所以把"具体要刷哪几门"列出来让用户过一眼
   const nv = picked.filter(x => x.video).length;
+  const nq = picked.filter(x => x.quiz).length;
   const nw = picked.filter(x => x.work).length;
   const names = picked.slice(0, 6)
     .map(x => '· ' + ((courses[x.i] || {}).title || '?')).join('\\n');
   const more = picked.length > 6 ? `\\n… 共 ${picked.length} 门` : '';
-  if (!confirm(`即将开始：刷课 ${nv} 门 · 作业 ${nw} 门\\n\\n`
+  if (!confirm(`即将开始：视频 ${nv} 门 · 测验 ${nq} 门 · 作业 ${nw} 门\\n\\n`
                + names + more + '\\n\\n确认无误？')) return;
   const idx = picked.map(x => x.i);
   // 启动要读章节列表，通常几秒；没有即时反馈会让人以为没点上而反复点击
@@ -1541,6 +1586,7 @@ $('btnStart').onclick = async () => {
       body: JSON.stringify({indices: idx, speed: parseFloat($('speed').value) || 1,
         jobs: parseInt($('jobs').value) || 1,
         video: picked.filter(x => x.video).map(x => x.i),
+        quiz: picked.filter(x => x.quiz).map(x => x.i),
         work: picked.filter(x => x.work).map(x => x.i)})}).then(r => r.json());
     if (!r.ok) { $('msg2').textContent = r.msg || '启动失败'; return; }
     showStep(3);
@@ -1904,21 +1950,36 @@ def _do_start(indices, data):
                 out.add(_course_id(state["courses"][i]))
         return out
 
-    if "video_course_ids" in data or "work_course_ids" in data:
+    # 2026-09-15 ——— 内容维度拆成三个独立勾选框：视频 / 测验 / 作业 ———
+    #
+    # 背景：章节测验（workid）此前只能跟着"刷课"一起做（它和视频同属章节任务点，
+    # 由 process_chapter 遍历处理），没法规避"我只想做测验、不想刷视频"。
+    # 用户明确要求拆开，并要"默认全做"。
+    #
+    # 三个维度的落地方式：
+    #   视频 video → 走章节遍历，only_kinds 含 "video"
+    #   测验 quiz  → 走章节遍历，only_kinds 含 "quiz"
+    #   作业 work  → 走事后独立的 _run_homeworks（不受 only_kinds 影响）
+    # 若某门课只勾了测验，就只遍历章节、只答题、视频一律跳过。
+    has_selection = any(k in data for k in ("video", "work", "quiz"))
+    if "video_course_ids" in data or "work_course_ids" in data or "quiz_course_ids" in data:
         # 自动恢复：已经是 courseId
         video_ids = {str(x) for x in (data.get("video_course_ids") or [])}
         work_ids = {str(x) for x in (data.get("work_course_ids") or [])}
-        chosen = video_ids | work_ids
+        quiz_ids = {str(x) for x in (data.get("quiz_course_ids") or [])}
+        chosen = video_ids | work_ids | quiz_ids
         picked = [c for c in state["courses"] if _course_id(c) in chosen]
-    elif "video" in data or "work" in data:
+    elif has_selection:
         # 前端启动：下标 → courseId
         video_ids = _ids_from_indices("video")
         work_ids = _ids_from_indices("work")
-        chosen = video_ids | work_ids
+        quiz_ids = _ids_from_indices("quiz")
+        chosen = video_ids | work_ids | quiz_ids
         picked = [c for c in state["courses"] if _course_id(c) in chosen]
     else:
-        # 旧调用方：不区分内容，全部按"刷课"处理
+        # 旧调用方：不区分内容，全部按"刷课"处理（含测验），保持兼容
         video_ids = work_ids = None
+        quiz_ids = set()
         picked = [state["courses"][i] for i in indices
                   if 0 <= i < len(state["courses"])]
 
@@ -1932,6 +1993,20 @@ def _do_start(indices, data):
     if video_ids is not None:
         cfg["video_course_ids"] = sorted(video_ids)
         cfg["work_course_ids"] = sorted(work_ids)
+        cfg["quiz_course_ids"] = sorted(quiz_ids)
+        # 章节遍历型的白名单：某门课勾了视频或测验才需要遍历该课章节。
+        # 只勾"作业"的课不在此列（它走 _run_homeworks，不需要遍历章节）。
+        walk_ids = video_ids | quiz_ids
+        cfg["walk_course_ids"] = sorted(walk_ids)
+        # 全局内容开关：本次任务里"视频"和"测验"各自是否至少有一门被勾。
+        # 用于 process_job 的 only_kinds —— 注意这是**全局**粒度，
+        # 逐课粒度由 walk_course_ids 控制（不在集合里的课根本不遍历）。
+        only = set()
+        if video_ids:
+            only.add("video")
+        if quiz_ids:
+            only.add("quiz")
+        cfg["only_kinds"] = sorted(only)
     _launch(picked, cfg)
     return True, ""
 
@@ -2128,26 +2203,32 @@ def _work(courses, config):
         # 两项都按 courseId 匹配，与恢复路径保持一致。
         video_ids = config.get("video_course_ids")
         work_ids = config.get("work_course_ids")
+        quiz_ids = config.get("quiz_course_ids") or []
+        # walk_ids：需要遍历章节的课（勾了视频或测验）。
+        # 旧调用方没这个键 → 回退成"旧行为"（video_ids 为 None 时全遍历）。
+        walk_ids = config.get("walk_course_ids")
+        if walk_ids is None:
+            walk_ids = None if video_ids is None else sorted(set(video_ids) | set(quiz_ids))
         # 运行看板（2026-09-14）：先把"这次一共要碰哪几门课"登记进去，
         # 界面才能显示"剩余 N 门（排队中）"，而不是只有一门在动、其余无影无踪。
         run_tracker.reset()
         for c in courses:
             cid = _course_id(c)
-            do_video = (video_ids is None) or (cid in video_ids)
+            do_walk = (walk_ids is None) or (cid in walk_ids)
             do_work = bool(work_ids) and (cid in work_ids)
-            if do_video:
+            if do_walk:
                 run_tracker.begin(cid, "video", c.get("title", ""))
             if do_work:
                 run_tracker.begin(cid, "homework", c.get("title", ""))
-            if not do_video and not do_work:
+            if not do_walk and not do_work:
                 run_tracker.mark_skip(cid, "未勾选任何内容")
-            elif not do_video:
-                run_tracker.mark_skip(cid, "未勾选刷课")
+            elif not do_walk:
+                run_tracker.mark_skip(cid, "只勾了作业，不遍历章节")
         tasks = []
         point_map = {}      # 任务点名 → courseId（供进度解析反查归属）
         for c in courses:
             cid = _course_id(c)
-            do_video = (video_ids is None) or (cid in video_ids)
+            do_walk = (walk_ids is None) or (cid in walk_ids)
             print(f"读取章节: {c.get('title', '')}")
             try:
                 points = state["chaoxing"].get_course_point(
@@ -2165,8 +2246,8 @@ def _work(courses, config):
                 run_tracker.note(cid, "无章节任务点")
                 run_tracker.finish(cid, "video", "done")
                 continue
-            if not do_video:
-                print("  [跳过刷课] 该课程未勾选刷课，仅处理作业")
+            if not do_walk:
+                print("  [跳过章节] 该课程只勾了作业，不遍历章节（作业在后续阶段处理）")
                 continue
             run_tracker.set_tasks(cid, len(pts))
             for i, point in enumerate(pts):

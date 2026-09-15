@@ -280,8 +280,41 @@ def init_chaoxing(common_config, tiku_config, config_path=None):
     return chaoxing
 
 
-def process_job(chaoxing: Chaoxing, course: dict, job: dict, job_info: dict, speed: float) -> StudyResult:
-    """处理单个任务点"""
+def process_job(chaoxing: Chaoxing, course: dict, job: dict, job_info: dict, speed: float,
+                only_kinds: set | None = None) -> StudyResult:
+    """处理单个任务点。
+
+    only_kinds (2026-09-15 新增)：内容类型白名单，取值 {"video", "quiz"} 的任意组合。
+    只处理白名单里的类型，其余**直接跳过并按成功计**（不是失败 —— 用户没勾就是不想要，
+    标成失败会让章节反复重试）。
+
+    为什么需要它：章节测验（workid）此前只能跟着"刷课"一起做，
+    没法"只做测验不刷视频"。用户明确要求拆成三个独立勾选框
+    （视频 / 测验 / 作业），这里就是后端的执行点。
+
+    None = 不过滤（旧行为，全做），保证既有调用方零影响。
+    """
+    # 任务点归类：video/audio → 视频；workid → 测验；document/read/live → 其它。
+    #
+    # 白名单模式下**只做被勾选的类型**，"其它"（文档/阅读/直播）一律跳过 ——
+    # 语义是"用户勾了什么就只做什么"。历史上文档是跟着"刷课"顺带做的，
+    # 但那是因为没有独立开关；现在拆开了就不该再顺手做用户没勾的内容。
+    #
+    # 具体归属：
+    #   勾"视频" → 做 video/audio，顺带做 document/read（同属"看内容"一类，
+    #              且它们不是独立评分项，跳过它们会导致章节被判定未完成、
+    #              反而卡住后续测验，故保留）
+    #   勾"测验" → 只做 workid
+    kind = "video" if job["type"] in ("video", "audio", "document", "read") else (
+        "quiz" if job["type"] == "workid" else None)
+    if only_kinds is not None and kind is not None and kind not in only_kinds:
+        logger.debug(f"按勾选跳过任务点（{kind} 未勾选）: {course['title']} 任务ID: {job['jobid']}")
+        return StudyResult.SUCCESS
+    # 既不属于"视频类"也不属于"测验类"（如 live 直播）：白名单模式下跳过
+    if only_kinds is not None and kind is None:
+        logger.debug(f"按勾选跳过任务点（非勾选类型 {job['type']}）: {course['title']} 任务ID: {job['jobid']}")
+        return StudyResult.SUCCESS
+
     # 视频任务
     if job["type"] == "video":
         logger.trace(f"识别到视频任务, 任务章节: {course['title']} 任务ID: {job['jobid']}")
@@ -390,6 +423,10 @@ class JobProcessor:
         self.worker_num = config["jobs"]
         self.config = config
         self.retry_interval = config.get("retry_interval", 1.0)
+        # 内容类型白名单（2026-09-15）：{"video","quiz"} 的任意子集，None = 全做。
+        # 由前端"视频 / 测验 / 作业"三个勾选框决定，见 _do_start。
+        only = config.get("only_kinds")
+        self.only_kinds = set(only) if only else None
 
     def _finish_task(self):
         with self._lock:
@@ -469,7 +506,8 @@ class JobProcessor:
             # 还活着 -> 看门狗看到"线程存活"不重启 -> 永久僵死。
             # 更糟的是该任务点没有 task_done()，队列计数永久挂着。
             try:
-                task.result = process_chapter(self.chaoxing, task.course, task.point, self.speed)
+                task.result = process_chapter(self.chaoxing, task.course, task.point, self.speed,
+                                              self.only_kinds)
             except PauseInterrupt:
                 # 暂停信号：当前任务还没做完，放回队列后立刻让 worker 退出。
                 # 必须先于 BaseException 捕获——否则会被当成"任务失败"，
@@ -631,8 +669,9 @@ class JobProcessor:
             pass
 
 
-def process_chapter(chaoxing: Chaoxing, course: dict[str, Any], point: dict[str, Any], speed: float) -> ChapterResult:
-    """处理单个章节"""
+def process_chapter(chaoxing: Chaoxing, course: dict[str, Any], point: dict[str, Any], speed: float,
+                    only_kinds: set | None = None) -> ChapterResult:
+    """处理单个章节。only_kinds 见 process_job 的说明（None = 全做）。"""
     logger.info(f'当前章节: {point["title"]}')
     if point["has_finished"]:
         logger.info(f'章节：{point["title"]} 已完成所有任务点')
@@ -655,7 +694,7 @@ def process_chapter(chaoxing: Chaoxing, course: dict[str, Any], point: dict[str,
 
     job_results: list[StudyResult] = []
     for job in jobs:
-        result = process_job(chaoxing, course, job, job_info, speed)
+        result = process_job(chaoxing, course, job, job_info, speed, only_kinds)
         job_results.append(result)
 
     # 有视频在等平台判定：章节未完结但也不算失败，交后台等待线程收尾
