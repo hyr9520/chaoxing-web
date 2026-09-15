@@ -21,7 +21,7 @@ from tqdm import tqdm
 
 from api.answer import Tiku, TikuManual, CacheDAO, _assemble_subs
 from api.answer_check import (cut, check_submittable, is_listening_question,
-                              _is_letter_only)
+                              _is_letter_only, set_option_letters as _sol)
 from api.learned import LearnedAnswers, normalize_title
 from api.exceptions import RiskControlError, PauseInterrupt
 from api.cipher import AESCipher
@@ -45,6 +45,21 @@ from api.homework import (
 
 def get_timestamp():
     return str(int(time.time() * 1000))
+
+
+def _option_letters_of(options) -> set:
+    """从题目的 options 文本里抽出合法选项字母集（如 {"A","B","C","D"}）。
+
+    供 answer_check._is_letter_only 判定"连写字母"是否合法 —— 有了字母集，
+    "review"/"origin" 这类英文单词（含选项外的字母）就能被正确排除，
+    而 "ABC" 这种合法多选答案仍能通过。options 可能为空（听力/判断题），
+    此时返回空集合，调用方 set_option_letters 会退回长度兜底行为。
+    """
+    if not options:
+        return set()
+    text = str(options)
+    # 兼容 "A. xxx\nB. yyy" 与 "A、xxx" 两种前缀形态
+    return {m.group(1).upper() for m in re.finditer(r"(?m)^\s*([A-Za-z])[.、)．:：]?", text)}
 
 
 class SessionManager:
@@ -1493,7 +1508,20 @@ class Chaoxing:
                         # 不能再走下面"内容→字母"匹配 —— clean_res 会把 "ABC"
                         # 当成带编号的内容剥成 "BC" → 匹配失败 → 答案丢失走随机
                         # （实测 3.2 三道多选题全部随机，正是这条路径）
-                        if _is_letter_only(res):
+                        #
+                        # 2026-09-15 修 bug：_is_letter_only 依赖模块级"选项字母集"
+                        # 上下文，而主流程从未调用 set_option_letters() → 上下文
+                        # 恒为 None → 只能靠 len<=8 兜底，于是 AI 返回的英文单词
+                        # （如 "review"、"origin"）会被误判成选项字母直接提交。
+                        # 这里在判定前注入本题的合法选项字母集，判完立即清空，
+                        # 避免串题。
+                        _letters = _option_letters_of(q.get("options"))
+                        _sol(_letters)
+                        try:
+                            _is_pure_letters = _is_letter_only(res)
+                        finally:
+                            _sol(None)
+                        if _is_pure_letters:
                             answer = "".join(sorted(set(str(res).strip().upper())))
                         else:
                             # 多选处理

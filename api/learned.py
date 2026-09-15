@@ -234,6 +234,25 @@ class LearnedAnswers:
                 wl.insert(0, my_answer)
                 rec["wrong"] = wl[:5]          # 最多留 5 条
                 rec["wrong_at"] = _now()
+                # 2026-09-15 修 bug：判错时必须撤销已失效的 verified。
+                # 此前只增不减 —— 一道题先判对、后续再判错时，旧的 verified
+                # 会被永久保留，而 query()/query_all() 都**优先返回 verified**
+                # → 下次遇到该题直接交上已被平台证伪的答案，必错。
+                # 实测中招 5 条（acc3 听力题 3.5/3.6/3.7/3.9/3.10，
+                # verified_src=restore_20260911 从备份恢复的旧值）。
+                #
+                # 撤销规则：
+                #   cuo（全错）→ 整组答案已证伪，撤销 verified。
+                #   bandui（部分对）→ 只有当 verified 与本次提交的 my_answer
+                #     完全相同时才撤销（说明"整组全对"这个结论是错的）；
+                #     若两者不同，说明 verified 来自另一次作答，保留待考。
+                _v = rec.get("verified")
+                if _v and (mark == "cuo" or _v == my_answer):
+                    rec.pop("verified", None)
+                    rec.pop("verified_at", None)
+                    rec.pop("verified_src", None)
+                    rec["verified_revoked_at"] = _now()
+                    rec["verified_revoked_reason"] = mark
             data[title] = rec
             self._save()
 

@@ -272,7 +272,15 @@ def _pick_alternative(ans: str, wrong: list, q_info: dict) -> str:
 
 
 class Tiku(ABC):
-    CONFIG_PATH = os.path.join(os.getcwd(), "config.ini")
+    # 2026-09-15 修隐患：原来用 os.getcwd() 定位 config.ini，而这是**类属性、
+    # 在模块导入时求值** —— 一旦进程从项目根以外的地方启动（多实例管理器、
+    # 计划任务、双击 .bat 时 cwd 不同），CONFIG_PATH 就会指向错误的目录。
+    # 后果不只是读不到配置：_get_conf() 捕获 KeyError 后会把 self.DISABLE
+    # 置为 True，**整个题库功能被静默停用**，表现为"题库莫名不工作"。
+    # 改为以源码根为基准（与 api/config.py:data_dir()、api/logger.py 一致）。
+    # cwd 恰好在项目根时两种写法结果相同，故对现有启动方式零影响。
+    CONFIG_PATH = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.ini")
     DISABLE = False  # 停用标志
     SUBMIT = False  # 提交标志
     COVER_RATE = 0.8  # 覆盖率
@@ -392,14 +400,31 @@ class Tiku(ABC):
             except Exception as e:
                 logger.warning(f"读取学习库失败（不影响作答）：{e}")
                 _verified = ""
+            # 2026-09-15 补：与 query_all() 对齐，学习库值也要过形态校验。
+            # 此前 query() 直接返回 verified，若学习库里存的是脏值
+            # （旧版程序写入的拒答文本、或题型变更导致形态不符），
+            # 会被原样提交上去。query_all() 走的是"缓存层校验"，
+            # 单题路径缺了这道闸。
             if _verified:
-                logger.info(f"从学习库获取答案（已验证）：{q_info['title']} -> {_verified}")
-                return _verified
+                _ok = plausible_answer(_verified, q_info.get('type'))
+                if _ok or getattr(self, 'is_manual', False):
+                    logger.info(f"从学习库获取答案（已验证）：{q_info['title']} -> {_verified}")
+                    return _verified
+                logger.warning(
+                    f"学习库答案形态与题型不符，视为未命中重新查询："
+                    f"{q_info['title']} -> {_verified}")
 
         # 先过缓存（若存在章节检测错误反馈，说明处于重做模式，跳过缓存让大模型参考反馈重新作答）
         if not getattr(self, 'work_feedback', None):
             cache_dao = CacheDAO()
             answer = cache_dao.get_cache(q_info['title'])
+            # 2026-09-15 补：缓存形态校验（同 query_all() 的 plausible_answer 闸门），
+            # 拦住历史写入的拒答文本/格式垃圾，避免脏缓存被直接交上去。
+            if answer and not (plausible_answer(answer, q_info.get('type'))
+                               or getattr(self, 'is_manual', False)):
+                logger.warning(f"缓存答案形态非法，视为未命中重新查询："
+                               f"{q_info['title']} -> {answer}")
+                answer = None
             if answer:
                 # 缓存值若曾被平台判错，不可信 —— 与 query_all 一致，改走
                 # 重新分析（AI 会注入负反馈排除该错误答案）。
@@ -1470,27 +1495,39 @@ class TikuAdapter(Tiku):
         # 22 条听力题实测：[题干 + [] + 4 + 0] 与库中 hash 100% 一致。
         if type == 4:
             options = []
-        res = requests.post(
-            self.api,
-            json={
-                'question': q_info['title'],
-                'options': options,
-                'type': type
-            },
-            verify=False
-        )
+        # 2026-09-15 修 bug：此前 requests.post 没有 timeout —— TikuAdapter
+        # 一旦卡住（进程假死 / 端口被占但无响应），整个答题流程会无限期挂起，
+        # 表现为作业页一直转圈。加超时 + 异常兜底：超时就当未命中，回退下一个
+        # 题库（正常链路是 TikuAdapter,AI，AI 会兜底）。
+        try:
+            res = requests.post(
+                self.api,
+                json={
+                    'question': q_info['title'],
+                    'options': options,
+                    'type': type
+                },
+                verify=False,
+                timeout=(5, 20),   # (连接, 读取) 秒
+            )
+        except requests.RequestException as e:
+            logger.warning(f"{self.name} 请求异常（按未命中处理）: {e}")
+            return None
         if res.status_code == 200:
-            res_json = res.json()
-            # if bool(res_json['plat']):
-            # plat无论搜没搜到答案都返回0
-            # 这个参数是tikuadapter用来设定自定义的平台类型
-            if not len(res_json['answer']['bestAnswer']):
-                logger.error("查询失败, 返回：" + res.text)
+            try:
+                res_json = res.json()
+                best = (res_json.get('answer') or {}).get('bestAnswer') or []
+            except Exception as e:
+                logger.warning(f"{self.name} 响应解析失败（按未命中处理）: {e}")
+                return None
+            # plat 无论搜没搜到答案都返回 0；该字段是 tikuadapter 用来
+            # 设定自定义平台类型的，这里用不到。
+            if not len(best):
+                logger.debug("未命中，返回：" + res.text[:200])
                 return None
             sep = "\n"
-            return sep.join(res_json['answer']['bestAnswer']).strip()
-        # else:
-        #   logger.error(f'{self.name}查询失败:\n{res.text}')
+            return sep.join(best).strip()
+        logger.debug(f'{self.name} 查询返回非 200: {res.status_code}')
         return None
 
     def _init_tiku(self):

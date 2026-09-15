@@ -127,6 +127,41 @@ def parse_options(raw: str) -> list:
     return out
 
 
+def letters_to_text(answer: str, opts: list) -> str:
+    """把「选项字母」答案翻译成「答案文本」。
+
+    2026-09-15 修 bug（严重）：此前直接把学习库里的 verified（形如 "B"）
+    写进 tiku.answer。但 TikuAdapter 的 answer 字段语义是**答案文本**：
+    它拿 answer 里的字符串去 options 里做匹配，匹配不到就退化成**返回第一
+    个选项**。于是 "B" 匹配不到任何选项 → 接口 bestAnswer 恒等于 A 选项，
+    **等于每次都灌一个错答案**。
+
+    实测（2026-09-15）：回灌的 17 条（id 126~142）全部中招，
+    例如「北斗三号系统的特点是()」库里 answer=["C"]，
+    但接口返回 bestAnswer=["仅覆盖亚太地区"]（A 选项），而正确答案是
+    「实现全球覆盖」；对照 104 条文本式入库的老数据（如英语题
+    answer=["origin"]）则完全正常 —— 差别就在字母 vs 文本。
+
+    转换规则：
+      - 纯字母（单个或多个，如 "B" / "ACD"）→ 按选项顺序取对应文本，多选用换行连接
+      - 已经是文本 → 原样返回
+      - 字母超出选项范围或取不到 → 返回原值（交由调用方决定是否跳过）
+    """
+    s = str(answer or "").strip()
+    if not s:
+        return s
+    if not re.fullmatch(r"[A-Za-z]+", s):
+        return s  # 已是文本（如 "origin"）
+    parts = []
+    for ch in s.upper():
+        idx = ord(ch) - ord("A")
+        if 0 <= idx < len(opts):
+            parts.append(str(opts[idx]))
+        else:
+            return s  # 越界，宁可不改也不要写错
+    return "\n".join(parts)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
@@ -170,7 +205,14 @@ def main():
         if not opts and t not in (3, 4):
             noopt.append(q)
             continue
-        add.append((q, t, rec["answer"], opts))
+        # 2026-09-15 修 bug：tiku.answer 必须写**答案文本**，不能写选项字母。
+        # 写字母会让 TikuAdapter 匹配失败并退化成返回第一个选项（= 错答案）。
+        # 详见 letters_to_text 的 docstring。
+        ans_text = letters_to_text(rec["answer"], opts)
+        if t in (0, 1) and not ans_text:
+            noopt.append(q)
+            continue
+        add.append((q, t, ans_text, opts))
 
     print("-" * 70)
     print("将新增 %d 条，跳过已存在 %d 条，因缺选项跳过 %d 条"
@@ -195,6 +237,22 @@ def main():
         return
 
     ts = time.strftime("%Y%m%d_%H%M%S")
+
+    # 2026-09-15 【入库前强制自检】—— 防止"字母式答案"再次混入。
+    # 血的教训：answer 字段必须是**答案文本**。一旦写成字母，TikuAdapter
+    # 匹配不到就退化返回第一个选项，界面一切正常但**每题都在提交错答案**，
+    # 极难察觉（本次是靠端到端逐条比对才挖出来）。这里在落库前硬拦。
+    bad = [(q, t, ans) for q, t, ans, opts in add
+           if t in (0, 1) and re.fullmatch(r"[A-Za-z]+", str(ans).strip())]
+    if bad:
+        print("\n" + "!" * 60)
+        print("检测到 %d 条答案仍是「字母式」，可能无法被 TikuAdapter 正确解析：" % len(bad))
+        for q, t, ans in bad[:10]:
+            print("   [t%d] %-46s -> %r" % (t, q[:46], ans))
+        print("已中止写入。请确认 letters_to_text() 是否覆盖了这些形态。")
+        print("!" * 60)
+        return
+
     bak = TIKU_DB + ".bak.sync." + ts
     shutil.copy2(TIKU_DB, bak)
     print("\n已备份 -> %s" % os.path.basename(bak))

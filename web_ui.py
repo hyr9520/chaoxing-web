@@ -634,9 +634,13 @@ class ProgressTracker:
         # 界面看着正常、实际大量判错）。这里补一组来自学习库的真实判据。
         ver = wrong = 0
         try:
-            import os as _os
-            _p = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
-                               "learned_answers.json")
+            # 2026-09-15 修 bug：原实现直接读源码目录下的 learned_answers.json，
+            # 完全无视 CK_DATA_DIR，导致多实例下 5 个实例的界面**都显示同一组
+            # 假数字**（实测 acc1/acc2 均报 verified=140/wrong=20，而两者真实
+            # 学习库分别是 69/2 和 66/8）。必须与 api/learned.py 用同一套
+            # data_dir() 解析，否则界面上的"判对/判错"与账号实际战绩无关。
+            from api.config import data_dir as _data_dir
+            _p = os.path.join(_data_dir(), "learned_answers.json")
             with open(_p, encoding="utf-8") as _f:
                 _d = json.load(_f)
             ver = sum(1 for v in _d.values() if v.get("verified"))
