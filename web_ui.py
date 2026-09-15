@@ -1773,7 +1773,7 @@ $('btnQuit').onclick = async () => {
   if (!confirm('停止刷课服务并关闭题库后台？\\n运行中的任务将中断，已上报的进度不会丢失。')) return;
   const b = $('btnQuit');
   b.dataset.busy = '1'; b.disabled = true; b.textContent = '正在停止';
-  try { await fetch(BASE + '/api/shutdown', {method: 'POST'}); } catch (e) {}
+  try { await fetch(BASE + '/api/shutdown?all=1', {method: 'POST'}); } catch (e) {}
   document.body.innerHTML =
     '<div style="text-align:center;padding:90px 20px;color:#6b7280;font-size:15px">' +
     '服务已全部停止，可以关闭此页面了。<br>下次双击桌面「超星刷课」再次启动。</div>';
@@ -2340,15 +2340,27 @@ def api_logs():
 
 @app.post("/api/shutdown")
 def api_shutdown():
-    """一键全停：杀掉题库服务与自身（正在运行的任务一并中断，已上报进度不丢）。"""
+    """一键全停：杀掉题库服务与自身（正在运行的任务一并中断，已上报进度不丢）。
+
+    2026-09-15 修缺陷：多实例下网关「停止实例 N」也走这个端点，于是
+    **停任意一个实例都会杀掉共享的 tikuAdapter**（8060）。后果是其它仍在
+    运行的实例瞬间失去题库来源 —— 未命中全部转 AI，命中率暴跌，而界面上
+    看不出任何异常（这正是"题库经常出问题"的隐蔽来源之一）。
+
+    修复：默认只关自己；只有显式带 ?all=1（网关的"停止所有服务"/一键全停）
+    才连题库一起杀。
+    """
+    kill_tiku = str(request.args.get("all") or "").strip() in ("1", "true", "yes")
+
     def _bye():
         _clear_resume()   # 用户主动停止：下次启动不自动续刷
-        try:
-            subprocess.run(["taskkill", "/F", "/IM", "tikuAdapter.exe"],
-                           capture_output=True,
-                           creationflags=subprocess.CREATE_NO_WINDOW)
-        except Exception:
-            pass
+        if kill_tiku:
+            try:
+                subprocess.run(["taskkill", "/F", "/IM", "tikuAdapter.exe"],
+                               capture_output=True,
+                               creationflags=subprocess.CREATE_NO_WINDOW)
+            except Exception:
+                pass
         os._exit(0)
 
     threading.Timer(0.8, _bye).start()

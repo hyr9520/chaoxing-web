@@ -592,10 +592,14 @@ def api_stop_all():
 
     def _bye():
         time.sleep(1.5)          # 留时间让响应回到浏览器
-        for it in instances():
+        its = instances()
+        for idx, it in enumerate(its):
             port = it["port"]
+            # 2026-09-15：只有"停止全部"才连题库一起关，且放在最后一个实例上
+            # 关（避免先关的实例把题库杀了、后面实例的收尾逻辑受影响）。
+            allq = "?all=1" if idx == len(its) - 1 else ""
             try:
-                requests.post(f"http://127.0.0.1:{port}/api/shutdown",
+                requests.post(f"http://127.0.0.1:{port}/api/shutdown{allq}",
                               timeout=3)
             except Exception:
                 pass
