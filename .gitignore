@@ -1,0 +1,218 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+#  Usually these files are written by a python script from a template
+#  before PyInstaller builds the exe, so as to inject date/other infos into it.
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Translations
+*.mo
+*.pot
+
+# Django stuff:
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Flask stuff:
+instance/
+.webassets-cache
+
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+.python-version
+
+# pipenv
+#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
+#   However, in case of collaboration, if having platform-specific dependencies or dependencies
+#   having no cross-platform support, pipenv may install dependencies that don't work, or not
+#   install all needed dependencies.
+#Pipfile.lock
+
+# PEP 582; used by e.g. github.com/David-OConnor/pyflow
+__pypackages__/
+
+# Celery stuff
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath parsed files
+*.sage.py
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+logs/
+saves/
+build/
+dist/
+*.spec
+
+# python-uv.lock
+# just like Pipfile.lock,
+uv.lock
+
+# poetry
+poetry.lock
+
+# Custom files
+.cookies.txt
+cookies.txt
+.config.ini
+config.ini
+chaoxing.log
+config*.ini
+.chaoxing.log
+./config.ini
+./chaoxing.log
+./cookies.txt
+.idea/
+.vscode/
+cache.json
+
+# ================= 本项目（Web UI / 多实例 / 网关）新增排除规则 =================
+# 【最高优先级】界面配置里存着账号**明文密码**和网关口令，绝对不能提交
+ui_config.json
+ui_config.json.*
+gateway_config.json
+
+# 题库缓存与学习库：含你刷过的题目/答案记录
+learned_answers.json
+learned_answers.json.*
+cache_guessed.json
+cache.json.*
+
+# 多实例数据目录：cookies / 题库缓存 / 学习库 / 界面配置全在里面
+chaoxing_data/
+
+# 课程音频索引与听力转写结果
+audio_index.json
+transcripts.json
+listening_solved.json
+
+# 调研与调试产物
+survey_*.json
+survey_*.txt
+_page_*.html
+_work_page.html
+_live_*.log
+_live_*.html
+
+# 临时脚本 / 截图 / 日志（本项目约定：下划线开头即为临时文件）
+_*.py
+_*.png
+_*.log
+_*.txt
+_*.bak
+*.bak
+*.bak.*
+
+# 备份目录
+backups/
+
+# 语音识别模型（Whisper，约 145MB，超 GitHub 单文件 100MB 上限）
+# 需要时按 README 的说明自行下载到 models/fw-base/
+models/
+
+# 课程音频：体积大且涉及版权，不要提交
+audio/
+
+# 内部工作文档：含个人账号 / 姓名 / 学校等信息，不对外
+HANDOFF.md
+TEST_REPORT_*.md
+DEPLOY_REPORT_*.md
+
+# 内部排查/规划文档：含网关口令、账号、环境细节，不对外
+UI_OPTIMIZE_PLAN_*.md
+程序体检报告_*.md
+答案命中率排查报告.md
+
+# 临时验证产物 / 界面截图（含账号界面），不对外
+_ui_shots/
+_verify_*_result.json
+_*.json
