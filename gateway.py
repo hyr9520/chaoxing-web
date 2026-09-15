@@ -56,6 +56,17 @@ app = Flask(__name__)
 app.json.ensure_ascii = False
 # secret_key 在下面配置读写函数定义之后设置（需要持久化到配置文件）
 
+# ---------------- 自动回灌状态（学习库 → 全局题库） ----------------
+# 2026-09-15 新增。定义放在这里而不是线程函数旁边，是为了让 /api/overview
+# （定义在本节下方）能直接引用；虽然 Python 运行时查找能跨顺序访问，但显式
+# 靠前更不容易误判成"未定义"。
+_SYNC = {
+    "every": 600,       # 间隔（秒）。10 分钟——回灌本身很轻（纯 SQLite 读+比对）
+    "last_at": None,    # 上次跑完的时间戳（字符串，便于直接展示）
+    "last_res": None,   # 上次返回的统计 dict
+    "runs": 0,          # 累计跑了几轮
+}
+
 
 # ---------------- 配置与实例发现 ----------------
 
@@ -342,7 +353,8 @@ def api_overview():
             continue          # 普通用户只看自己那个实例
         data.append(_instance_state(it))
     return jsonify(ok=True, role=role, who=getattr(g, "who", ""),
-                   instances=data, stagger=dict(_stagger))
+                   instances=data, stagger=dict(_stagger),
+                   sync=dict(_SYNC))
 
 
 @app.get("/")
@@ -611,6 +623,64 @@ def api_stop_all():
 
     threading.Thread(target=_bye, daemon=True).start()
     return jsonify(ok=True, msg="正在停止全部服务…（本页稍后会断开）")
+
+
+# ---------------- 自动回灌（学习库 → TikuAdapter 题库） ----------------
+
+# 2026-09-15 新增。用户需求原话："程序如果是能自动的只是会有延迟的话，
+# 问题不大，只要确定能把答案关回去就行了。"
+#
+# 背景：程序有两条"记住答案"的通道 —— 每实例的学习库 learned_answers.json
+# 和全局共用的 tikuAdapter/tiku.db。以前两者**没有打通**：某个账号把题做对、
+# 平台确认全对，学习库记下了，题库却还是空的 → 换个账号遇到同一道题照样搜不到。
+# 修法是靠 sync_learned_to_tiku.py 手工回灌，但那要人记得去跑。
+#
+# 这里挂一个后台线程定时自动汇总，彻底免掉手工。
+# 状态容器 _SYNC 定义在模块顶部（app 之后），此处只放线程逻辑。
+
+
+def _sync_once():
+    """跑一轮回灌，异常全部吞掉（定时任务绝不能因一次失败就死掉）。"""
+    try:
+        # 延迟导入：sync 脚本会 import 一堆东西，放模块顶层会拖慢网关冷启动；
+        # 而且万一脚本有语法问题，也不该连带网关起不来。
+        from sync_learned_to_tiku import sync
+        r = sync(quiet=True)          # 不带 accs = 汇总全部实例
+        _SYNC["last_res"] = r
+        _SYNC["last_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        _SYNC["runs"] += 1
+        if r and r.get("added"):
+            print(f"[自动回灌] 新增 {r['added']} 条 → {r.get('msg')}")
+        elif r and not r.get("ok"):
+            print(f"[自动回灌] 本轮未写入：{r.get('msg')}")
+        return r
+    except Exception as e:
+        _SYNC["last_res"] = {"ok": False, "msg": f"异常：{e}"}
+        _SYNC["last_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[自动回灌] 异常：{e}")
+        return None
+
+
+def _sync_worker():
+    """后台定时器。启动后先等一轮（服务刚起来时别抢资源）。
+
+    2026-09-15 加固：整个循环体再包一层 try。`_sync_once` 内部已经全兜底，
+    但时间戳格式化、状态字典写入等外围代码万一抛异常，会让**线程静默死亡**——
+    之后再也不会自动回灌，而且表面看不出任何症状（这正是最危险的一种故障）。
+    包一层后任何意外都只跳过本轮。
+
+    首轮只等 30 秒（原来 60 秒）：改 gateway.py 后要重启网关才生效，而重启会让
+    runs 归零、重新进入缓冲期。缓冲期越长，"改完重启后迟迟看不到回灌生效"的
+    窗口就越长，排查时容易误以为功能没生效。回灌本身极轻（几百条内存比对 +
+    最多几十条 INSERT），30 秒足够让实例和日志稳定下来。
+    """
+    time.sleep(30)                    # 冷启动缓冲：让实例先起来、日志先落盘
+    while True:
+        try:
+            _sync_once()
+        except Exception as e:        # 理论上到不了这里，留着是保险
+            print(f"[自动回灌] 线程级异常（已跳过本轮）：{e}")
+        time.sleep(_SYNC["every"])
 
 
 # ---------------- 反向代理 ----------------
@@ -1202,4 +1272,7 @@ if __name__ == "__main__":
     print(f"发现 {len(inst)} 个实例：" +
           (", ".join(f"acc{i['n']}@{i['port']}" for i in inst) if inst else "无"))
     print("把 SakuraFrp 的 1 条隧道映射到本端口即可外网访问。")
+    # 自动回灌：学习库 → 全局题库，每 10 分钟一轮（用户要求"自动+可接受延迟"）
+    threading.Thread(target=_sync_worker, daemon=True).start()
+    print(f"自动回灌已启动：每 {_SYNC['every'] // 60} 分钟把全部实例的学习库汇总进题库。")
     app.run(host=HOST, port=PORT, debug=False, threaded=True)

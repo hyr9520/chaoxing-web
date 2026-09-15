@@ -1532,7 +1532,32 @@ class TikuAdapter(Tiku):
 
     def _init_tiku(self):
         # self.load_token()
-        self.api = self._conf['url']
+        url = self._conf['url']
+        # 2026-09-15 【关键修复】必须显式带 use=local，否则本地题库查不到。
+        #
+        # 官方文档（github.com/DokiDoki1103/tikuAdapter）在「URL 请求参数」里写明：
+        #     use  你想要使用哪些题库，不填写默认使用所有免费题库
+        #         示例值：local,icodef,buguake,wanneng
+        # 即 **不传 use 时，默认题库集合里没有 local** —— 我们自己写进
+        # tikuAdapter/tiku.db 的那 170 多条答案根本不会被查询，
+        # /search 只会去问 icodef / 不挂科 这些在线免费题库。
+        #
+        # 后果：表现为"答案明明回灌进库了、管理页也能看到，就是搜不到"，
+        # 而且 TikuAdapter 照样会为通用常识题（"中国的首都是哪里"）返回答案 ——
+        # 因为那是在线题库给的。极具迷惑性，排查时很容易误判成
+        # "库坏了 / hash 不对 / 需要重启"，实际只差这一个 URL 参数。
+        #
+        # 实测（2026-09-15，同一道题同一时刻）：
+        #     POST /adapter-service/search              -> bestAnswer = []          ✗
+        #     POST /adapter-service/search?use=local    -> ['让数据分析结果更直观清晰'] ✓
+        #
+        # 兼容处理：
+        #   - 配置里若已带 "use=" → 原样使用，尊重用户配置（可自定义 local,icodef 组合）
+        #   - 已带其它 query（含 "?"）→ 用 & 追加
+        #   - 干净 URL → 用 ? 追加
+        if 'use=' not in url:
+            url = url + ('&' if '?' in url else '?') + 'use=local'
+        self.api = url
 
 
 class AI(Tiku):
