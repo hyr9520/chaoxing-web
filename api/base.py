@@ -1484,6 +1484,11 @@ class Chaoxing:
             # 3. 搜题
             total_questions = len(questions["questions"])
             found_answers = 0
+            # 把课程名注入到每道题上：题库全没命中时走 AI 兜底，AI 若不知道
+            # 这是哪门课，只能拿通用知识硬凑，专业术语极易答偏
+            # （实测同一批 SketchUp 填空题：无课程背景 0/5 → 有课程背景 2/5）
+            for _q in questions["questions"]:
+                _q["_course"] = (_course or {}).get("title", "")
             answers = self.tiku.query_all(questions["questions"], query_delay=query_delay)
 
             if not isinstance(answers, list):

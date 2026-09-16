@@ -1701,6 +1701,15 @@ class AI(Tiku):
             )
             feedback_text = (feedback_text + "\n" + _sub_text) if feedback_text else _sub_text
 
+        # 课程上下文（由 base.study_work 注入到 q_info["_course"]）：给模型领域定位
+        # 与术语要求。实测同一批 SketchUp 填空题：无课程背景 0/5 → 有课程背景 2/5。
+        # 题库全没命中时全靠 AI 兜底，它若不知道这是哪门课，只能拿通用知识硬凑，
+        # 专业术语极易答偏（如把 SketchUp 的"反转平面"答成"反转法线"）。
+        _course = str((q_info or {}).get("_course") or "").strip()
+        _ctx = (f"本题出自《{_course}》课程的章节测验。"
+                "请使用该学科的标准术语（软件类课程用该软件官方中文界面的原话）作答，"
+                "答案保持简短（通常 1-6 个字），不要写解释。\n") if _course else ""
+
         def _make_messages(system_content: str, user_content: str,
                            images: Optional[list] = None) -> list:
             """构造带反馈上下文的消息列表.
@@ -1751,7 +1760,7 @@ class AI(Tiku):
             try:
                 return client.chat.completions.create(**self._completion_kwargs(
                     model=self.model,
-                    messages=_make_messages(system_content, user_content,
+                    messages=_make_messages(_ctx + system_content, user_content,
                                             images=_images)))
             except Exception as e:
                 if not _images:
@@ -1760,7 +1769,7 @@ class AI(Tiku):
                     f"带图请求失败（{type(e).__name__}: {e}），已自动降级为纯文本重试")
                 return client.chat.completions.create(**self._completion_kwargs(
                     model=self.model,
-                    messages=_make_messages(system_content, user_content)))
+                    messages=_make_messages(_ctx + system_content, user_content)))
 
         # 判断题目类型
         self._wait_for_interval()
@@ -2050,6 +2059,15 @@ class SiliconFlow(Tiku):
             system_prompt = "本题为填空题，请直接给出填空内容，以JSON格式输出：示例回答：{\"Answer\": [\"答案文本\"]}。除此之外不要输出任何多余的内容，也不要使用MD语法。如果你使用了互联网搜索，也请不要返回搜索的结果和参考资料"
         elif q_info['type'] == 'judgement':
             system_prompt = "本题为判断题，请回答'正确'或'错误'，以JSON格式输出：示例回答：{\"Answer\": [\"正确\"]}。除此之外不要输出任何多余的内容，也不要使用MD语法。如果你使用了互联网搜索，也请不要返回搜索的结果和参考资料"
+
+        # 课程上下文（由 base.study_work 注入到 q_info["_course"]）：
+        # 给出领域定位 + 术语要求。实测同一批 SketchUp 填空题命中率 0/5 → 2/5。
+        _course = str((q_info or {}).get("_course") or "").strip()
+        if _course:
+            system_prompt += (
+                f"\n本题出自《{_course}》课程的章节测验。"
+                "请使用该学科（或该软件官方中文界面）的标准术语作答，"
+                "答案保持简短（通常 1-6 个字），不要写解释。")
 
         # 听力题：题干里只有选项、没有音频原文，模型看不到听力材料，
         # 直接问极易退化成"全部选同一个字母"的瞎猜。这里明确告知这一限制，
