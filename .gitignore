@@ -216,3 +216,4 @@ UI_OPTIMIZE_PLAN_*.md
 _ui_shots/
 _verify_*_result.json
 _*.json
+_*.cmd

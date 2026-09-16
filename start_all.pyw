@@ -8,6 +8,7 @@
 """
 import os
 import socket
+import subprocess
 import sys
 import time
 import webbrowser
@@ -58,6 +59,44 @@ def existing_count() -> int:
     return max(3, max(names) if names else 0)
 
 
+def start_weiban() -> bool:
+    """拉起安全微伴控制台（**独立进程**，端口 5011）。
+
+    与学习通完全隔离：另一份代码、另一个端口、另一套数据目录
+    （chaoxing_data/weiban/）。它起不来**不影响学习通**，所以这里只打印
+    提示，不弹窗中断主流程。
+    """
+    wb_port = int(os.environ.get("WB_PORT") or 5011)
+    if port_alive(wb_port):
+        print(f"安全微伴已在运行（{wb_port}）")
+        return True
+    ui = os.path.join(os.path.dirname(BASE), "weiban", "web_ui.py")
+    if not os.path.exists(ui):
+        print("未找到安全微伴控制台（weiban/web_ui.py），跳过")
+        return False
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    env["WB_PORT"] = str(wb_port)
+    try:
+        subprocess.Popen(
+            [sys.executable, ui], cwd=os.path.dirname(ui), env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                          | getattr(subprocess, "DETACHED_PROCESS", 0),
+            close_fds=True)
+    except Exception as e:
+        print(f"安全微伴启动失败（不影响学习通）：{e}")
+        return False
+    for _ in range(25):
+        if port_alive(wb_port):
+            print(f"安全微伴已就绪 -> http://127.0.0.1:{wb_port}/")
+            return True
+        time.sleep(0.4)
+    print("安全微伴启动超时（不影响学习通）")
+    return False
+
+
 def main():
     # 1) 拉起实例 + 网关 + 隧道（复用 start_multi 的逻辑，避免重复实现）
     count = existing_count()
@@ -65,6 +104,8 @@ def main():
     if env_count and env_count.isdigit():
         count = max(count, int(env_count))
     print(f"将启动 {count} 个实例")
+    # 安全微伴与学习通完全独立，先把它拉起来（起不来也不影响下面的流程）
+    start_weiban()
     sys.argv = ["start_multi.py", str(count)]
     try:
         import start_multi

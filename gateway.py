@@ -39,6 +39,10 @@ except ValueError:
     PORT = 8888
 
 ROLE_ADMIN, ROLE_USER, ROLE_VIEWER = "admin", "user", "viewer"
+# 安全微伴专用角色（2026-09-16）：从登录页选「安全微伴」并用微伴账号进来的用户，
+# **只能**访问微伴控制台 —— 碰不到任何学习通实例、首页和实例接口。
+ROLE_WB = "wb"
+WB_OK = ("/wb", "/api/whoami", "/auth/logout")
 # 访客（只读）允许访问的路径前缀。
 # ⚠️ 绝对不能包含 "/acc/"（2026-09-14 实测踩坑）：反代过去的请求对实例而言
 # 来自 127.0.0.1（网关转发），实例会当成本机而**完全放行** —— 于是只读访客
@@ -228,9 +232,32 @@ def _viewer_allowed(path: str) -> bool:
     return any(path.startswith(p) for p in VIEWER_OK if p != "/")
 
 
+def _user_allowed(path: str) -> bool:
+    """普通用户（查看 + 暂停）能碰的路径。
+
+    ⚠️ 实例反代（/acc/N/...）必须按**子路径**细分：整个 /acc/ 放行的话，
+    用户能直接调 /acc/N/api/start 把任务跑起来 —— 等于没设权限。
+    这里只放行"看"和"暂停"。
+    """
+    if path == "/":
+        return True
+    if any(path.startswith(p) for p in VIEWER_OK if p != "/"):
+        return True
+    m = re.match(r"^/acc/\d+/(.*)$", path)
+    if m:
+        sub = m.group(1)
+        if sub == "":
+            return True
+        return any(sub.startswith(k) for k in (
+            "api/status", "api/logs", "api/whoami", "api/stop",
+            "api/courses", "api/saved-config"))
+    return False
+
+
 @app.before_request
 def _auth_gate():
-    if request.path in ("/login", "/auth", "/favicon.ico"):
+    if request.path in ("/login", "/auth", "/auth/weiban",
+                        "/auth/weiban/add", "/favicon.ico"):
         return None
     if _is_local_request():
         g.role, g.who = ROLE_ADMIN, "本机"
@@ -238,8 +265,13 @@ def _auth_gate():
     role = session.get("role")
     if role:
         g.role, g.who = role, session.get("who") or role
-        if role == ROLE_VIEWER and not _viewer_allowed(request.path):
-            return jsonify(ok=False, msg="只读访问：该操作用不了"), 403
+        if role == ROLE_USER and not _user_allowed(request.path):
+            return jsonify(ok=False, msg="普通用户只能查看和暂停，不能执行该操作"), 403
+        # 微伴账号：只放行安全微伴控制台，其余（首页 / 实例 / 实例接口）一律拒绝
+        if role == ROLE_WB and not any(
+                request.path == p or request.path.startswith(p + "/")
+                for p in WB_OK):
+            return jsonify(ok=False, msg="微伴账号仅能访问安全微伴控制台"), 403
         return None
     if request.path.startswith("/api/"):
         return jsonify(ok=False, need_login=True, msg="未登录或登录已过期"), 401
@@ -263,9 +295,11 @@ def do_auth():
     if pwd == tk.get("admin_token"):
         session["role"], session["who"] = ROLE_ADMIN, "管理口令"
         return jsonify(ok=True, role=ROLE_ADMIN)
+    # 只读口令与账号登录都归入「用户」：能看、能暂停，但不能启动/新增
+    # （2026-09-16 按用户要求把原来的三级权限收敛成两级）
     if pwd == tk.get("viewer_token"):
-        session["role"], session["who"] = ROLE_VIEWER, "只读口令"
-        return jsonify(ok=True, role=ROLE_VIEWER)
+        session["role"], session["who"] = ROLE_USER, "只读口令"
+        return jsonify(ok=True, role=ROLE_USER)
     for p in all_profiles():
         if (str(p.get("username") or "") == user
                 and str(p.get("password") or "") == pwd):
@@ -273,6 +307,169 @@ def do_auth():
             session["inst"] = p.get("_inst")
             return jsonify(ok=True, role=ROLE_USER, inst=p.get("_inst"))
     return jsonify(ok=False, msg="账号或密码不正确（需与本机已保存的学习通账号一致）")
+
+
+# 安全微伴：独立虚拟环境 + 校验脚本（都在上游源码目录旁边）
+WB_SRC_DIR = os.path.join(os.path.dirname(DATA_ROOT), "weiban_src")
+WB_VERIFY_PY = os.path.join(os.path.dirname(DATA_ROOT), "weiban", "verify_login.py")
+WB_VENV_PY = os.path.join(WB_SRC_DIR, ".venv", "Scripts", "python.exe")
+
+
+def _verify_weiban(tenant: str, username: str, password: str, timeout: int = 150):
+    """真去登录一次安全微伴，确认账号可用。返回 (ok, errmsg)。
+
+    慢（要过验证码识别），但这是"认证"该有的代价 —— 不能让乱输就进来。
+    """
+    if not os.path.exists(WB_VENV_PY) or not os.path.exists(WB_VERIFY_PY):
+        return False, "安全微伴组件未就绪（缺 weiban_src/.venv 或 verify_login.py）"
+    env = os.environ.copy()
+    env.update({"WB_TENANT_NAME": tenant, "WB_USERNAME": username,
+                "WB_PASSWORD": password, "PYTHONIOENCODING": "utf-8"})
+    try:
+        r = subprocess.run([WB_VENV_PY, WB_VERIFY_PY], cwd=WB_SRC_DIR, env=env,
+                           capture_output=True, text=True, timeout=timeout,
+                           encoding="utf-8", errors="replace")
+    except subprocess.TimeoutExpired:
+        return False, "认证超时（平台响应慢或验证码识别卡住），请重试"
+    except Exception as e:
+        return False, f"认证失败：{e}"
+    out = f"{r.stdout or ''}\n{r.stderr or ''}"
+    if "AUTH_OK" in out:
+        return True, ""
+    for line in out.splitlines():
+        if "AUTH_FAIL" in line:
+            return False, line.split("AUTH_FAIL:", 1)[-1].strip()[:180]
+    return False, "账号或密码不正确"
+
+
+# 安全微伴：已加入的账号清单（管理员添加，登录时用来比对；不再去平台验证学校）
+WB_ACCOUNTS = os.path.join(DATA_ROOT, "weiban", "accounts.json")
+
+
+def _wb_accounts() -> dict:
+    try:
+        with open(WB_ACCOUNTS, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _wb_save_accounts(d: dict) -> None:
+    os.makedirs(os.path.dirname(WB_ACCOUNTS), exist_ok=True)
+    with open(WB_ACCOUNTS, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=1)
+
+
+@app.post("/auth/weiban")
+def do_auth_weiban():
+    """安全微伴入口。
+
+    验证方式（2026-09-16 按用户要求改）：**不再连平台校验学校**，直接拿输入
+    去比对管理员添加的本地账号清单 —— 快、且不受平台波动影响。
+      ① 密码 = 管理员口令  → 管理员身份进入微伴控制台（不受限）
+      ② 学号在已加入清单里 → 学校/密码一致则放行，否则打回
+    """
+    data = request.get_json(silent=True) or {}
+    tenant = str(data.get("tenant") or "").strip()
+    username = str(data.get("username") or "").strip()
+    password = str(data.get("password") or "")
+
+    # ① 管理员口令：直接进（微伴控制台对管理员不设限）
+    if password and password == gateway_tokens().get("admin_token"):
+        session["role"], session["who"] = ROLE_ADMIN, "管理口令"
+        session.pop("wb_user", None)
+        return jsonify(ok=True, redirect="/wb/")
+
+    if not (tenant and username):
+        return jsonify(ok=False, msg="学校全称与学号都要填")
+
+    # ② 比对已加入的账号
+    acct = _wb_accounts().get(username)
+    if not acct:
+        return jsonify(ok=False,
+                       msg="该账号还没加入。请让管理员先在「安全微伴」页把它添加进来")
+    if acct.get("tenant") and acct["tenant"] != tenant:
+        return jsonify(ok=False,
+                       msg=f"学校全称与登记的不一致，应为：{acct['tenant']}")
+    if acct.get("password") and password and acct["password"] != password:
+        return jsonify(ok=False, msg="密码不正确")
+
+    wb_dir = os.path.join(DATA_ROOT, "weiban")
+    try:
+        os.makedirs(wb_dir, exist_ok=True)
+        with open(os.path.join(wb_dir, "_pending.json"), "w", encoding="utf-8") as f:
+            json.dump({"tenant": acct.get("tenant") or tenant, "username": username,
+                       "password": password or acct.get("password") or username,
+                       "at": time.time()}, f)
+    except Exception as e:
+        return jsonify(ok=False, msg=f"保存账号失败：{e}")
+    session["role"], session["who"], session["wb_user"] = ROLE_WB, f"微伴 · {username}", username
+    return jsonify(ok=True, redirect="/wb/")
+
+
+@app.post("/auth/weiban/add")
+def do_weiban_add_account():
+    """登录页专用的「管理员添加账号」入口。
+
+    为什么单独开一个：加账号的入口原本只在微伴控制台里，但账号不在清单里就
+    进不去控制台 —— 鸡生蛋。这里让管理员在**登录页**直接用口令把账号加上，
+    绕开这个循环。凭据是管理员口令，与本页其它入口同一安全级别。
+    """
+    data = request.get_json(silent=True) or {}
+    if str(data.get("admin_token") or "") != gateway_tokens().get("admin_token"):
+        return jsonify(ok=False, msg="管理员口令不正确")
+    tenant = str(data.get("tenant") or "").strip()
+    username = str(data.get("username") or "").strip()
+    if not (tenant and username):
+        return jsonify(ok=False, msg="学校全称和学号都要填")
+    accounts = _wb_accounts()
+    if username in accounts:
+        return jsonify(ok=False, msg=f"{username} 已经在清单里了")
+    accounts[username] = {
+        "tenant": tenant,
+        "password": str(data.get("password") or "").strip(),
+        "added_at": time.strftime("%Y-%m-%d %H:%M"),
+    }
+    _wb_save_accounts(accounts)
+    return jsonify(ok=True, msg=f"已添加 {username}，切回上面就能用它登录了")
+
+
+@app.route("/api/wb/accounts", methods=["GET", "POST", "DELETE"])
+def api_wb_accounts():
+    """安全微伴账号清单管理 —— **只有管理员**能增删（用户明确要求）。"""
+    if _role() != ROLE_ADMIN:
+        return jsonify(ok=False, msg="只有管理员能管理微伴账号"), 403
+    accounts = _wb_accounts()
+
+    if request.method == "GET":
+        # 不回传密码明文，只说明"有没有设密码"
+        return jsonify(ok=True, accounts=[
+            {"username": k, "tenant": v.get("tenant", ""),
+             "has_password": bool(v.get("password")),
+             "added_at": v.get("added_at", "")}
+            for k, v in sorted(accounts.items())])
+
+    d = request.get_json(silent=True) or {}
+    username = str(d.get("username") or "").strip()
+    if not username:
+        return jsonify(ok=False, msg="学号必填")
+
+    if request.method == "DELETE":
+        accounts.pop(username, None)
+        _wb_save_accounts(accounts)
+        return jsonify(ok=True, msg=f"已移除 {username}")
+
+    tenant = str(d.get("tenant") or "").strip()
+    if not tenant:
+        return jsonify(ok=False, msg="学校全称必填")
+    accounts[username] = {
+        "tenant": tenant,
+        "password": str(d.get("password") or "").strip(),
+        "added_at": time.strftime("%Y-%m-%d %H:%M"),
+    }
+    _wb_save_accounts(accounts)
+    return jsonify(ok=True, msg=f"已添加 {username}")
 
 
 @app.post("/auth/logout")
@@ -716,13 +913,58 @@ def proxy(n, sub):
         return Response("没有这个实例", status=404,
                         mimetype="text/plain; charset=utf-8")
     role = _role()
-    # 第二道保险：即使白名单被人改错，这里也挡住访客进实例详情
-    if role == ROLE_VIEWER:
-        return jsonify(ok=False, msg="只读访问：不能进入实例详情页"), 403
     # 普通用户只能进自己那个实例，不能操作别人的账号
+    # （原 ROLE_VIEWER 分支已随"权限收敛为两级"移除）
     if role == ROLE_USER and session.get("inst") != n:
         return jsonify(ok=False, msg="无权访问该实例"), 403
     return _forward(n, sub)
+
+
+# ---------------- 安全微伴反向代理（完全独立的进程 / 端口）----------------
+# 安全微伴跑在自己的进程里（weiban/web_ui.py，默认 5011），这里只做一层转发，
+# 让远程用户也能访问它 —— 两个平台在进程、端口、数据目录上都是分开的：
+# 这边崩了不会影响学习通，反之亦然。
+WB_PORT = int(os.environ.get("WB_PORT", "5011"))
+
+
+def _forward_wb(sub: str):
+    url = f"http://127.0.0.1:{WB_PORT}/{sub}"
+    headers = {k: v for k, v in request.headers.items()
+               if k.lower() not in _SKIP_HEADERS}
+    headers["X-Base-Path"] = "/wb"
+    # 把"当前是哪种身份"告诉微伴控制台（跨进程，它读不到网关的 session）：
+    #   X-WB-Isolation=1 → 是微伴账号进来的：只能操作自己那个账号，
+    #                      且页面上不该出现"学习通"入口
+    #   X-WB-User        → 绑定到哪个账号
+    if _role() == ROLE_WB:
+        headers["X-WB-Isolation"] = "1"
+        headers["X-WB-User"] = str(session.get("wb_user") or "")
+    try:
+        resp = requests.request(
+            request.method, url, params=request.args,
+            data=request.get_data(), headers=headers, cookies=request.cookies,
+            allow_redirects=False, timeout=120)
+    except Exception:
+        return Response(
+            "安全微伴控制台未启动（端口 %d）。请在项目根目录运行："
+            "python weiban/web_ui.py" % WB_PORT,
+            status=502, mimetype="text/plain; charset=utf-8")
+    out = Response(resp.content, resp.status_code)
+    for k, v in resp.headers.items():
+        if k.lower() in _SKIP_RESP_HEADERS:
+            continue
+        if k.lower() == "location" and v.startswith("/"):
+            v = f"/wb{v}"
+        out.headers[k] = v
+    return out
+
+
+@app.route("/wb/", defaults={"sub": ""}, methods=["GET", "POST"])
+@app.route("/wb/<path:sub>", methods=["GET", "POST"])
+def proxy_wb(sub):
+    # 普通用户（只读口令 / 账号）可以进微伴控制台做"查看 + 暂停"；
+    # 微伴账号只能看自己的（由 _forward_wb 注入身份头，控制台端再校验一次）。
+    return _forward_wb(sub)
 
 
 # ---------------- 页面 ----------------
@@ -760,32 +1002,190 @@ LOGIN_PAGE = """<!DOCTYPE html>
         border-radius:50%;animation:spin .7s linear infinite;vertical-align:-1px}
   @keyframes spin{to{transform:rotate(360deg)}}
   input:focus{outline:2px solid #93b4f5;outline-offset:1px;border-color:#2563eb}
+  /* ---- 平台选择：登录页就分平台（2026-09-16）---- */
+  .tabs{display:flex;gap:8px;margin:0 0 16px}
+  .tab{flex:1;padding:9px 6px;border:1px solid #d8dee4;border-radius:9px;background:#fff;
+       color:#374151;font-size:14px;cursor:pointer;margin:0;width:auto}
+  .tab.on{background:#2563eb;color:#fff;border-color:#2563eb}
+  .hide{display:none !important}
+  /* ---- 视觉增强（2026-09-16）：只加外观属性，不动尺寸/布局/结构 ---- */
+  body{background:linear-gradient(160deg,#f7f9fc 0%,#eef2f9 45%,#e8eef8 100%);
+       -webkit-font-smoothing:antialiased}
+  .box{background:linear-gradient(180deg,#fff 0%,#fcfdff 100%);border-color:#e8ecf3;
+       box-shadow:0 1px 2px rgba(16,24,40,.04),0 12px 34px -10px rgba(16,24,40,.14)}
+  h1{letter-spacing:.2px}
+  input{background:#fcfdff;transition:border-color .18s ease,box-shadow .18s ease,background .18s ease}
+  input:hover{border-color:#c7d2e3}
+  input:focus{outline:none;border-color:#2563eb;background:#fff;
+              box-shadow:0 0 0 3.5px rgba(37,99,235,.14)}
+  button{background:linear-gradient(180deg,#3b82f6 0%,#2563eb 100%);
+         box-shadow:0 1px 2px rgba(37,99,235,.28),0 8px 18px -6px rgba(37,99,235,.45);
+         transition:transform .16s ease,box-shadow .16s ease,filter .16s ease}
+  button:hover:not(:disabled){transform:translateY(-1px);
+         box-shadow:0 2px 4px rgba(37,99,235,.3),0 12px 24px -8px rgba(37,99,235,.55)}
+  button:active:not(:disabled){transform:translateY(0);filter:brightness(.97)}
+  .tab{transition:background .18s ease,color .18s ease,border-color .18s ease,box-shadow .18s ease}
+  .tab:hover:not(.on){border-color:#b9c6dc;background:#f8fafd}
+  .tab.on{background:linear-gradient(180deg,#3b82f6 0%,#2563eb 100%);
+          box-shadow:0 1px 2px rgba(37,99,235,.25),0 6px 14px -6px rgba(37,99,235,.5)}
+  summary{transition:color .16s ease}
+  summary:hover{color:#2563eb}
+  /* ---- 视觉增强·第二轮：精致化细节，仍只加外观属性 ---- */
+  ::-webkit-scrollbar{width:10px;height:10px}
+  ::-webkit-scrollbar-track{background:transparent}
+  ::-webkit-scrollbar-thumb{background:rgba(100,116,139,.28);border-radius:999px;
+        border:2px solid transparent;background-clip:content-box}
+  ::-webkit-scrollbar-thumb:hover{background:rgba(100,116,139,.45);background-clip:content-box}
+  button,.tab,.box,input{transition-timing-function:cubic-bezier(.22,.61,.36,1)}
+  body{animation:fadeIn .28s cubic-bezier(.22,.61,.36,1)}
+  @keyframes fadeIn{from{opacity:0}to{opacity:1}}
+  ::selection{background:rgba(37,99,235,.16)}
+  .box h1{position:relative;padding-left:11px}
+  .box h1::before{content:"";position:absolute;left:0;top:50%;transform:translateY(-50%);
+        width:3px;height:17px;border-radius:2px;
+        background:linear-gradient(180deg,#60a5fa,#2563eb)}
+  input::placeholder{color:#a8b0bd}
+  button:active:not(:disabled){transform:scale(.985)}
+  @media (prefers-reduced-motion: reduce){
+    body{animation:none}
+    button:active:not(:disabled){transform:none}
+  }
 </style></head><body>
 <div class="box">
   <h1>刷课控制台</h1>
-  <p class="sub">用学习通账号登录，查看该账号的进度</p>
-  <label for="user">学习通账号</label>
-  <input id="user" autocomplete="username" placeholder="手机号" autofocus>
-  <label for="pwd">密码</label>
-  <div class="pwrow">
-    <input id="pwd" type="password" autocomplete="current-password" placeholder="密码">
-    <button class="eye" id="eye" type="button" aria-label="显示密码">显示</button>
+  <div class="tabs">
+    <button class="tab on" id="tabCk" type="button">学习通</button>
+    <button class="tab" id="tabWb" type="button">安全微伴</button>
   </div>
-  <button id="btn" type="submit">登录</button>
+
+  <div id="paneCk">
+    <p class="sub">用学习通账号登录，查看该账号的进度</p>
+    <label for="user">学习通账号</label>
+    <input id="user" autocomplete="username" placeholder="手机号" autofocus>
+    <label for="pwd">密码</label>
+    <div class="pwrow">
+      <input id="pwd" type="password" autocomplete="current-password" placeholder="密码">
+      <button class="eye" id="eye" type="button" aria-label="显示密码">显示</button>
+    </div>
+    <button id="btn" type="submit">登录</button>
+    <div class="tip">账号密码只与本机已保存的档案比对，不会发送给学习通。<br>
+      也可直接输入管理员口令或只读口令进入。</div>
+  </div>
+
+  <div id="paneWb" class="hide">
+    <p class="sub">用安全微伴账号进入（学校全称需与登录页显示完全一致）</p>
+    <label for="wbTenant">学校全称</label>
+    <input id="wbTenant" placeholder="例如：XX大学">
+    <label for="wbUser">学号 / 用户名</label>
+    <input id="wbUser" autocomplete="username" placeholder="学号">
+    <label for="wbPwd">密码</label>
+    <div class="pwrow">
+      <input id="wbPwd" type="password" autocomplete="current-password" placeholder="默认与学号相同">
+      <button class="eye" id="eye2" type="button" aria-label="显示密码">显示</button>
+    </div>
+    <button id="btnWb" type="submit">进入安全微伴</button>
+    <div class="tip">账号要先由管理员加入清单，才能从这里进入。<br>
+      <b>首次使用：把管理员口令填在「密码」框</b>，点「进入安全微伴」，进到
+      「已加入的账号」卡片里添加学号。</div>
+
+    <details id="adBox" style="margin-top:14px;border-top:1px dashed #d9d9d9;padding-top:10px">
+      <summary style="cursor:pointer;font-size:13px;color:#555">管理员：在这里直接添加账号</summary>
+      <label for="adTenant" style="margin-top:10px">学校全称</label>
+      <input id="adTenant" placeholder="例如：XX大学">
+      <label for="adUser">学号 / 用户名</label>
+      <input id="adUser" placeholder="学号">
+      <label for="adPwd">密码（可留空，留空则不校验）</label>
+      <input id="adPwd" type="password" placeholder="留空则不校验密码">
+      <label for="adToken">管理员口令</label>
+      <input id="adToken" type="password" placeholder="管理员口令">
+      <button id="btnAdd" type="button">添加账号</button>
+      <div class="msg" id="adMsg" role="status" aria-live="polite"></div>
+    </details>
+  </div>
+
   <div class="msg" id="msg" role="status" aria-live="polite"></div>
-  <div class="tip">账号密码只与本机已保存的档案比对，不会发送给学习通。<br>
-    也可直接输入管理员口令或只读口令进入。</div>
 </div>
 <script>
 const $ = id => document.getElementById(id);
 let going = false;
-$('eye').onclick = () => {
-  const i = $('pwd'), on = i.type === 'password';
-  i.type = on ? 'text' : 'password';
-  $('eye').textContent = on ? '隐藏' : '显示';
-  $('eye').setAttribute('aria-label', on ? '隐藏密码' : '显示密码');
-  i.focus();
-};
+function bindEye(btnId, inputId) {
+  $(btnId).onclick = () => {
+    const i = $(inputId), on = i.type === 'password';
+    i.type = on ? 'text' : 'password';
+    $(btnId).textContent = on ? '隐藏' : '显示';
+    i.focus();
+  };
+}
+bindEye('eye', 'pwd');
+bindEye('eye2', 'wbPwd');
+
+// 平台切换：登录页就分平台 —— 选哪个进哪个系统
+let plat = 'ck';
+function switchPlat(p) {
+  plat = p;
+  $('tabCk').classList.toggle('on', p === 'ck');
+  $('tabWb').classList.toggle('on', p === 'wb');
+  $('paneCk').classList.toggle('hide', p !== 'ck');
+  $('paneWb').classList.toggle('hide', p !== 'wb');
+  $('msg').className = 'msg';
+  $('msg').textContent = '';
+}
+$('tabCk').onclick = () => switchPlat('ck');
+$('tabWb').onclick = () => switchPlat('wb');
+
+// 安全微伴入口
+async function goWb() {
+  if (going) return;
+  const tenant = $('wbTenant').value.trim();
+  const user = $('wbUser').value.trim();
+  const pwd = $('wbPwd').value;
+  // 管理员可以只填口令进来（后端第一分支直接放行），所以这里不强制学校/学号。
+  // 只要求「至少填了东西」，具体校验与报错交给后端 —— 否则管理员会被前端先挡住。
+  if (!pwd && !(tenant && user)) {
+    $('msg').textContent = '请填密码，或填学校全称 + 学号';
+    $('wbTenant').focus();
+    return;
+  }
+  going = true; $('btnWb').disabled = true;
+  $('msg').className = 'msg';
+  $('msg').innerHTML = '<span class="spin"></span>正在校验…';
+  try {
+    const r = await fetch('auth/weiban', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({tenant: tenant, username: user, password: pwd})});
+    const j = await r.json();
+    if (j.ok) { going = false; location.href = j.redirect || 'wb/'; return; }
+    $('msg').className = 'msg';
+    $('msg').textContent = j.msg || '进入失败';
+  } catch (e) {
+    $('msg').className = 'msg';
+    $('msg').textContent = '网络错误：' + e;
+  }
+  going = false; $('btnWb').disabled = false;
+}
+$('btnWb').onclick = goWb;
+async function addAccountFromLogin(){
+  const btn = $('btnAdd');
+  if(btn.disabled) return;
+  const t = $('adTenant').value.trim(), u = $('adUser').value.trim(), tk = $('adToken').value;
+  if(!t || !u){ $('adMsg').textContent = '学校全称和学号都要填'; return; }
+  if(!tk){ $('adMsg').textContent = '请填管理员口令'; return; }
+  btn.disabled = true;
+  $('adMsg').textContent = '正在添加…';
+  try{
+    const r = await fetch('/auth/weiban/add', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({tenant:t, username:u, password:$('adPwd').value, admin_token:tk})});
+    const j = await r.json();
+    $('adMsg').textContent = j.msg || (j.ok ? '已添加' : '添加失败');
+    if(j.ok){ $('adTenant').value=''; $('adUser').value=''; $('adPwd').value=''; }
+  }catch(e){
+    $('adMsg').textContent = '请求失败：' + e;
+  }
+  btn.disabled = false;
+}
+$('btnAdd').onclick = addAccountFromLogin;
+$('wbPwd').addEventListener('keydown', e => { if (e.key === 'Enter') goWb(); });
 async function go() {
   if (going) return;
   const user = $('user').value.trim(), pwd = $('pwd').value.trim();
@@ -807,6 +1207,7 @@ async function go() {
     }
     $('msg').className = 'msg ok';
     $('msg').textContent = '登录成功，正在进入…';
+    going = false;      // 跳转前复位：否则浏览器「返回」时 bfcache 会把这个 true 带回来
     location.href = '/';
   } catch (e) {
     $('msg').textContent = '请求失败（服务可能未启动）: ' + e;
@@ -814,6 +1215,17 @@ async function go() {
   }
 }
 $('btn').onclick = go;
+// 浏览器「返回」会从 bfcache 恢复页面，而登录跳转前没清掉的 going 会一直卡在 true，
+// 再点登录按钮就被 `if (going) return` 静默吞掉 —— 表现就是“点了一点反应都没有”。
+// 恢复时把状态清干净。
+window.addEventListener('pageshow', e => {
+  if (!e.persisted) return;
+  going = false;
+  $('btn').disabled = false;
+  $('btnWb').disabled = false;
+  $('msg').textContent = '';
+  $('msg').className = 'msg';
+});
 $('pwd').onkeydown = e => { if (e.key === 'Enter') go(); };
 $('user').onkeydown = e => { if (e.key === 'Enter') $('pwd').focus(); };
 </script></body></html>"""
@@ -902,6 +1314,12 @@ GW_PAGE = """<!DOCTYPE html>
   .riskcard{border-color:#fecaca}
   .risk{margin-top:8px;padding:6px 9px;border-radius:8px;background:#fef2f2;
         color:#b91c1c;font-size:12px}
+  /* ---- 平台切换（学习通 / 安全微伴）：两个平台是完全独立的进程与端口 ---- */
+  .platbar{display:flex;gap:8px;margin:0 0 14px;flex-wrap:wrap}
+  .plat{padding:6px 15px;border-radius:9px;background:#fff;color:#374151;
+        border:1px solid #d8dee4;text-decoration:none;font-size:13px}
+  .plat.on{background:#2563eb;color:#fff;border-color:#2563eb}
+  .plat:not(.on):hover{background:#f3f6fb}
   /* ⚠️ 必须定义：页面里用 class="hide" / classList.toggle('hide') 控制显隐，
      但早先漏了这条规则 —— 于是 #staggerBox 和「停止调度」按钮根本藏不住
      （实测表现为顶部多出一个空白卡片）*/
@@ -935,11 +1353,75 @@ GW_PAGE = """<!DOCTYPE html>
   button:focus-visible,.acts a:focus-visible,.sw .sl:focus-visible{
         outline:2px solid #2563eb;outline-offset:2px}
   .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+  /* ---- 视觉增强（2026-09-16）：只加外观属性，不动尺寸/布局/结构 ----
+     卡片 hover 只改阴影、不做位移，避免浮起干扰点击开关。 */
+  body{background:linear-gradient(160deg,#f7f9fc 0%,#eef2f9 45%,#e8eef8 100%);
+       -webkit-font-smoothing:antialiased}
+  .card{background:linear-gradient(180deg,#fff 0%,#fdfeff 100%);border-color:#e8ecf3;
+        box-shadow:0 1px 2px rgba(16,24,40,.04),0 10px 28px -12px rgba(16,24,40,.12);
+        transition:box-shadow .18s ease,border-color .18s ease}
+  .card:hover{box-shadow:0 2px 6px rgba(16,24,40,.06),0 16px 36px -14px rgba(16,24,40,.18);
+        border-color:#dde4ef}
+  button{background:linear-gradient(180deg,#3b82f6 0%,#2563eb 100%);
+         box-shadow:0 1px 2px rgba(37,99,235,.26),0 6px 14px -6px rgba(37,99,235,.42);
+         transition:transform .16s ease,box-shadow .16s ease,filter .16s ease}
+  button:hover:not(:disabled){transform:translateY(-1px);
+         box-shadow:0 2px 4px rgba(37,99,235,.3),0 10px 22px -8px rgba(37,99,235,.5)}
+  button:active:not(:disabled){transform:translateY(0);filter:brightness(.97)}
+  button.ghost{background:linear-gradient(180deg,#fff 0%,#fafbfd 100%);
+         box-shadow:0 1px 2px rgba(16,24,40,.05)}
+  button.ghost:hover:not(:disabled){border-color:#b9c6dc;background:#fff;
+         box-shadow:0 2px 6px rgba(16,24,40,.08)}
+  button.danger{background:linear-gradient(180deg,#ef4444 0%,#dc2626 100%);
+         box-shadow:0 1px 2px rgba(220,38,38,.26),0 6px 14px -6px rgba(220,38,38,.42)}
+  .pbar{box-shadow:0 1px 2px rgba(16,24,40,.06) inset}
+  .pfill{background:linear-gradient(90deg,#34d399 0%,#22c55e 100%);
+         box-shadow:0 0 8px rgba(34,197,94,.32)}
+  .plat{transition:background .18s ease,color .18s ease,border-color .18s ease,box-shadow .18s ease}
+  .plat.on{background:linear-gradient(180deg,#3b82f6 0%,#2563eb 100%);
+         box-shadow:0 1px 2px rgba(37,99,235,.25),0 6px 14px -6px rgba(37,99,235,.5)}
+  .fab{box-shadow:0 4px 12px rgba(37,99,235,.32),0 12px 28px -8px rgba(37,99,235,.48);
+       transition:transform .18s ease,box-shadow .18s ease}
+  .fab:hover{transform:translateY(-2px)}
+  .hint{background:linear-gradient(180deg,#f8fafd 0%,#f4f7fb 100%)}
+  @media (prefers-reduced-motion: reduce){
+    button,.card,.plat,.fab{transition:none}
+    button:hover:not(:disabled),button:active:not(:disabled),.fab:hover{transform:none}
+  }
+  /* ---- 视觉增强·第二轮：精致化细节，仍只加外观属性 ---- */
+  ::-webkit-scrollbar{width:10px;height:10px}
+  ::-webkit-scrollbar-track{background:transparent}
+  ::-webkit-scrollbar-thumb{background:rgba(100,116,139,.28);border-radius:999px;
+        border:2px solid transparent;background-clip:content-box}
+  ::-webkit-scrollbar-thumb:hover{background:rgba(100,116,139,.45);background-clip:content-box}
+  button,.card,.plat{transition-timing-function:cubic-bezier(.22,.61,.36,1)}
+  body{animation:fadeIn .28s cubic-bezier(.22,.61,.36,1)}
+  @keyframes fadeIn{from{opacity:0}to{opacity:1}}
+  ::selection{background:rgba(37,99,235,.16)}
+  .head h1{position:relative;padding-left:12px}
+  .head h1::before{content:"";position:absolute;left:0;top:50%;transform:translateY(-50%);
+        width:3.5px;height:20px;border-radius:2px;
+        background:linear-gradient(180deg,#60a5fa,#2563eb)}
+  .pfill{position:relative;overflow:hidden}
+  .pfill::after{content:"";position:absolute;inset:0;
+        background:linear-gradient(90deg,transparent,rgba(255,255,255,.42),transparent);
+        animation:shine 2.4s cubic-bezier(.22,.61,.36,1) infinite}
+  @keyframes shine{0%{transform:translateX(-100%)}100%{transform:translateX(200%)}}
+  .tag{letter-spacing:.2px}
+  .empty{background:linear-gradient(180deg,#fbfcfe 0%,#f6f8fb 100%)}
+  @media (prefers-reduced-motion: reduce){
+    body{animation:none}
+    .pfill::after{animation:none;display:none}
+  }
 </style></head><body>
 <div class="wrap">
   <div class="head">
     <h1>多账号刷课控制台</h1>
     <div class="sub">一个入口管理所有账号实例 · <span id="who"></span></div>
+  </div>
+  <div class="platbar">
+    <a class="plat on" href="/">学习通</a>
+    <a class="plat" href="/wb/">安全微伴</a>
   </div>
   <div class="statrow">
     <span id="sum" class="tag">加载中…</span>
