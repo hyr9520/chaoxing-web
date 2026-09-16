@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import functools
 import json
+import os
 import random
 import secrets
 import re
@@ -1571,7 +1572,15 @@ class Chaoxing:
                             _parts = [p.strip() for p in
                                       re.split(r"\s*[|｜\n]\s*|\s*[，,]\s*", str(res))
                                       if p.strip()]
-                        if _n_blank > 1:
+                        # ⚠️ 2026-09-16 修复「填空题整题提交为空」：此前条件是 _n_blank > 1，
+                        # 单空（_n_blank == 1）落进下面的 else，**不写 _blank_parts**；
+                        # 提交阶段于是走 `answer{qid}` 兜底分支 —— 而 PC 版页面根本没有
+                        # answer{qid} 这个可提交字段（它只是回显用），_set_field 命中不到
+                        # 就静默丢弃 → 平台收到空值 → 整题 0 分且不报任何错。
+                        # 实测对照：光纤 7.9 的多空题（5/3/2 空）字段是 answerEditor{qid}N，
+                        # 能提交；区域经济学 1.6/3.8 的单空题全是「我的答案：(1)」空 = 0 分。
+                        # 单空与多空的真实字段同为 answerEditor{qid}1，故统一走该分支。
+                        if _n_blank >= 1:
                             # 兜底（2026-09-13 实测补充）：模型偶尔仍把 N 个空的答案
                             # 拼成一整串放进数组唯一元素。此时按句末标点再拆一次；
                             # **只在拆分结果正好等于空数时**采用，避免误拆。
@@ -1759,10 +1768,17 @@ class Chaoxing:
                         else:
                             pairs.append([nm, _el.get("value", "") or ""])
 
+                    # 未命中的字段名先收集，提交前汇总告警一次。
+                    # 「静默跳过」曾把"字段名拼错"伪装成"提交成功"——填空题 0 分
+                    # 的根因就是这个，藏了很久才被翻出来。
+                    _missed_fields = []
+
                     def _set_field(name, val):
                         for _i2, (_nm, _v) in enumerate(pairs):
                             if _nm == name:
                                 pairs[_i2][1] = val
+                                return
+                        _missed_fields.append(name)
 
                     wqbid_ids = []
                     for q in q_list:
@@ -1808,6 +1824,19 @@ class Chaoxing:
                             wqbid_ids.append(qid)
                     _set_field("answerwqbid", "".join(x + "," for x in wqbid_ids))
                     _set_field("pyFlag", questions["pyFlag"])
+
+                    # 排错开关（默认关闭，不影响生产）：把填空相关字段的最终提交值
+                    # 打出来。填空题"整题提交为空却毫无报错"这类问题只有看到它才能定位。
+                    if os.environ.get("CK_DUMP_FORM") == "1":
+                        _dump = [(n, (v or "")[:36]) for n, v in pairs
+                                 if n.startswith(("answerEditor", "tiankongsize"))]
+                        logger.info(f"[表单dump] 填空相关字段 {len(_dump)} 个 -> {_dump}")
+
+                    if _missed_fields:
+                        logger.warning(
+                            f"以下 {len(_missed_fields)} 个字段在提交表单中不存在，"
+                            f"已跳过（若为 answer{{qid}} 属正常回显字段）："
+                            f"{_missed_fields[:12]}")
 
                     if questions["pyFlag"] == "1":
                         enc_work = next((v for nm, v in pairs if nm == "enc_work"), "")
