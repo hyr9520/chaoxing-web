@@ -1,4 +1,5 @@
 import configparser
+import difflib
 import json
 import os
 import random
@@ -18,6 +19,7 @@ from openai import OpenAI
 from urllib3 import disable_warnings, exceptions
 
 from api.answer_check import check_answer, plausible_answer, is_listening_question
+from api import ai_vote
 from api.config import data_dir
 from api.image_support import build_image_data_urls
 from api.learned import LearnedAnswers, normalize_title
@@ -26,8 +28,23 @@ from api.logger import logger
 # 关闭警告
 disable_warnings(exceptions.InsecureRequestWarning)
 
-__all__ = ["CacheDAO", "Tiku", "TikuFallback", "TikuYanxi", "TikuGo", "TikuLike", "TikuAdapter", "AI", "SiliconFlow",
-           "TikuManual"]
+__all__ = ["CacheDAO", "Tiku", "TikuFallback", "TikuYanxi", "TikuGo", "TikuLike", "TikuAdapter", "TikuHive",
+           "TikuJszkk", "AI", "SiliconFlow", "TikuManual", "AIKeyExhaustedError"]
+
+
+class AIKeyExhaustedError(Exception):
+    """🔴 2026-09-26 23:40 新增：AI 题库的**全部 Key 都不可用**（额度耗尽/Key 无效）。
+
+    为什么要单独一个异常类型：
+      多 Key 池全部打光后，如果直接把 SDK 原始异常（401/429）抛出去，
+      它会一路穿透 `_query_locked` → `_query`（降级分支）=无匹配 → `_call`
+      → `TikuFallback._query` 的 `except Exception` 虽会兜住，
+      但**日志语义混乱**，且 `_query` 的模型降级分支会先错误地尝试
+      "换模型重试"（同一个死 Key，必然再次 401），白白多打一轮请求。
+      ⇒ 用专用类型让上层**明确识别**"这是 Key 级故障、换模型没用、应直接
+        回退到下一个题库"。
+    """
+    pass
 
 
 class CacheDAO:
@@ -234,6 +251,26 @@ def _apply_verified_subs(ans: str, sub_verified: dict, wrong: list = None,
     return cand
 
 
+_JUDGE_T = {"对", "正确", "是", "√", "true", "t", "yes", "y", "1"}
+_JUDGE_F = {"错", "错误", "否", "×", "x", "false", "f", "no", "n", "0",
+            "不对", "不正确"}
+
+
+def judge_key(s):
+    """判断题答案归一 → True / False / None（无法判断）。2026-09-27 新增。
+
+    必要性：平台展示用「正确/错误」，而学习库 wrong 列表里常存「对/错」，
+    两者直接字符串比对**会漏判**（"错误" in ["错"] == False）→ 已证伪的答案
+    被漏掉，又提交一遍。凡是判断类比对都要先过这里。
+    """
+    t = str(s or "").strip().lower()
+    if t in _JUDGE_T:
+        return True
+    if t in _JUDGE_F:
+        return False
+    return None
+
+
 def _pick_alternative(ans: str, wrong: list, q_info: dict) -> str:
     """给出一个"不同于所有历史错误答案"的候选（2026-09-11 硬保证）。
 
@@ -242,17 +279,45 @@ def _pick_alternative(ans: str, wrong: list, q_info: dict) -> str:
     导致同一道错题被反复提交同一个错误值（听力题只能做一次，本账号无从纠正）。
 
     策略：
-      - 单字母（单选/判断）：从选项池里挑第一个不在 wrong 中的
-      - 连写字母（听力多小问，如 "DCBD"）：只改动其中一位，
+      - 判断（对/错）：直接取反（形态保持不变，如 正确↔错误）
+      - 单字母（单选）：从选项池里挑第一个不在 wrong 中的
+      - 连写字母（多选 / 听力多小问）：只改动其中一位，
         生成第一个不在 wrong 中的组合（从首位开始尝试）
+      - 自由文本（填空/简答）：无候选池，返回空串（调用方据此放弃本题）
     都试不出来时返回空串（调用方据此放弃写入题库）。
     """
     text = str(ans or "").strip()
     wrong_set = {str(w).strip() for w in (wrong or [])}
-    if not text or not re.fullmatch(r"[A-Za-z]+", text):
-        return ""          # 非纯字母形态（填空题/文本答案）无法安全构造候选
+    if not text:
+        return ""
+
+    text = str(text).strip()
+    if not text:
+        return ""
+
+    # 🔴 2026-09-27 新增：判断题支持换候选（此前直接落到"非字母形态"分支被放弃）。
+    k = judge_key(text)
+    if k is not None:
+        for _a, _b in (("对", "错"), ("正确", "错误"), ("是", "否"),
+                       ("√", "×"), ("true", "false")):
+            if text.lower() == _a:
+                alt = _b
+                break
+            if text.lower() == _b:
+                alt = _a
+                break
+        else:
+            alt = "错" if k else "对"
+        _k2 = judge_key(alt)
+        if any(judge_key(w) is _k2 for w in wrong_set):
+            return ""          # 反值也被判错过 → 无解
+        return alt
+
+    if not re.fullmatch(r"[A-Za-z]+", text):
+        return ""          # 填空/自由文本无法安全构造候选
     text = text.upper()
     pool = _option_pool(q_info)
+    is_multi = (q_info.get("type") == "multiple")
 
     if len(text) == 1:
         for c in pool:
@@ -260,15 +325,98 @@ def _pick_alternative(ans: str, wrong: list, q_info: dict) -> str:
                 return c
         return ""
 
-    # 多小问连写：逐位尝试替换
+    # 连写字母：逐位尝试替换
+    # 🔴 2026-09-27 修：多选替换后必须**无重复字母** ——
+    #    旧逻辑会造出 "BBD" 这种非法多选答案（实测）。
     for i in range(len(text)):
         for c in pool:
             if c == text[i]:
                 continue
             cand = text[:i] + c + text[i + 1:]
+            if is_multi and len(set(cand)) != len(cand):
+                continue
             if cand not in wrong_set:
                 return cand
     return ""
+
+
+# ── 2026-09-27 新增：填空答案字符规范化 + 选项一致性校验 ────────────────────
+#    两个都是真机实测暴露出来的丢分点，详见各自 docstring。
+
+_SUB_SUP = str.maketrans({
+    "₀": "0", "₁": "1", "₂": "2", "₃": "3", "₄": "4",
+    "₅": "5", "₆": "6", "₇": "7", "₈": "8", "₉": "9",
+    "⁰": "0", "¹": "1", "²": "2", "³": "3", "⁴": "4",
+    "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9",
+})
+
+_FULLWIDTH_ALNUM = {}
+for _i in range(10):
+    _FULLWIDTH_ALNUM[chr(0xFF10 + _i)] = chr(0x30 + _i)      # ０-９
+for _i in range(26):
+    _FULLWIDTH_ALNUM[chr(0xFF21 + _i)] = chr(0x41 + _i)      # Ａ-Ｚ
+    _FULLWIDTH_ALNUM[chr(0xFF41 + _i)] = chr(0x61 + _i)      # ａ-ｚ
+
+
+def normalize_fill_answer(ans: str) -> str:
+    """填空题答案字符规范化。
+
+    真机实测（2026-09-27 A 卷 / 100 题作业第 62 题）：AI 把化学式写成
+    `H₂O` `CO₂`（Unicode 下标数字），平台正确答案是 `H2O` `CO2`（普通数字）。
+    平台对填空题做**字符串精确比较** → 界面显示"学生答案与正确答案一模一样"
+    却判 0 分（用户截图实证：学生答案 H₂O/CO₂、正确答案 H2O/CO2、得分 0）。
+
+    处理范围**刻意保守**，避免误伤中文答案：
+      · Unicode 上下标数字 → 普通数字（H₂O → H2O）
+      · 全角字母/数字 → 半角（只动 0-9 A-Z a-z，**不动中文标点**，
+        否则"，（U+FF0C）"会被转成半角逗号，反而与平台答案失配）
+      · 连续空白收敛 + 去首尾空白
+    """
+    s = str(ans or "")
+    if not s:
+        return ""
+    s = s.translate(_SUB_SUP)
+    s = "".join(_FULLWIDTH_ALNUM.get(ch, ch) for ch in s)
+    s = re.sub(r"[ \t\u3000]+", " ", s).strip()
+    return s
+
+
+def _opt_list(options) -> list:
+    """把选项拆成"纯内容"列表（去掉 A./B. 前缀与空白），**顺序敏感**。
+
+    兼容 `"A. 21\\nB. 80"` / `["21", "80"]` / `"21|80"` 三种形态。
+    """
+    if isinstance(options, (list, tuple)):
+        items = [str(x) for x in options]
+    else:
+        items = re.split(r"[\n|]+", str(options or ""))
+    out = []
+    for it in items:
+        t = re.sub(r"^\s*[A-Ha-h]\s*[.、．:：]\s*", "", str(it).strip())
+        t = re.sub(r"\s+", "", t)
+        if t:
+            out.append(t)
+    return out
+
+
+def options_compatible(cur_options, lib_options) -> bool:
+    """按题干命中的**字母答案**能否用在当前题目上。
+
+    学习库 / TikuAdapter 的字母，是"那道题在那份试卷里的选项编号"。
+    当前题目选项若与之不同（数量、顺序或内容不同），字母必然错位。
+
+    实测两例（2026-09-27 A 卷）：
+      · 「下列属于中国四大名著的有？」库里 verified=ABC，答成 ABD
+      · 「下列属于 HTTP 请求方法的有？」库里 verified=ABCD，答成 ABC
+
+    返回 True = 兼容可用；False = 明确不兼容（调用方须放弃该答案）。
+    任一侧取不到选项（老数据）时返回 True —— 不做过度拦截，保持旧行为。
+    """
+    cur = _opt_list(cur_options)
+    lib = _opt_list(lib_options)
+    if len(cur) < 2 or len(lib) < 2:
+        return True
+    return cur == lib
 
 
 class Tiku(ABC):
@@ -284,6 +432,11 @@ class Tiku(ABC):
     DISABLE = False  # 停用标志
     SUBMIT = False  # 提交标志
     COVER_RATE = 0.8  # 覆盖率
+    # 🔴 2026-09-26：默认**禁止**在"有题没拿到答案"时硬交。
+    # 用户原话：「不会让这个类似的事情发生」。默认 False = 只要有题没答案
+    # 就存草稿、不交卷（见 base.py study_work_homework 的拦截分支）。
+    # 只有显式置 True 才允许带着蒙的答案交卷 —— 那是用户主动选择的冒险。
+    FORCE_SUBMIT = False
     true_list = None
     false_list = None
 
@@ -396,10 +549,11 @@ class Tiku(ABC):
         # 单题路径上也成立。
         if not self._is_manual_mode:
             try:
-                _verified = LearnedAnswers().get_verified(q_info['title'])
+                _rec = LearnedAnswers().get_verified_record(q_info['title'])
             except Exception as e:
                 logger.warning(f"读取学习库失败（不影响作答）：{e}")
-                _verified = ""
+                _rec = {}
+            _verified = (_rec or {}).get("answer") or ""
             # 2026-09-15 补：与 query_all() 对齐，学习库值也要过形态校验。
             # 此前 query() 直接返回 verified，若学习库里存的是脏值
             # （旧版程序写入的拒答文本、或题型变更导致形态不符），
@@ -407,12 +561,119 @@ class Tiku(ABC):
             # 单题路径缺了这道闸。
             if _verified:
                 _ok = plausible_answer(_verified, q_info.get('type'))
+                # 🔴 2026-09-27 新增：**选项一致性闸门**。
+                # 学习库按"题干"归一化匹配，不看选项 —— 同一题干在不同试卷里
+                # 选项数/顺序不同时，库里的旧字母必然错位。实测 A 卷：
+                # 「四大名著」库 verified=ABC 却答成 ABD；「HTTP 方法」库
+                # verified=ABCD 却答成 ABC。两道都是这么错的。
+                if _ok and not options_compatible(q_info.get('options'),
+                                                  (_rec or {}).get("options")):
+                    logger.warning(
+                        f"学习库答案与本题选项不一致（按题干命中会字母错位），"
+                        f"视为未命中改走重新查询：{q_info['title']} -> {_verified}")
+                    _ok = False
                 if _ok or getattr(self, 'is_manual', False):
                     logger.info(f"从学习库获取答案（已验证）：{q_info['title']} -> {_verified}")
                     return _verified
                 logger.warning(
                     f"学习库答案形态与题型不符，视为未命中重新查询："
                     f"{q_info['title']} -> {_verified}")
+
+        # 🔴 2026-09-26 修 bug：把"取到答案后的收口"抽成局部函数。
+        # 原代码里 `answer = self._query(q_info)` 出现在两处（438 行「缓存被判错后
+        # 重查」、443 行「缓存未命中」），**两处都没有 return**，控制流直接掉到
+        # 函数末尾的 `return None` → AI/题库明明给出了答案却被丢掉。
+        # 线上症状：日志里「AI大模型答题 命中答案」紧接着「题目 xxx 未能获取答案」
+        # → 填空题被判空答案、判断题随机蒙 → 提交出去的是垃圾。
+        def _accept(ans):
+            """非空即返回（本类 skip_answer_validation=True，不再做形态校验）。
+
+            🔴 2026-09-27 修：单选/多选补「选项内容 → 选项字母」映射。
+            AI 提示词按设计要求返回**选项的具体内容**（内容比字母可靠，避免
+            长选项时字母错位），但平台单选/多选只认字母 —— query_all() 有
+            map_single/multiple_answer 兜底，本单题路径（作业走这条）此前
+            没有 → 内容形态答案被原样提交 → 客观题全错。此处与 query_all 对齐。
+            """
+            if ans is None:
+                return None
+            ans = str(ans).strip()
+            if not ans:
+                return None
+            _qtype = q_info.get('type')
+            if (_qtype in ('single', 'multiple')
+                    and not getattr(self, 'is_manual', False)):
+                # 已是字母形态直接放行（single=单字母，multiple=连写/分隔字母串）
+                _letter_form = (re.fullmatch(r'[A-Za-z]', ans) if _qtype == 'single'
+                                else re.fullmatch(r'[A-Za-z]{1,8}', ans))
+                if not _letter_form:
+                    try:
+                        # 延迟导入，避免循环依赖（同 query_all）
+                        from api.base import map_single_answer, map_multiple_answer
+                        mapped = (map_multiple_answer(ans, q_info.get('options') or '')
+                                  if _qtype == 'multiple'
+                                  else map_single_answer(ans, q_info.get('options') or '')) or ''
+                    except Exception as e:
+                        logger.debug(f"选项内容映射字母失败: {e}")
+                        mapped = ''
+                    if mapped:
+                        logger.info(f"答案按选项内容映射为选项字母：{ans[:60]} -> {mapped}")
+                        ans = mapped
+                    else:
+                        # 映射不出来的必是拒答文本/垃圾（如"我无法访问音频…"），
+                        # 提交上去必判错还会污染真实答案率 → 与 query_all 一致舍弃。
+                        logger.warning(f"答案无法映射为选项字母，已舍弃："
+                                       f"{q_info['title'][:50]} -> {ans[:60]}")
+                        return None
+            if _qtype not in ('single', 'multiple'):
+                # 🔴 2026-09-27 新增：填空/文本答案做字符规范化。
+                # 真机实证（100 题作业第 62 题）：AI 答 `H₂O` `CO₂`（Unicode 下标），
+                # 平台正确答案是 `H2O` `CO2` → 平台精确比较判 0 分，
+                # 界面上"学生答案"和"正确答案"看起来一模一样（用户截图）。
+                _n = normalize_fill_answer(ans)
+                if _n and _n != ans:
+                    logger.info(f"填空/文本答案字符规范化：{ans[:40]} -> {_n[:40]}")
+                if _n:
+                    ans = _n
+            # 🔴 2026-09-27 新增：**已证伪答案拦截**（对所有来源生效）。
+            # 背景（用户追问"题库命中但平台判错会怎么处理"查出来的真隐患）：
+            #   · 学习库判错时会**撤销 verified**（learned.py:270 `rec.pop("verified")`），
+            #     这条链路是通的；
+            #   · 但回灌进 **tikuAdapter/tiku.db 的记录只插不更新**
+            #     （sync_learned_to_tiku.py:478 `if q in exist2: return False`），
+            #     没有 UPDATE / DELETE → 曾被判错的答案会**永久留在外部题库**里。
+            # 结果：学习库撤销了、外部题库还留着 → 下次命中 → 又提交同一个错答案。
+            # 这里在**统一收口**处补一道闸：答案落在 wrong 列表 → 换候选；
+            # 换不出 → 放弃本题（宁空不污）。与用户 2026-09-11 提的
+            # "第二次还返回相同答案就驳回"要求一致，且覆盖 AI/题库/学习库全来源。
+            try:
+                _wrong = LearnedAnswers().get_wrong(q_info['title'])
+            except Exception as _e:                           # noqa: BLE001
+                logger.debug(f"读取错题列表失败（忽略，不影响作答）：{_e}")
+                _wrong = []
+            if _wrong and not getattr(self, 'is_manual', False):
+                _hit = ans in _wrong
+                if not _hit:
+                    # 判断题走等价比对：平台展示用「正确/错误」，
+                    # 而库里 wrong 常存「对/错」→ 直接字符串比对会漏判。
+                    _k = judge_key(ans)
+                    if _k is not None:
+                        _hit = any(judge_key(w) is _k for w in _wrong)
+                if _hit:
+                    _alt = _pick_alternative(ans, _wrong, q_info)
+                    if _alt:
+                        logger.warning(
+                            f"答案曾被平台判错（{_wrong[:3]}），强制改用另一个候选："
+                            f"{q_info['title'][:40]} {ans} -> {_alt}")
+                        ans = _alt
+                    else:
+                        logger.warning(
+                            f"答案曾被平台判错且无可替换候选，放弃本题（宁空不污）："
+                            f"{q_info['title'][:40]} -> {ans}")
+                        return None
+            logger.info(f"从{self.name}获取答案：{q_info['title']} -> {ans}")
+            if getattr(self, 'is_manual', False):
+                CacheDAO().add_cache(q_info['title'], ans)
+            return ans
 
         # 先过缓存（若存在章节检测错误反馈，说明处于重做模式，跳过缓存让大模型参考反馈重新作答）
         if not getattr(self, 'work_feedback', None):
@@ -435,12 +696,16 @@ class Tiku(ABC):
                 if _wrong and answer.strip() in _wrong and not self._is_manual_mode:
                     logger.info(f"缓存答案曾被平台判错，改走重新分析："
                                 f"{q_info['title']} -> {answer}")
-                    answer = self._query(q_info)
+                    # 🔴 2026-09-26 修：这里原先只赋值不返回，答案被
+                    # 函数末尾的 return None 吃掉。走统一收口。
+                    return _accept(self._query(q_info))
                 else:
                     logger.info(f"从缓存中获取答案：{q_info['title']} -> {answer}")
                     return answer.strip()
             else:
-                answer = self._query(q_info)
+                # 🔴 2026-09-26 修：缓存未命中 → 问题库。原先缺 return，
+                # 导致**所有非重做模式的题目一律拿不到答案**（线上事故根因）。
+                return _accept(self._query(q_info))
         else:
             answer = self._query(q_info)
             if answer:
@@ -824,6 +1089,14 @@ class TikuFallback(Tiku):
         for provider in self.providers:
             try:
                 answer = provider._query(q_info)
+            except AIKeyExhaustedError as e:
+                # 🔴 2026-09-26 23:40：Key 池全废是**预期内**的降级路径
+                # （免费额度打光），用 warning + 不打堆栈，避免日志被
+                # 长 traceback 淹没（真机踩坑：一题一个 60 行堆栈）。
+                logger.warning(
+                    f'{provider.name} 的 AI Key 已全部耗尽，'
+                    f'回退到下一个题库：{e}')
+                continue
             except Exception as e:
                 provider_id = f'{provider.name}({provider.__class__.__name__})'
                 logger.exception(f'{self.name} 查询时 {provider_id} 异常: {e}')
@@ -837,7 +1110,12 @@ class TikuFallback(Tiku):
                 logger.info(f'{provider.name} 命中答案')
                 return answer
 
-            logger.info(f'{provider.name} 返回答案类型不符，回退到下一个题库')
+            # 🔴 2026-09-27：把「被拒的原始答案 + 判定上下文」打出来。
+            # 起因：考试题日志只有「返回答案类型不符」，看不到 AI 究竟答了什么，
+            # 完全没法定位（type 是数字还是字符串、答案是正文还是多行…）。
+            logger.info(
+                f'{provider.name} 返回答案类型不符，回退到下一个题库'
+                f'｜type={q_info.get("type")!r} 原始答案={str(answer)[:150]!r}')
         return None
 
     def _query_all(self, q_list: list[dict], query_delay: float = 0.0) -> list[Optional[str]]:
@@ -853,6 +1131,11 @@ class TikuFallback(Tiku):
             sub_q_list = [q_list[idx] for idx in pending_indices]
             try:
                 sub_results = provider.query_all(sub_q_list, query_delay=query_delay)
+            except AIKeyExhaustedError as e:
+                logger.warning(
+                    f'{provider.name} 的 AI Key 已全部耗尽，'
+                    f'批量查询跳过该题库：{e}')
+                continue
             except Exception as e:
                 provider_id = f'{provider.name}({provider.__class__.__name__})'
                 logger.exception(f'{self.name} 批量查询时 {provider_id} 异常: {e}')
@@ -951,7 +1234,7 @@ class TikuYanxi(Tiku):
             self._times = res_json["data"].get("times", self._times)
             return res_json['data']['answer'].strip()
         else:
-            logger.error(f'{self.name}查询失败:\n{res.text}')
+            logger.error(f'{self.name}查询失败:\n{res.text[:500]}')
         return None
 
     def load_token(self):
@@ -1014,13 +1297,13 @@ class TikuGo(Tiku):
 
     def _parse_response(self, res: requests.Response) -> Optional[dict]:
         if res.status_code != 200:
-            logger.error(f'{self.name}查询失败: 状态码 {res.status_code}, 响应: {res.text}')
+            logger.error(f'{self.name}查询失败: 状态码 {res.status_code}, 响应: {res.text[:500]}')
             return None
 
         try:
             res_json = res.json()
         except ValueError:
-            logger.error(f'{self.name}查询失败: 返回内容不是有效JSON, 响应: {res.text}')
+            logger.error(f'{self.name}查询失败: 返回内容不是有效JSON, 响应: {res.text[:500]}')
             return None
 
         try:
@@ -1275,7 +1558,7 @@ class TikuLike(Tiku):
         elif res.status_code == 403:
             logger.error(f'{self.name}访问被拒绝: 可能是Token权限不足')
         else:
-            logger.error(f'{self.name}查询失败: 状态码 {res.status_code}, 响应内容: \n{res.text}')
+            logger.error(f'{self.name}查询失败: 状态码 {res.status_code}, 响应内容: \n{res.text[:500]}')
 
         return None
 
@@ -1485,9 +1768,24 @@ class TikuAdapter(Tiku):
         # 传给 TikuAdapter 后 hash 变成 md5(q + '[""]' + type + plat)，
         # 与库里的 md5(q + "[]" + type + plat) 不一致 —— 听力题（选项都嵌在
         # 题干里、options 为空）因此永远搜不到。空串必须产出 []。
-        raw_options = q_info['options'] or ''
-        options = [sub(r'^[A-Za-z]\.?、?\s?', '', option)
-                   for option in raw_options.split('\n') if option.strip()]
+        # 🔴 2026-09-27 修 bug：考试链路传的 options 是 **list[dict]**
+        #    （{letter, value, text}），此前无条件当字符串 `.split('\n')`
+        #    → AttributeError，导致**考试每一题的 TikuAdapter 查询都崩**。
+        _raw_opts = q_info.get('options')
+        if isinstance(_raw_opts, (list, tuple)):
+            _lines = []
+            for _o in _raw_opts:
+                if isinstance(_o, dict):
+                    _L = str(_o.get('letter') or _o.get('value') or '').strip()
+                    _T = str(_o.get('text') or '').strip()
+                    if _L or _T:
+                        _lines.append(f"{_L}. {_T}" if _T else _L)
+                elif str(_o).strip():
+                    _lines.append(str(_o))
+            options = [sub(r'^[A-Za-z]\.?、?\s?', '', o) for o in _lines if o.strip()]
+        else:
+            options = [sub(r'^[A-Za-z]\.?、?\s?', '', option)
+                       for option in (_raw_opts or '').split('\n') if option.strip()]
         # 2026-09-14 【听力题专项】type=4 一律不带选项查询。
         # 实测（3.5 题）：正确答案 BAD 就在题库里，但查询侧把每道小题的
         # A/B/C/D 拼成 12 个选项发出去，而题库里听力题的 options 存的是 []，
@@ -1525,6 +1823,56 @@ class TikuAdapter(Tiku):
             if not len(best):
                 logger.debug("未命中，返回：" + res.text[:200])
                 return None
+            # 🔴 2026-09-27 新增：**选项集合校验**（拦"串味命中"）。
+            # 背景：自制题实测 —— AI 21/21 全对，TikuAdapter 27 题错 11 题，
+            # 全部是"题库返回了另一道题的答案"（模糊匹配所致）：
+            #   "下列哪个**不是**哺乳动物" → 返回"鲸"；"四大发明" → 返回"针灸"；
+            #   "长江是中国第一长河" → 返回"错误"（命中了"黄河…"那道题）。
+            # ⚠️ **实测结论（很重要，别重复踩）**：对当前这套 TikuAdapter，
+            #    **这道校验拦不到任何串味**（错题与好题的 options 集合 100% 一致）
+            #    —— 因为它把 `options` 原样回显我们传入的值，而不是回库中题的选项。
+            #    但实测也 **0 误伤**，成本极低，故保留：换题库源/换实现时可能有用。
+            #    真正可靠的兜底仍是 AI（见 _accept 的映射兜底与 query 的 provider 链）。
+            _lib_opts = res_json.get("options")
+            if isinstance(_lib_opts, list) and _lib_opts and options:
+                def _oset(xs):
+                    return {re.sub(r"[\s\u3000,，。.、;；:：!！?？\"'“”‘’()（）\[\]【】]+",
+                                   "", str(x)).lower()
+                            for x in xs if str(x).strip()}
+                _a, _b = _oset(_lib_opts), _oset(options)
+                if _a != _b:
+                    logger.warning(
+                        f"{self.name} 选项集合与本题不符（串味命中，库中是另一道题）"
+                        f"→ 拒绝并交下一个题库：{q_info['title'][:40]}")
+                    return None
+            # 🔴 2026-09-27 新增：**答案歧义拒绝**。
+            # 真机实证（A 卷第 4 题「下列哪个不是哺乳动物？」）：题库里同时存在
+            # "鲸" 与 "企鹅" 两条互相冲突的记录 ——
+            # 响应 allAnswer=[["鲸"],["企鹅"]]，作业那次选中 "鲸" → 判错；
+            # 事后重查同一接口又选中 "企鹅"。这种"同题多答案"的记录不可采信：
+            # 按未命中处理，交给后续题库/AI（腾讯额度充足，宁可多问一次也要答对）。
+            try:
+                _ans_obj = res_json.get("answer") or {}
+                _all = _ans_obj.get("allAnswer") or []
+                _uniq = set()
+                for _x in _all:
+                    _t = ("".join(_x) if isinstance(_x, (list, tuple))
+                          else str(_x)).strip()
+                    # 🔴 规范化后再比对：题库里常有"长度单位"与"长度单位,"这类
+                    # **只差标点**的成对记录（实测误报两例：光年 / 物种起源），
+                    # 那不是真冲突。必须先去标点空白再判重，否则会把好答案拒掉、
+                    # 白白多问一次 AI。
+                    _t = re.sub(r"[\s,，。.、;；:：!！?？\"'“”‘’]+", "", _t)
+                    if _t:
+                        _uniq.add(_t)
+                if len(_uniq) > 1:
+                    logger.warning(
+                        f"{self.name} 题库答案存在冲突（{sorted(_uniq)[:4]}），"
+                        f"不可采信 → 按未命中处理交下一个题库："
+                        f"{q_info['title'][:40]}")
+                    return None
+            except Exception as _e:                       # noqa: BLE001
+                logger.debug(f"答案歧义检测失败（忽略，不影响作答）：{_e}")
             sep = "\n"
             return sep.join(best).strip()
         logger.debug(f'{self.name} 查询返回非 200: {res.status_code}')
@@ -1560,6 +1908,299 @@ class TikuAdapter(Tiku):
         self.api = url
 
 
+class TikuHive(Tiku):
+    """OnlineCourseAPI（hive-net.cn）—— 第三个免费题库兜底（2026-09-29 接入）。
+
+    定位：`TikuAdapter`（本地库 + 不挂科）未命中时，再问一次这个免费网课题库，
+    最后才落到 AI。用户原话：「多个题库对应一个题库」「首要是不付费的」。
+
+    实测（2026-09-29，40 道超星真题对拍）：
+      · 题干完全一致（相似度 ≥0.95）：10/40 → **覆盖面约 25%**
+      · 其中答案与本地库一致 8/10；另 2 道是**多选题库只存了部分选项**，
+        外部源给的 ABC/ABCD 反而更完整 → 实际准确率 ≈ 10/10
+      · 免费额度 10000 次/天（token=free），实测消耗后余 8900+
+
+    两个**必须**的工程处理（少一个就会引入错误答案）：
+      1. **浏览器 UA**：不带 UA 会被 Cloudflare 拦（HTTP 403, error code 1010）
+      2. **题干相似度闸门（≥0.95）**：它是模糊搜索，实测最佳匹配相似度
+         均值只有 0.599 —— 大量"同类不同题"（问"耳聋基因编码什么"却返回
+         生物学分类词）。不过滤就会把**别的题**的答案填上来。
+
+    安全策略：
+      · 相似度不足 → 按未命中处理（绝不"猜一个"）
+      · 答案字母 → 文本 → **在本题选项里反查**；反查不到也按未命中
+        （避免"外部源与本题选项顺序不同"导致字母错位）
+      · 返回的是**本题选项原文**（与已验证的 TikuAdapter 返回形态一致），
+        避免下游"文本→字母"映射因细微差异失败
+      · 任何异常（超时/解析失败/额度用尽）静默降级，交给下一个 provider
+    """
+
+    DISABLE = False
+    _DEFAULT_URL = "https://www.hive-net.cn/backend/course/search"
+    _DEFAULT_TOKEN = "free"
+    _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+           "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
+    _MIN_SIM = 0.95
+
+    def __init__(self, config_path: Optional[str] = None) -> None:
+        super().__init__(config_path)
+        self.name = 'OnlineCourse题库'
+
+    def _init_tiku(self):
+        # 端点 / 令牌允许用 config.ini [tiku] hive_url / hive_token 覆盖
+        try:
+            self.api = (self._conf.get('hive_url') or '').strip() or self._DEFAULT_URL
+            self._token = (self._conf.get('hive_token') or '').strip() or self._DEFAULT_TOKEN
+        except Exception:
+            self.api = self._DEFAULT_URL
+            self._token = self._DEFAULT_TOKEN
+
+    # ---------- 内部工具 ----------
+    @staticmethod
+    def _clean_title(s) -> str:
+        """去掉与题干无关的装饰：题型前缀 / 题号 / 尾部分值。
+
+        ⚠️ **必须做**（2026-09-29 实测踩坑）：外部源是**关键词模糊搜索**，
+        题干里带着「【单选题】」这类前缀会显著拉低匹配质量 ——
+        同一道题带前缀查相似度仅 0.14~0.20，剥掉前缀后是 **1.00**
+        （「五胡十六国的作战旗号是」实测对比）。
+        """
+        s = str(s or "").strip()
+        s = re.sub(r"^【[^】]{1,8}】\s*", "", s)
+        s = re.sub(r"^\d+[.、]\s*", "", s)
+        s = re.sub(r"（\d+(?:\.\d+)?分）\s*$", "", s)
+        return s.strip()
+
+    @staticmethod
+    def _norm(s) -> str:
+        """题干/选项归一：去题型前缀、题号、空白与标点，统一小写。"""
+        s = str(s or "").strip().lower()
+        s = re.sub(r"^【[^】]{1,8}】\s*", "", s)
+        s = re.sub(r"^\d+[.、]\s*", "", s)
+        return re.sub(r"[\s\u3000,，。;；:：'\"“”‘’()（）\[\]【】_\-—\.、]+", "", s)
+
+    @staticmethod
+    def _parse_opts(text) -> dict:
+        """'A.xxx,B.yyy' / 'A:xxx,B:yyy' / 换行分隔 → {'A': 'xxx', 'B': 'yyy'}。
+
+        ⚠️ 分隔符必须包含**冒号**（2026-09-29 实测踩坑）：外部源的
+        `answer_options` 实际格式是 `A:埃斯库罗斯,B:索福克勒斯,...`，
+        只写 `[.、)．]` 会导致**整条解析为空** → 答案明明命中却被判成
+        "选项无法对应本题"而丢弃。
+        """
+        out = {}
+        for seg in re.split(r"[,\n，;；]", str(text or "")):
+            m = re.match(r"\s*([A-Za-z])\s*[.、\)．:：]\s*(.+?)\s*$", seg.strip())
+            if m:
+                out[m.group(1).upper()] = m.group(2)
+        return out
+
+    @staticmethod
+    def _q_opts(q_info: dict) -> list:
+        """取本题选项文本（兼容 str / list[str] / list[dict] 三种形态）。"""
+        raw = q_info.get("options")
+        out = []
+        if isinstance(raw, (list, tuple)):
+            for o in raw:
+                if isinstance(o, dict):
+                    out.append(str(o.get("text") or o.get("value") or "").strip())
+                else:
+                    out.append(str(o).strip())
+        else:
+            out = [x.strip() for x in str(raw or "").split("\n") if x.strip()]
+        return [re.sub(r"^[A-Za-z][.、\)．]\s*", "", x) for x in out if x]
+
+    # ---------- 主查询 ----------
+    def _query(self, q_info: dict) -> Optional[str]:
+        title = self._clean_title(q_info.get("title"))
+        if len(title) < 6:
+            return None
+        try:
+            res = requests.get(
+                self.api,
+                params={"token": self._token, "question": title},
+                headers={"User-Agent": self._UA,
+                         "Referer": "https://www.hive-net.cn/"},
+                verify=False,
+                timeout=(5, 12),
+            )
+        except requests.RequestException as e:
+            logger.debug(f"{self.name} 请求异常（按未命中处理）: {e}")
+            return None
+        if res.status_code != 200:
+            logger.debug(f"{self.name} 返回非 200: {res.status_code}")
+            return None
+        try:
+            data = res.json().get("data") or {}
+        except Exception as e:
+            logger.debug(f"{self.name} 响应解析失败（按未命中处理）: {e}")
+            return None
+
+        lst = data.get("list") or []
+        if not lst:
+            return None
+
+        # ① 题干相似度闸门
+        tgt = self._norm(title)
+        best, best_sim = None, 0.0
+        for it in lst:
+            s = difflib.SequenceMatcher(
+                None, self._norm(it.get("question")), tgt).ratio()
+            if s > best_sim:
+                best, best_sim = it, s
+        if best is None:
+            return None
+        if best_sim < self._MIN_SIM:
+            logger.info(
+                f"{self.name} 最高相似度仅 {best_sim:.2f}（需 ≥{self._MIN_SIM}），"
+                f"判为误匹配 → 按未命中处理交下一个题库：{title[:36]}")
+            return None
+
+        # ② 答案字母 → 文本 → 本题选项里反查
+        their = self._parse_opts(best.get("answer_options"))
+        letters = re.sub(r"[^A-Za-z]", "", str(best.get("answer") or "")).upper()
+        their_texts = {self._norm(their[ch]) for ch in letters if ch in their}
+        mine = self._q_opts(q_info)
+        picks = [mine[i] for i, o in enumerate(mine) if self._norm(o) in their_texts]
+
+        # 🔴 2026-09-29：**只接受"完整对应"**，不做部分采信、也不做
+        # "条数一致就按字母硬对"。
+        # 理由（实测）：外部源的选项**顺序与本题不同**是常态
+        #   （「情境」题：库=以上都不是/特定的事件/特定的人物关系/特点的时空环境，
+        #     外部源=特点的时空环境/特定的事件/特定的人物关系）。
+        # 一旦按字母直接对应就会全盘错位；而部分对应则会把多选**答漏**
+        # （外部源给 3 项、只对上 2 项 → 提交出去就是错的）。
+        # 所以：对不上就整题放弃，宁可留给 AI。
+        if not picks or len(picks) != len(letters):
+            logger.info(
+                f"{self.name} 命中题干但选项与本题无法完整对应"
+                f"（相似度 {best_sim:.2f}，外部 {len(letters)} 项 / 对上 {len(picks)} 项）"
+                f"→ 按未命中处理：{title[:34]}")
+            return None
+
+        logger.info(
+            f"{self.name} 命中答案（相似度 {best_sim:.2f}）：{title[:36]} "
+            f"-> {len(picks)} 项")
+        # 返回**本题选项原文**，与 TikuAdapter 的返回形态保持一致
+        return "\n".join(picks)
+
+
+class TikuJszkk(Tiku):
+    """「全能搜题」(study.jszkk.com) —— **免费网课题库，免 token**（2026-09-29 接入）。
+
+    来源：扩大搜索时发现（开源项目 study.zmide.com，MIT）。
+    接口：GET `https://study.jszkk.com/api/open/seek?q=<题干>`
+    响应：`{"code":200,"data":{"content":"题目原文","answer":"答案"}}`
+          —— 多选用 `#` 分隔；判断题给 `√` / `×`。
+
+    实测（2026-09-29，40 道超星中文真题）：
+      · 题干命中（相似度 ≥0.95）: **27/40 = 67.5%**
+      · 答案能对上本题选项: **20/40 = 50%**
+      · 其中与本地库一致 18 / 不一致 2 —— **而那 2 个都是它对**：
+          ① 1971 年 7 月秘密访华的美国总统特使 → 它答"基辛格"（对），
+             本地库是"卡特"（错）
+          ② 1950 年工商业合理调整的重点关系 → 它答"公私关系"（对），
+             本地库是"劳资关系"（错）
+      → 本样本 **20/20 全对**，质量明显优于 OnlineCourseAPI
+        （后者题干命中仅 17.5%、与库一致率仅 57%）。
+
+    因为质量不低于 AI（91%）且**完全免费**，所以放在 **AI 之前**：
+    能接住的题就不烧 token 了（用户明确在意消耗）。
+
+    工程要点：
+      · 它**不返回选项列表** → 只能靠「题干相似度 ≥0.95」+「答案文本能对上
+        本题选项」两道闸，缺一不可
+      · 会返回垃圾（"版本需要更新<a href=...>"）→ 必须过滤
+      · 英文题覆盖差（子代理实测）→ 这层主要吃中文题
+    """
+
+    DISABLE = False
+    _DEFAULT_URL = "https://study.jszkk.com/api/open/seek"
+    _UA = TikuHive._UA
+    _MIN_SIM = 0.95
+    # 命中这些字样说明返回的是提示/报错而非答案
+    _JUNK = ("版本需要更新", "<a href", "请先", "无法", "不存在", "登录",
+             "充值", "过期", "http://", "https://")
+
+    def __init__(self, config_path: Optional[str] = None) -> None:
+        super().__init__(config_path)
+        self.name = '全能搜题'
+
+    def _init_tiku(self):
+        try:
+            self.api = (self._conf.get('jszkk_url') or '').strip() or self._DEFAULT_URL
+        except Exception:
+            self.api = self._DEFAULT_URL
+
+    def _query(self, q_info: dict) -> Optional[str]:
+        title = TikuHive._clean_title(q_info.get("title"))
+        if len(title) < 6:
+            return None
+        try:
+            res = requests.get(
+                self.api,
+                params={"q": title},
+                headers={"User-Agent": self._UA},
+                verify=False,
+                timeout=(5, 12),
+            )
+        except requests.RequestException as e:
+            logger.debug(f"{self.name} 请求异常（按未命中处理）: {e}")
+            return None
+        if res.status_code != 200:
+            logger.debug(f"{self.name} 返回非 200: {res.status_code}")
+            return None
+        try:
+            data = res.json().get("data") or {}
+        except Exception as e:
+            logger.debug(f"{self.name} 响应解析失败（按未命中处理）: {e}")
+            return None
+
+        content = str(data.get("content") or "").strip()
+        answer = str(data.get("answer") or "").strip()
+        if not content or not answer:
+            return None
+        if any(bad in answer for bad in self._JUNK):
+            logger.info(f"{self.name} 返回的是提示而非答案，按未命中处理：{answer[:40]}")
+            return None
+
+        # ① 题干相似度闸门
+        sim = difflib.SequenceMatcher(
+            None, TikuHive._norm(content), TikuHive._norm(title)).ratio()
+        if sim < self._MIN_SIM:
+            logger.info(
+                f"{self.name} 最高相似度仅 {sim:.2f}（需 ≥{self._MIN_SIM}）"
+                f"→ 按未命中处理交下一个题库：{title[:34]}")
+            return None
+
+        qtype = q_info.get("type")
+        # ② 判断题：√ / × → 平台认识的「正确 / 错误」
+        if qtype == "judgement":
+            a = TikuHive._norm(answer)
+            if a in ("√", "对", "正确", "是", "t", "true", "1"):
+                logger.info(f"{self.name} 命中判断题（相似度 {sim:.2f}）：{title[:32]} -> 正确")
+                return "正确"
+            if a in ("×", "x", "错", "错误", "否", "f", "false", "0"):
+                logger.info(f"{self.name} 命中判断题（相似度 {sim:.2f}）：{title[:32]} -> 错误")
+                return "错误"
+            return None
+
+        # ③ 单选/多选：答案文本 → 本题选项（只接受完整对应）
+        mine = TikuHive._q_opts(q_info)
+        if not mine:
+            return None
+        parts = {TikuHive._norm(x) for x in re.split(r"[#|]", answer) if x.strip()}
+        picks = [o for o in mine if TikuHive._norm(o) in parts]
+        if not picks:
+            logger.info(
+                f"{self.name} 命中题干但答案对不上本题选项（相似度 {sim:.2f}）"
+                f"→ 按未命中处理：{title[:34]}")
+            return None
+        logger.info(
+            f"{self.name} 命中答案（相似度 {sim:.2f}）：{title[:34]} -> {len(picks)} 项")
+        return "\n".join(picks)
+
+
 class AI(Tiku):
     # AI大模型答题实现
     # 支持读图的模型（2026-09-13 实测）：agnes-3.0-flash 可正确读图；
@@ -1568,6 +2209,42 @@ class AI(Tiku):
     # "claude-3"/"gemini" 等多模态关键字。可用 set_vision_enabled() 强制开关。
     _VISION_HINTS = ("3.0", "vl", "vision", "gpt-4o", "gpt-4.1", "claude-3",
                      "claude-4", "gemini", "qwen-vl", "glm-4v")
+
+    # 🔴 2026-09-27（用户明确要求）：**一次性额度平台**的端点特征。
+    #   这些平台的免费额度是「每个模型一份、用完即无」，所以**额度真耗尽**时
+    #   必须永久弃用该槽位，绝不能像永久免费档那样记冷却又切回来
+    #   （否则会反复撞同一个已耗尽的槽位，永远递补不到下一个模型）。
+    #   与之相对：agnes（apihub.agnes-ai.cn）、智谱 GLM 免费档是**按窗口限流**，
+    #   等一会儿会恢复，冷却复活是正确的。
+    #
+    # 🔴🔴 2026-09-27 二次修正（用户追问"额度没用完、只是网络不畅，会不会被
+    #   当成用完了"）：原实现对一次性平台**一刀切**——只要落进"配额/限流"
+    #   分支就永久弃用。后果：腾讯**只是 QPS/并发限流**回一个 429
+    #   （额度其实还剩几十万）也会被永久丢掉，白扔一个满额度槽位。
+    #   现在只对"**明确额度耗尽**"永久弃用；纯限流（rate limit / too many
+    #   requests）给**有限次**冷却复活机会，反复失败才升级为永久。
+    _ONESHOT_HOSTS = ("tokenhub.tencentmaas.com",)
+    # 一次性平台"疑似限流"的冷却时长（比普通 45s 长，且逐次递增）
+    _ONESHOT_COOLDOWN = 180.0
+    # 一次性平台"疑似限流"最多复活几次；超过即永久弃用（防反复撞墙）
+    _ONESHOT_MAX_REVIVE = 2
+    # 永久免费平台滑动窗口限流的冷却时长（类属性，`_init_tiku` 里也会覆盖一份）
+    _COOLDOWN_SECONDS = 45.0
+
+    # 🔴 2026-09-27 新增：**纯网络/传输层**故障的异常类型名。
+    #   这些异常跟"Key 有没有废"完全无关，必须**先于任何额度判据**排除掉，
+    #   否则一次网络抖动就可能被误判成"额度耗尽 → 永久弃用"。
+    _NETWORK_ERR_NAMES = (
+        'APITimeoutError', 'APIConnectionError',
+        'ConnectError', 'ConnectTimeout', 'ConnectTimeoutError',
+        'ReadTimeout', 'ReadTimeoutError', 'WriteTimeout', 'WriteError',
+        'ReadError', 'PoolTimeout', 'RemoteProtocolError',
+        'LocalProtocolError', 'ProxyError', 'SSLError', 'SSLEOFError',
+        'NetworkError', 'NewConnectionError', 'MaxRetryError',
+        'ProtocolError', 'ConnectionError', 'Timeout', 'TimeoutException',
+        'ChunkedEncodingError', 'IncompleteRead', 'RemoteDisconnected',
+        'ClosedResourceError', 'BrokenResourceError',
+    )
 
     def __init__(self, config_path: Optional[str] = None) -> None:
         """初始化AI大模型答题实现."""
@@ -1578,6 +2255,20 @@ class AI(Tiku):
         self.work_feedback = None  # 章节检测错误反馈（重做时参考）
         self._session = None       # 超星登录会话（用于下载题目配图）
         self._vision_override = None  # None=自动判断, True/False=强制
+
+        # 🔴 2026-09-28 **AI 答案二次确认（多槽位投票）** ——
+        #    起因：日志归因发现"仅由 AI 作答"的题错误率明显高于题库命中的题
+        #    （得 10 分那次 3 题全走 AI、几乎全错）。用户要求做二次确认，
+        #    并提出关键质疑"两个模型返回不一样怎么办" ⇒ 改成**奇数票多数决**，
+        #    细节见 api/ai_vote.py 的模块 docstring。
+        #    🔴 2026-09-29 **默认改为关闭**（用户拍板）：用真实回执量化后发现
+        #    投票把正确率从 92.3% 提到 92.4%（169 题里只救回 1 题，+0.6pp，
+        #    带偏 0 题），而多出来的 hy3 / hy4-preview / v4-pro 调用占了总
+        #    token 的约 49% —— 属于纯白消费。要开启就配 `ai_vote = true`。
+        #    量化脚本：`_analyze_vote_accuracy.py` / `_analyze_vote_net.py`。
+        self._vote_enabled = False
+        self._vote_stat = {"voted": 0, "high": 0, "majority": 0,
+                           "merged": 0, "fallback": 0, "single": 0}
 
     def set_session(self, session) -> None:
         """注入超星登录会话，供下载带登录态的题目配图（2026-09-13）。"""
@@ -1591,8 +2282,46 @@ class AI(Tiku):
         """当前模型是否支持读图。"""
         if self._vision_override is not None:
             return bool(self._vision_override)
-        model = (self.model or "").lower()
-        return any(h in model for h in self._VISION_HINTS)
+        return self._model_is_vision(self.model)
+
+    @classmethod
+    def _model_is_vision(cls, model: str) -> bool:
+        """判断某个模型名是否支持读图（供多槽位选择视觉槽位复用）。"""
+        m = (model or "").lower()
+        if not m:
+            return False
+        if any(h in m for h in cls._VISION_HINTS):
+            return True
+        # 🔴 2026-09-26 23:35 补充：硅基流动实测可用的 VL 命名都带 `-vl-`
+        #    （Qwen/Qwen3-VL-8B-Instruct 等），上面的 "vl" 已能覆盖；
+        #    这里再兜一层常见变体，避免大小写/分隔符差异漏判。
+        return any(k in m for k in ("-vl-", "vl-", "-v-", "omni"))
+
+    def _vision_slot_idx(self) -> int:
+        """找一个**支持视觉**的可用槽位下标；没有则返回 -1。
+
+        用途（2026-09-26 新增）：图片题落在非视觉模型上时（例如
+        Qwen2.5-7B），平台会直接回 `The model is not a VLM` —— 此时
+        应自动切到池里支持视觉的槽位（如 Qwen3-VL-8B），而不是丢题。
+
+        ⚠️ 判定"已在用的槽位"要比 **(Key, Model)**，不能只比 Key ——
+        同一个 Key 可以配不同模型（文本用 7B、图片用 VL），
+        只比 Key 会把唯一可用的视觉槽位误判成"就是当前这个"而跳过。
+        """
+        for i, s in enumerate(getattr(self, "_slots", []) or []):
+            model = s.get("model") or self._conf.get("model") or ""
+            key = s.get("key") or ""
+            # 🔴 2026-09-27：`_key_dead` 已是**冷却表**且键为**槽位签名**，
+            #    用 `_sig_alive` 判定（临时限流到点自动复活；同 Key 不同模型互不牵连）。
+            if not key or not self._sig_alive(self._sig(s)):
+                continue
+            if not self._model_is_vision(model):
+                continue
+            # 已是当前生效的 (Key, Model) 组合 → 跳过（切了也没变）
+            if key == self.key and model == self.model:
+                continue
+            return i
+        return -1
 
     def set_work_feedback(self, feedback) -> None:
         """
@@ -1636,28 +2365,70 @@ class AI(Tiku):
         return kwargs
 
     def _wait_for_interval(self):
-        if self.last_request_time:
-            interval_time = time.time() - self.last_request_time
-            if interval_time < self.min_interval_seconds:
-                sleep_time = self.min_interval_seconds - interval_time
-                logger.debug(f"API请求间隔过短, 等待 {sleep_time} 秒")
-                time.sleep(sleep_time)
+        """🔴🔴🔴 2026-09-27 重写：**跨线程串行化**，把并发放大项消掉。
 
-    def _query_locked(self, q_info: dict):
+        🔴 实测结论（进程内探针，2026-09-27，**已确证**）：
+            · **单 Key 串行连打，第 11 次起 429** ⇒ agnes 免费档是
+              **「约 10 次/分钟」的滑动窗口限流**，**串行也照样触发**！
+            · 429 后 **约 32 秒自动恢复**（+15s 仍 429、+32s 已放行）
+            · 并发 4 → 全 200；并发 8 → 前 8 次 429
+        ⇒ 并发**不是根因**，只是让窗口**更快打满**。
+          降并发**解决不了**限流，唯一解是**多 Key 轮换**（见 `_key_dead` 冷却表）。
+
+        那这个函数还有用吗？**有**：`last_request_time` 是**实例级单值**，
+        多线程读到同一个旧值 → 间隔判断形同虚设 → 瞬时并发冲上 8+ →
+        本来能撑 10 次的窗口**几秒就烧完**。加锁串行化让配额**按时间摊开**，
+        配合 45s 冷却表，整体从"秒烧完"变成"稳定轮转"。
+
+        修法：把"检查+更新 last_request_time"整段放进 `self._rate_lock`，
+        配合 `time.sleep()` 让**同一时刻只有一个线程在真正发请求**。
+        sleep 也在锁内 → 后续线程排队等待，天然把并发压到 1。
+        """
+        with self._rate_lock:
+            if self.last_request_time:
+                interval_time = time.time() - self.last_request_time
+                if interval_time < self.min_interval_seconds:
+                    sleep_time = self.min_interval_seconds - interval_time
+                    logger.debug(f"API请求间隔过短, 等待 {sleep_time} 秒")
+                    time.sleep(sleep_time)
+            self.last_request_time = time.time()
+
+    def _query_locked(self, q_info: dict, extra_hint: str = ""):
+        """单题问答。
+
+        `extra_hint`（2026-09-28）：追加到 system prompt 末尾的额外说明。
+        目前只被**投票的第 3 票（仲裁票）**使用 —— 把前两票的分歧告诉模型，
+        要它重新审题并判断哪个对（提高平局收敛率，减少"三票全不同"）。
+        """
         def remove_md_json_wrapper(md_str):
             # 使用正则表达式匹配Markdown代码块并提取内容
             pattern = r'^\s*```(?:json)?\s*(.*?)\s*```\s*$'
             match = re.search(pattern, md_str, re.DOTALL)
             return match.group(1).strip() if match else md_str.strip()
 
-        if self.http_proxy:
-            proxy = self.http_proxy
-            httpx_client = httpx.Client(proxy=proxy)
-            client = OpenAI(http_client=httpx_client, base_url=self.endpoint, api_key=self.key)
-        else:
-            client = OpenAI(base_url=self.endpoint, api_key=self.key)
+        # 🔴 2026-09-26 23:05：client 改为在 `_call()` 里**按当前 Key 现建**
+        #    （多 Key 轮换需要每次重建；这里不再预先构造）
         # 去除选项字母，防止大模型直接输出字母而非内容
-        options_list = q_info['options'].split('\n')
+        # 🔴 2026-09-27 修 bug：考试的 `q_info['options']` 是 **list（且可能为空）**，
+        #    此前无条件当字符串 `.split('\n')` → `AttributeError: 'list' object has
+        #    no attribute 'split'`，导致**考试每一题的 AI 兜底全部异常失败**
+        #    （作业路径传的是字符串，所以这个 bug 一直没暴露；今天第一次真跑考试才现形）。
+        _raw_options = q_info.get('options')
+        options_list = []
+        if isinstance(_raw_options, (list, tuple)):
+            # 考试链路传的是 list[dict]：{letter(显示字母), value(提交值), text(正文)}
+            # → 拼成 AI 能读的「A. 圣诞节」
+            for _o in _raw_options:
+                if isinstance(_o, dict):
+                    _L = str(_o.get('letter') or _o.get('value') or '').strip()
+                    _T = str(_o.get('text') or '').strip()
+                    if _L or _T:
+                        options_list.append(f"{_L}. {_T}" if _T else _L)
+                elif str(_o).strip():
+                    options_list.append(str(_o))
+        elif isinstance(_raw_options, str):
+            options_list = _raw_options.split('\n')
+        options_list = [x for x in options_list if str(x).strip()]
         cleaned_options = [re.sub(r"^[A-Z]\s*", "", option) for option in options_list]
         options = "\n".join(cleaned_options)
 
@@ -1748,6 +2519,18 @@ class AI(Tiku):
                 )
             return messages
 
+        def _make_client():
+            """按**当前** self.key 建 client（多 Key 轮换时必须每次重建）。
+
+            🔴 2026-09-27 加 timeout：OpenAI SDK 默认超时 600 秒，上游一旦挂起
+            （真机实测硅基流动挂了 8 分钟不返回）会堵死整个作业线程。90 秒覆盖
+            实测最慢的视觉模型（读图 ~14s）+ 限流重试余量。
+            """
+            if self.http_proxy:
+                return OpenAI(http_client=httpx.Client(proxy=self.http_proxy, timeout=90),
+                              base_url=self.endpoint, api_key=self.key, timeout=90)
+            return OpenAI(base_url=self.endpoint, api_key=self.key, timeout=90)
+
         def _call(system_content: str, user_content: str):
             """发一次问答请求（统一入口）。
 
@@ -1756,20 +2539,159 @@ class AI(Tiku):
             图片能力未开通），带图请求会直接 400 —— 若不放行就会让整道题
             拿不到答案。去图重试保证"至少能按纯文本作答"，与用户要求的
             "自动降级"一致。
+
+            🔴🔴🔴 2026-09-26 23:05 **多 Key 轮换（新增）**：
+            遇到 429 / 额度用尽 → 把当前 Key 标记 dead → 换下一个 Key 重试。
+            最多轮遍整个 Key 池。这样"一个 Key 免费额度用尽"不再导致整份
+            作业大面积丢题（真机踩坑：单 Key 429 → 29/100 题无答案）。
             """
-            try:
-                return client.chat.completions.create(**self._completion_kwargs(
-                    model=self.model,
-                    messages=_make_messages(_ctx + system_content, user_content,
-                                            images=_images)))
-            except Exception as e:
-                if not _images:
+            last_err = None
+            tried = 0
+            # 仲裁票的额外说明（本函数是闭包，直接读外层的 extra_hint）。
+            # 拼到 system prompt 末尾 —— 所有题型分支与"去图重试"都自动带上。
+            _sys_extra = ("\n\n" + extra_hint.strip()) if (extra_hint or "").strip() else ""
+            # 🔴 2026-09-27：按**槽位**计数（同一把 Key 可配多个模型，
+            #    只数去重后的 Key 会漏掉槽位 → 提前放弃重试）
+            total_keys = max(1, len(self._slots))
+            while tried < total_keys:
+                tried += 1
+                client = _make_client()          # 用当前 Key 重建
+                try:
+                    _ok = client.chat.completions.create(**self._completion_kwargs(
+                        model=self.model,
+                        messages=_make_messages(_ctx + system_content + _sys_extra,
+                                                user_content,
+                                                images=_images)))
+                    # 🔴 2026-09-27：成功即清零该槽位的"限流复活计数"——
+                    #    限流是一次性事件，稳定工作过就不该再因为历史计数被永久弃用。
+                    try:
+                        self._revive_count.pop(self._cur_sig(), None)
+                    except Exception:
+                        pass
+                    return _ok
+                except Exception as e:
+                    # ⓪ 🔴 2026-09-26 23:35 图片题专用修复：
+                    #    当前模型不是视觉模型（平台回 "not a VLM"）→ **不要**
+                    #    直接把图丢掉降级成纯文本（那样等于瞎猜，必错），
+                    #    而是切到池里支持视觉的槽位重试。
+                    #    真机踩坑：Qwen2.5-7B 收到图直接 400 not a VLM。
+                    if _images and self._is_vlm_error(e):
+                        _vi = self._vision_slot_idx()
+                        if _vi >= 0:
+                            logger.warning(
+                                f"⚠ 当前模型 {self.model} 不支持读图，"
+                                f"自动切到视觉槽位重试本题")
+                            self._apply_slot(_vi, announce=True)
+                            self._key_idx = _vi + 1
+                            continue
+                        logger.warning(
+                            f"⚠ 当前模型 {self.model} 不支持读图，"
+                            f"且池内无可用视觉模型 → 退化为纯文本作答")
+                        _images.clear()
+                        continue
+
+                    # ① 带图失败 → 去图重试一次（同 Key）
+                    if _images:
+                        logger.warning(
+                            f"带图请求失败（{type(e).__name__}: {e}），"
+                            f"已自动降级为纯文本重试")
+                        try:
+                            return client.chat.completions.create(
+                                **self._completion_kwargs(
+                                    model=self.model,
+                                    messages=_make_messages(
+                                        _ctx + system_content + _sys_extra,
+                                        user_content)))
+                        except Exception as e2:
+                            e = e2
+                            _images.clear()      # 去图后仍失败 → 后续不再带图
+
+                    # ② 额度/限流/鉴权类 → 标记该槽位死亡并切下一个（Key+Endpoint+Model 整组）
+                    if self._is_quota_error(e) and len(self._slots) > 1:
+                        dead = self._cur_sig()      # ⚠️ 槽位签名，不是 Key 字符串
+                        # 🔴 2026-09-27 修：区分**临时限流**与**永久废号**。
+                        #    临时（agnes 免费档 429）→ 记 45s 冷却，到期自动复活；
+                        #    永久（欠费/Key 无效）→ 记 +inf 真正弃用。
+                        #    原实现一律永久拉黑 → 长作业中段全部 Key 阵亡。
+                        if dead not in self._key_dead:
+                            # 🔴 2026-09-27（用户明确要求）：**一次性额度平台**
+                            #    （腾讯 TokenHub）额度用完就真没了 → 永久弃用、
+                            #    不冷却复活（否则反复撞墙、永远递补不到下一个模型）。
+                            #
+                            # 🔴🔴 2026-09-27 二次修正（用户追问"额度没用完、
+                            #    只是网络不畅会不会被当成用完"）：
+                            #    原实现在这个分支里对一次性平台**一刀切永久弃用**，
+                            #    于是腾讯**仅因 QPS/并发限流**回一个 429（额度还
+                            #    剩很多）也会被永久丢掉。现在细分三类：
+                            #      ① 额度/余额真耗尽（quota / 余额不足 / 用完…）
+                            #         → 永久弃用（用户要求的语义）
+                            #      ② 纯限流（rate limit / too many requests）
+                            #         → 冷却（腾讯 180s/360s，普通 45s）后复活，
+                            #           但腾讯侧**复活次数有上限**，反复限流即永久
+                            #      ③ Key 无效/无权 → 永久弃用（与额度无关）
+                            #    ⚠️ 纯网络故障（超时/断连/DNS/SSL/代理）**根本
+                            #    进不来这里** —— `_is_quota_error` 已把它们排除。
+                            #    决策逻辑抽到 `_decide_dead_action`（纯函数，可单测）。
+                            _act, _cool, _why2, _bump = self._decide_dead_action(
+                                self.endpoint or "", e,
+                                self._revive_count.get(dead, 0))
+                            if _act == 'none':
+                                # 网络抖动：不处置槽位，原样抛出（上层走降级）
+                                raise e
+                            if _act == 'permanent':
+                                self._key_dead[dead] = float('inf')
+                                logger.warning(
+                                    f"🔑 AI 槽位（{self._sig_masked(dead)}）不可用"
+                                    f"（{_why2}），已永久弃用、不再切回"
+                                    f"（{len(self._key_dead)}/{total_keys} 个已耗尽）")
+                            else:
+                                if _bump:
+                                    self._revive_count[dead] = \
+                                        self._revive_count.get(dead, 0) + 1
+                                self._key_dead[dead] = time.time() + _cool
+                                _n_trans = sum(
+                                    1 for v in self._key_dead.values()
+                                    if v != float('inf'))
+                                logger.warning(
+                                    f"🔑 AI 槽位（{self._sig_masked(dead)}）触发"
+                                    f"{_why2}（{self._sig_cooldown_left(dead):.0f}s "
+                                    f"后自动恢复）｜当前冷却中 "
+                                    f"{_n_trans}/{total_keys}")
+                        # 从**当前槽位**的下一个开始找
+                        cur = self._slot_of_sig(dead)
+                        self._key_idx = (cur + 1) if cur >= 0 else self._key_idx
+                        self._next_key()
+                        # `_next_key()` 已把「找到的可用槽位」应用到生效值；
+                        # 若一个都没找到则不切换 → 此时当前槽位仍是刚判死的那个。
+                        # 因此这里判「当前生效槽位」是否真的可用。
+                        if not self._sig_alive(self._cur_sig()):
+                            # 全部冷却中 → 睡到最早解冻的那一刻再试一次
+                            _wait = self._min_cooldown_left()
+                            if _wait > 0 and tried < total_keys:
+                                logger.warning(
+                                    f"⏳ 全部 {total_keys} 个槽位均在冷却，"
+                                    f"等待 {_wait:.0f}s 后重试")
+                                time.sleep(min(_wait, 60.0))
+                                continue
+                            last_err = e
+                            break
+                        logger.info(
+                            f"🔁 换用下一个 AI 槽位重试本题"
+                            f"（{self._sig_masked(self._cur_sig())}）")
+                        continue
+
+                    # ③ 其他异常 → 原样抛出
                     raise
-                logger.warning(
-                    f"带图请求失败（{type(e).__name__}: {e}），已自动降级为纯文本重试")
-                return client.chat.completions.create(**self._completion_kwargs(
-                    model=self.model,
-                    messages=_make_messages(_ctx + system_content, user_content)))
+            if last_err is not None:
+                # 🔴 2026-09-26 23:40 修复：**所有 Key 都死了**是终态，
+                # 必须抛出可被上层识别的"账号级/Key 级"异常，让
+                # TikuFallback 回退到下一个题库（如 TikuAdapter），
+                # 而不是把原始 SDK 异常（401/429）抛穿整条作业链 ——
+                # 真机踩坑：假 Key 401 直接炸穿 study_work_homework，
+                # 整份 100 题作业中止（而非逐题降级）。
+                raise AIKeyExhaustedError(
+                    f"AI 全部 {total_keys} 个 Key 均不可用：{last_err}") from last_err
+            raise RuntimeError("AI 请求失败：所有 Key 均不可用")
 
         # 判断题目类型
         self._wait_for_interval()
@@ -1875,10 +2797,208 @@ class AI(Tiku):
             logger.error("无法解析大模型输出内容")
             return None
 
+    # ══ 🗳 AI 答案二次确认（2026-09-28）══════════════════════════════
+    #
+    # 背景：日志归因显示「**仅由 AI 作答**」的题错误率明显高于题库命中的题
+    #      （某次测验 3 题全走 AI → 只拿了 10 分）。
+    # 做法：**奇数票多数决**。用户提的关键质疑是"两个模型答案不一样怎么办" ——
+    #      2 票（偶数）平票时信息量为零，所以用 3 票：必有严格多数。
+    #      票必须来自**不同槽位**（不同模型），同一模型重问等于没投票。
+    # 平票怎么裁决、多选为什么"争议选项倾向不选"：见 api/ai_vote.py 的 docstring。
+
+    def _vote_candidates(self) -> list:
+        """挑可用于投票的槽位，**优先"独立的第二意见"**。
+
+        排序（越靠前越先被用来投票）：
+          1. 不同模型、且不是明显的小参数量模型（→ 真正的独立判断）
+          2. 不同模型但是小模型（如 4B/7B、mini/tiny）
+          3. 同模型但不同 Key（同源采样，价值最低，作为最后手段）
+
+        排除冷却中/永久弃用的槽位 —— 它们发出去必然失败，白等一轮。
+        """
+        cur_model = self.model
+        out = []
+        for i, s in enumerate(self._slots or []):
+            sig = self._sig(s)
+            if not self._sig_alive(sig):
+                continue
+            md = s.get("model") or self._conf.get("model") or ""
+            out.append({
+                "idx": i, "sig": sig, "tag": self._sig_masked(sig),
+                "rank": (0 if md != cur_model else 2)
+                        + (1 if ai_vote.is_weak_model(md) else 0),
+            })
+        out.sort(key=lambda x: x["rank"])
+        return out
+
+    # 投票时最多尝试几个候选槽位（前几个都失败就不硬撑，避免整题卡住）
+    _VOTE_MAX_TRY = 4
+
+    def _to_uniform(self, q_info: dict, raw):
+        """把 AI 原始输出统一成**可比较形态**再投票。
+
+        必要性：提示词要求"输出选项内容"，但模型有时给内容、有时给字母。
+        不统一的话，两票会因为**表述形态不同**被判成"分歧"（假平票），
+        白白触发第三次请求甚至走兜底。这里用的映射函数与后续真正提交时
+        用的是同一套（`map_single/map_multiple_answer`），所以投出来的票
+        就是最终要提交的形态。
+        """
+        if raw is None:
+            return ""
+        t = str(raw).strip()
+        if not t:
+            return ""
+        q_type = q_info.get("type")
+        if q_type in ("single", "multiple"):
+            try:
+                from api.base import map_single_answer, map_multiple_answer
+                opts = q_info.get("options", "")
+                if q_type == "multiple":
+                    return map_multiple_answer(t, opts) or ""
+                return map_single_answer(t, opts) or ""
+            except Exception as e:
+                logger.debug(f"投票前「选项内容→字母」映射失败：{e}")
+                return ""
+        # 判断题保留原文（正确/对/false…），比较时有 ai_vote.judge_norm 归一；
+        # 保留原文能保证最终提交的表述与模型输出一致
+        # （平台的 true_list/false_list 两种写法都认）。
+        return t
+
+    @staticmethod
+    def _arbitration_hint(votes, q_type) -> str:
+        """第 3 票（**仲裁票**）的额外说明：把前两票的分歧摆出来。
+
+        为什么不能让第 3 票也"盲答"：
+        它的**唯一职责就是打破平局**。若三票彼此独立，在 4 选项的单选题上
+        "三票全不同"的概率并不低 —— 那结果又变成抛硬币（只能退回主槽位）。
+        把分歧明确告诉它，能大幅提高它落到前两票之一的概率
+        （= 真正把平局解成了 2:1）。
+
+        判断题只有两个选项，三票必然 2:1，用不上这条；
+        多选题走逐选项裁决，也不需要。
+        """
+        if q_type != "single":
+            return ""
+        picks = [a for _, a in votes[:2]]
+        if len(picks) < 2 or picks[0] == picks[1]:
+            return ""
+        return (f"注意：本题此前已由另外两个模型独立作答，它们给出了**不同**的答案："
+                f"{picks[0]} 与 {picks[1]}。请你重新仔细审题，"
+                f"独立判断其中哪一个才是正确的；"
+                f"如果你认为两个都不对，也可以给出你自己的答案。")
+
+    def _vote_query(self, q_info: dict, first):
+        """已拿到第 1 票，追加第 2/3 票并裁决（返回最终答案）。"""
+        q_type = str(q_info.get("type") or "unknown")
+
+        # 自由文本题型不投票：两个模型答"同义不同字"的句子会被判成分歧，
+        # 强行投票只会把第 1 票的答案换掉，得不偿失。
+        if q_type in ("completion", "shortanswer"):
+            return first
+
+        # 图片题不投票：池内视觉槽位可能唯一，换槽位会切到非视觉模型
+        # （报 not a VLM 后退化成纯文本作答）→ 两票不同源、比较无意义；
+        # 且每票都要重新下载题干配图，代价高。
+        if self._vision_enabled():
+            try:
+                _imgs, _ = build_image_data_urls(self._session,
+                                                 q_info.get("title", ""))
+                if _imgs:
+                    return first
+            except Exception:
+                pass
+
+        base = self._to_uniform(q_info, first)
+        if not base:
+            return first          # 第 1 票转不出统一形态 → 没有可比对的基础
+
+        votes = [(self._sig_masked(self._cur_sig()), base)]
+        used = {self._cur_sig()}
+        # 投票期间会切走槽位，结束后**必须原样恢复**，否则影响后续所有题目
+        saved = (self.key, self.endpoint, self.model,
+                 self._key_idx, self._model_idx, list(self._model_chain))
+
+        def _restore():
+            (self.key, self.endpoint, self.model, self._key_idx,
+             self._model_idx, self._model_chain) = (
+                saved[0], saved[1], saved[2], saved[3], saved[4], list(saved[5]))
+
+        try:
+            _tried = 0
+            for cand in self._vote_candidates():
+                # **票数上限 3**：2 票一致就停；不一致才追加第 3 票。
+                # （奇数票保证必有严格多数，不会像 2 票那样平票无解。）
+                if len(votes) >= 3 or _tried >= self._VOTE_MAX_TRY:
+                    break
+                if cand["sig"] in used:
+                    continue
+                _tried += 1
+                # 第 3 票 = 仲裁票：带上前两票的分歧，别让它盲答
+                hint = self._arbitration_hint(votes, q_type) if len(votes) >= 2 else ""
+                try:
+                    self._apply_slot(cand["idx"], announce=False)
+                    # 只在真有仲裁说明时才传 extra_hint —— 保持"无 hint 走原调用"
+                    # 的路径不变，避免任何覆盖了 `_query_locked` 的实现被签名变更打坏
+                    raw = (self._query_locked(q_info, extra_hint=hint) if hint
+                           else self._query_locked(q_info))
+                except AIKeyExhaustedError:
+                    break                      # 池子耗尽 → 用手上的票裁决
+                except Exception as e:
+                    logger.debug(f"投票请求失败，跳过该槽位："
+                                 f"{type(e).__name__}: {e}")
+                    continue
+                finally:
+                    # 每次投票后立刻恢复：`_call` 内部失败时会自行切槽位，
+                    # 不还原就会把下一次投票的起点带偏
+                    _restore()
+                ans = self._to_uniform(q_info, raw)
+                if not ans:
+                    continue
+                used.add(cand["sig"])
+                votes.append((cand["tag"], ans))
+                if ai_vote.same(ans, base, q_type):
+                    break                      # 已一致 → 省掉第三次请求
+        finally:
+            _restore()
+
+        res = ai_vote.decide(votes, q_type)
+        conf = res.get("confidence") or "single"
+        self._vote_stat["voted"] = self._vote_stat.get("voted", 0) + 1
+        self._vote_stat[conf] = self._vote_stat.get(conf, 0) + 1
+
+        tags = "、".join(t for t, _ in votes)
+        _tail = f"| 原标题：{str(q_info.get('title') or '')[:40]} | 票源：{tags}"
+        if conf in ("high", "majority", "merged"):
+            logger.info(f"🗳 AI 二次确认[{conf}] {res.get('detail')} {_tail}")
+        else:
+            # 兜底说明这题的 AI 答案本身不可靠，值得在日志里醒目一点
+            logger.warning(f"🗳 AI 二次确认[{conf}] {res.get('detail')} {_tail}")
+
+        # 留痕（jsonl）：供事后核对"投票到底有没有让正确率变好"
+        try:
+            ai_vote.log_vote(data_dir(), {
+                "title": str(q_info.get("title") or "")[:120],
+                "type": q_type,
+                "votes": [{"tag": t, "ans": a} for t, a in votes],
+                "answer": res.get("answer"),
+                "confidence": conf,
+                "detail": res.get("detail"),
+            })
+        except Exception:
+            pass
+
+        return res.get("answer") or first
+
     def _query(self, q_info: dict):
         with self._lock:
             try:
-                return self._query_locked(q_info)
+                first = self._query_locked(q_info)
+            except AIKeyExhaustedError:
+                # 🔴 2026-09-26 23:40：Key 池全废 → **绝不能换模型重试**
+                # （同一个死 Key，换模型必然再次 401/429，白打一轮请求且
+                # 会让日志看起来像"模型有问题"）。直接抛出去，让
+                # TikuFallback 回退到下一个题库（如 TikuAdapter）。
+                raise
             except Exception as e:
                 # 模型级故障（模型下线/无权限/余额不足）自动降级重试一次
                 # （2026-09-13，用户明确要求"到时候自动降级"）。
@@ -1886,8 +3006,138 @@ class AI(Tiku):
                 # 换模型解决不了限流，反而会白丢一个可用的档位。
                 if self._is_model_fatal(e) and self._switch_to_fallback():
                     logger.warning(f"已切换到备用模型重试本题：{e}")
-                    return self._query_locked(q_info)
-                raise
+                    first = self._query_locked(q_info)
+                else:
+                    raise
+            # 🗳 二次确认（2026-09-28）：能走到这里说明**题库/学习库都没命中**，
+            #    正是"仅由 AI 作答"、错误率最高的那批题，值得多花 1–2 次请求。
+            if self._vote_enabled and first:
+                try:
+                    first = self._vote_query(q_info, first)
+                except AIKeyExhaustedError:
+                    pass                # 投票途中池子耗尽 → 保留第 1 票，不丢题
+                except Exception as e:
+                    logger.warning(f"AI 二次确认异常，本次改用第 1 票："
+                                   f"{type(e).__name__}: {e}")
+            # 🔴 2026-09-29：**答案可用性自检 + 换模型重答**（详见方法注释）。
+            # 放在最后：投票/降级都做完后，再确认"这个答案平台认不认"。
+            return self._ensure_usable(q_info, first)
+
+    # ---- 答案可用性自检（2026-09-29，用户明确要求）----
+    _RETRY_HINT = (
+        "⚠️ 你上一次的回答**无法对应本题的选项**，系统识别不了。请重新作答：\n"
+        "1) 必须从给定选项中作答，**逐字照抄选项原文**，禁止翻译、改写、概括、意译；\n"
+        "2) 题目与选项若是英文，必须原样输出英文，**禁止翻译成中文**；\n"
+        "3) 单选：给一个字母或一项原文；多选：给全部正确项（字母连写，或每项一行）。"
+    )
+
+    def _answer_usable(self, q_info: dict, ans) -> bool:
+        """这个答案平台认不认？单选/多选必须能落到**选项字母**上。
+
+        （不能只用 `plausible_answer` —— 它对"中文文本"也放行，而平台
+          单选/多选只认字母，文字交上去必判错。）
+        """
+        a = str(ans or "").strip()
+        if not a:
+            return False
+        t = q_info.get("type")
+        if t in ("single", "multiple"):
+            if re.fullmatch(r"[A-Za-z]{1,8}", a):
+                return True
+            try:
+                from api.base import map_single_answer, map_multiple_answer
+                opts = q_info.get("options") or ""
+                if isinstance(opts, (list, tuple)):
+                    opts = "\n".join(
+                        (str(o.get("text") or o.get("value") or "") if isinstance(o, dict)
+                         else str(o)) for o in opts if o)
+                fn = map_multiple_answer if t == "multiple" else map_single_answer
+                return bool(fn(a, opts))
+            except Exception as e:                            # noqa: BLE001
+                logger.debug(f"答案可用性检查异常（放行，不因自检丢答案）：{e}")
+                return True
+        return True
+
+    def _ensure_usable(self, q_info: dict, ans):
+        """答案不可用就**换第二个 AI 重答**，尽量别走到随机兜底。
+
+        背景（2026-09-29 实测）：acc2 出现 2 次"随机选择"兜底 ——
+        题目与选项都是英文，AI 语义答对了，但**把选项翻译成了中文**
+        （"大数据技术" vs 选项 "Big Data Technology"）→ 无法映射成选项字母
+        → 上层的 `_accept` 舍弃 → `random_answer()` 蒙。
+
+        用户原话：「一个 AI 返回识别不了，就调第二个 AI，保证这个题返回的
+        答案是正常的。随机的话风险就大了，只能是最下下下策。」
+
+        策略：最多换 3 个槽位（模型）重试，并附加强制提示词；任一槽位给出
+        可用答案即返回。全都不可用 → **返回原答案**（交给上层，本层不吞）。
+        """
+        if not ans or self._answer_usable(q_info, ans):
+            return ans
+        slots = getattr(self, "_slots", None) or []
+        limit = min(3, max(0, len(slots) - 1))
+        if limit <= 0:
+            logger.warning(
+                f"AI 答案不可用且池中无备用槽位（仅 {len(slots)} 个），原样交上层："
+                f"{str(ans)[:40]!r}")
+            return ans
+        logger.warning(
+            f"AI 答案无法对应本题选项（{str(ans)[:40]!r}），换模型重答，最多 {limit} 次")
+        for i in range(limit):
+            try:
+                # ⚠️ 用 `_next_key()`（切到下一个可用**槽位**：Key+Endpoint+Model），
+                #    **不是** `_switch_to_fallback()` —— 后者是"当前模型下线时
+                #    切备用模型"，返回 bool，本场景下恒为 False（实测踩坑：
+                #    第一次注入用了它，导致重试循环一次都没跑）。
+                if not self._next_key():
+                    break
+            except Exception as e:                            # noqa: BLE001
+                logger.debug(f"切换槽位失败：{e}")
+                break
+            try:
+                again = self._query_locked(q_info, extra_hint=self._RETRY_HINT)
+            except AIKeyExhaustedError:
+                break
+            except Exception as e:                            # noqa: BLE001
+                logger.debug(f"重答异常（继续换下一个）：{type(e).__name__}: {e}")
+                continue
+            if again and self._answer_usable(q_info, again):
+                logger.warning(
+                    f"换模型重答成功（第 {i + 1} 次）：{str(ans)[:30]!r} -> "
+                    f"{str(again)[:30]!r}")
+                return again
+        logger.warning(f"换模型重答仍未得到可用答案，保留原答案交上层：{str(ans)[:40]!r}")
+        return ans
+
+    def force_retry(self, q_info: dict) -> Optional[str]:
+        """**强制**换槽位重答（供上层在"即将随机蒙"之前调用）。
+
+        为什么需要它（2026-09-29 实测）：`_ensure_usable` 只在 AI **自己的**
+        `_query` 内生效；而**章节检测/作业的随机兜底在 `api/base.py` 三处**
+        （`1663` / `1770` / `3308`），走的是"query 返回空"或"答案映射失败"
+        —— 那些情况下 AI 层已经交过答案、不会再重试，于是照样落到随机。
+
+        用户原话：「随机的话风险就大了，只能是最下下下策」。
+        这里给它一道最后挣扎：换最多 3 个模型，任一给出**可用**答案即返回。
+        """
+        with self._lock:
+            for _ in range(3):
+                try:
+                    if not self._next_key():
+                        break
+                except Exception:                            # noqa: BLE001
+                    break
+                try:
+                    ans = self._query_locked(q_info, extra_hint=self._RETRY_HINT)
+                except AIKeyExhaustedError:
+                    break
+                except Exception as e:                        # noqa: BLE001
+                    logger.debug(f"force_retry 异常：{type(e).__name__}: {e}")
+                    continue
+                if ans and self._answer_usable(q_info, ans):
+                    logger.warning(f"随机兜底前换模型重答成功 -> {str(ans)[:40]!r}")
+                    return ans
+        return None
 
     # ---- 模型自动降级（2026-09-13）----
     @staticmethod
@@ -1965,6 +3215,501 @@ class AI(Tiku):
         if len(self._model_chain) > 1:
             logger.info(f"AI 模型降级链：{' → '.join(self._model_chain)}")
 
+        # 🔴🔴🔴 2026-09-26 23:05 **多 Key 池（解决 429 额度用尽）**
+        # 🔴🔴🔴 2026-09-26 23:25 **升级为「多槽位」：Key + Endpoint + Model 三元组**
+        #
+        # 背景：免费额度是**按 Key 独立计算**的。单个 Key 用尽后必然 429，
+        #       而"额度用尽"不是模型问题、也不是网络问题 —— 换个 Key 立刻满血。
+        #       ⇒ 配置多个 Key，遇到 429（额度/限流）自动切下一个。
+        #
+        # 🔴 为什么要连 Endpoint/Model 一起换（用户 2026-09-26 明确要求
+        #    「换 API Key 的时候把对应的也换掉，确保可以直接通畅」）：
+        #      不同平台的 Key **不能混用同一个 Endpoint** —— 把硅基流动的 Key
+        #      发到 agnes 的端点必然 401。所以一个"槽位"必须是三元组，
+        #      切换时整组替换，否则跨平台配置会互相撞死。
+        #
+        # 配置来源（按优先级）：
+        #   ① `ai_keys`：每行一个槽位（新增，推荐）
+        #        格式1  sk-bbb...                              → 沿用主 Endpoint/模型
+        #        格式2  sk-ccc...|https://api.siliconflow.cn/v1|Qwen/Qwen2.5-7B-Instruct
+        #               （用 `|` 分隔，只写 Key|Endpoint 也可，模型沿用）
+        #      兼容旧的逗号分隔写法（全部沿用主 Endpoint/模型）。
+        #   ② `ai_key` ：单个 Key（兼容旧配置），作为**首个**槽位
+        #
+        # 行为：
+        #   · 每个槽位被标记 `dead`（额度用尽/鉴权失败）后不再使用
+        #   · 全部 dead → 抛 AIKeyExhaustedError，让上层回退到别的题库
+        # 🔴 2026-09-27：跨线程限流锁（根治并发 429，见 _wait_for_interval）
+        self._rate_lock = threading.Lock()
+        self._slots: list = []      # [{"key","endpoint","model","tag"}]
+        self._key_idx = 0
+        # 🔴 2026-09-27 改造：由 `set` 升级为 **冷却表** {槽位签名: 解冻时间戳}。
+        #    原因：agnes 免费档的 429 是**账号级滑动窗口限流**，过一会儿自动恢复
+        #    （真机验证：K1 429 的同时 K2/K3/K4 全部正常）。
+        #    原 `set` 语义是"永久拉黑"，一份长作业跑到中段就把所有 Key 拉黑，
+        #    后面几十题全部拿不到答案。
+        #    现在：临时限流 → 记冷却 45s（到期自动复活）；永久废号 → 记 +inf。
+        #
+        # 🔴🔴 2026-09-27 二次改造：键从 **Key 字符串** 改为 **槽位签名**
+        #    `key|endpoint|model`。原因：腾讯 TokenHub 的免费额度是**按模型**
+        #    发放的（每模型 100 万 token，一把 Key 可调全部模型）。原先按 Key
+        #    记冷却 ⇒ 一个模型额度耗尽就把整把 Key 拉黑，同 Key 的其他模型一起废。
+        #    改为签名后，**一个模型用完只会弃用那一个槽位**，同 Key 的其他模型
+        #    继续可用 ⇒ 20 个模型各 100 万可以逐个吃完，无需为每个模型建一把 Key。
+        #    （这也顺带修好了"同一把 Key 配文本槽 + 视觉槽"时互相牵连的问题。）
+        self._key_dead: dict = {}
+        # 🔴 2026-09-27：槽位签名 → 已"疑似限流复活"次数。
+        #   仅一次性额度平台（腾讯）使用：限流不等于额度耗尽，所以先给冷却复活；
+        #   连续复活 _ONESHOT_MAX_REVIVE 次仍失败 → 升级为永久弃用。
+        #   一次请求成功即清零（见 `_call` 成功分支）。
+        self._revive_count: dict = {}
+        self._COOLDOWN_SECONDS = 45.0
+        try:
+            raw = str(self._conf.get('keys') or '').strip()
+            if raw:
+                for line in re.split(r'[\r\n]+', raw):
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    parts = [p.strip() for p in line.split('|')]
+                    key = parts[0] if parts else ''
+                    if not key:
+                        continue
+                    # 旧格式兼容：一行里塞多个 Key（逗号分隔）
+                    if '|' not in line and re.search(r'[,，;；\s]', key):
+                        for k in re.split(r'[,，;；\s]+', key):
+                            k = k.strip()
+                            if k:
+                                self._slots.append(
+                                    {"key": k, "endpoint": "", "model": "", "tag": "池"})
+                        continue
+                    self._slots.append({
+                        "key": key,
+                        "endpoint": parts[1] if len(parts) > 1 else "",
+                        "model": parts[2] if len(parts) > 2 else "",
+                        "tag": "池",
+                    })
+        except Exception:
+            pass
+        # 主 Key 作为**首个**槽位（沿用主 Endpoint/模型）
+        if self.key and all(s.get("key") != self.key for s in self._slots):
+            self._slots.insert(0, {"key": self.key, "endpoint": "",
+                                   "model": "", "tag": "主"})
+        if not self._slots and self.key:
+            self._slots = [{"key": self.key, "endpoint": "",
+                            "model": "", "tag": "主"}]
+        # 旧属性保留（`_next_key`/`_key_alive` 等仍按 Key 字符串工作）
+        self._keys = [s["key"] for s in self._slots]
+        # 去重（同 Key 只留一个；保序）
+        # 🔴 2026-09-26 23:38 修缺陷：去重键必须是 **(Key, Endpoint, Model) 三元组**，
+        #    不能只用 Key。原因：同一家的同一个 Key 可以调**不同模型**
+        #    （典型场景：文本题用 Qwen2.5-7B、图片题用 Qwen3-VL-8B，
+        #      但 API Key 就一个）。只按 Key 去重会把 VL 槽位吃掉 →
+        #    图片题永远找不到视觉模型（真机踩坑）。
+        _seen = set()
+        _uniq = []
+        for s in self._slots:
+            sig = (s["key"], s.get("endpoint") or "", s.get("model") or "")
+            if sig in _seen:
+                continue
+            _seen.add(sig)
+            _uniq.append(s)
+        self._slots = _uniq
+        self._keys = [s["key"] for s in self._slots]
+
+        if len(self._slots) > 1:
+            eps = {s["endpoint"] for s in self._slots if s["endpoint"]}
+            extra = f"，跨 {len(eps) + 1} 个平台" if eps else ""
+            logger.info(f"🔑 AI 多 Key 轮换已启用：共 {len(self._slots)} 个 Key"
+                        f"{extra}（429/401 时自动切换）")
+        # 把首个槽位应用到当前生效属性
+        self._apply_slot(0, announce=False)
+
+        # 🔴 2026-09-29 二次确认开关：**默认关**，只有显式配 `ai_vote = true`
+        #    才启用（语义从"默认可关"反转过来，原因见 `__init__` 处的注释：
+        #    实测只提升 0.6pp，却多花约一半 token）。
+        _av = str((self._conf or {}).get("ai_vote") or "").strip().lower()
+        self._vote_enabled = _av in ("1", "true", "on", "yes", "y")
+        if not self._vote_enabled:
+            logger.info("🗳 AI 二次确认：已关闭（默认）。实测开启只提升 0.6 个百分点，"
+                        "却多消耗约一半 token；要开启请配 ai_vote = true")
+        elif len(self._slots) > 1:
+            logger.info(f"🗳 AI 二次确认已启用：共 {len(self._slots)} 个槽位可交叉验证"
+                        f"（题库/学习库命中的题不参与，只复核 AI 单独作答的题）")
+        else:
+            logger.info("🗳 AI 二次确认：池中只有 1 个槽位，无法交叉验证 → "
+                        "退化为单次作答（加一个 Key 即可启用）")
+
+    # ── 🔑 多 Key 轮换（2026-09-26）──────────────────────────────────
+    def _apply_slot(self, idx: int, announce: bool = True) -> None:
+        """把第 idx 个槽位的 Key/Endpoint/Model 应用为**当前生效**值。
+
+        🔴 用户要求「换 API Key 的时候把对应的也换掉」：跨平台时三者必须
+        同时切换，否则会出现"用 A 家的 Endpoint 发 B 家的 Key" → 必然 401。
+        """
+        if not self._slots:
+            return
+        s = self._slots[idx % len(self._slots)]
+        old_ep, old_key, old_model = self.endpoint, self.key, self.model
+        self.key = s["key"]
+        self.endpoint = s["endpoint"] or self._conf.get('endpoint') or ""
+        self.model = s["model"] or self._conf.get('model') or ""
+        # 模型变了 → 重建降级链与索引，避免指向旧平台的模型名
+        if self.model != old_model:
+            self._model_chain = self._build_model_chain(self.model, self._conf)
+            self._model_idx = 0
+        if announce and (self.endpoint != old_ep or self.model != old_model):
+            logger.warning(
+                f"🔑 已切换 AI 槽位 → Key（…{self.key[-6:]}）"
+                f" | Endpoint={self.endpoint}"
+                f" | Model={self.model}")
+
+    # ── 🔑 槽位签名（2026-09-27 新增）────────────────────────────────
+    #
+    # 冷却表原先以 **Key 字符串** 为键 → 同一把 Key 配多个模型会**连带死亡**：
+    # hy3 额度耗尽 → 整把 Key 被拉黑 → 同 Key 的其他模型槽位一起废。
+    #
+    # 而腾讯 TokenHub 的免费额度是**按模型**发放的（每模型 100 万 token），
+    # 一把 Key 就能调全部模型。要让「一个模型用完 → 自动换下一个模型」生效，
+    # 冷却必须细化到**槽位**粒度 ⇒ 改用 (Key | Endpoint | Model) 签名。
+    #
+    # ⚠️ 签名的 endpoint/model 取**实际生效值**（空则回退主配置），
+    #    保证 `_cur_sig()` 与 `_sig(槽位)` 严格一致。
+    def _sig(self, s: dict) -> str:
+        ep = (s.get("endpoint") or self._conf.get("endpoint") or "").strip()
+        md = (s.get("model") or self._conf.get("model") or "").strip()
+        return f"{s.get('key') or ''}|{ep}|{md}"
+
+    def _cur_sig(self) -> str:
+        """当前生效槽位的签名。"""
+        return f"{self.key}|{self.endpoint}|{self.model}"
+
+    @staticmethod
+    def _sig_masked(sig: str) -> str:
+        """日志用掩码：Key 末 6 位 + 模型名。"""
+        parts = (sig or "").split("|")
+        key = parts[0] if parts else ""
+        md = parts[2] if len(parts) > 2 else ""
+        return f"…{key[-6:]}@{md}" if md else f"…{key[-6:]}"
+
+    def _slot_of_sig(self, sig: str) -> int:
+        """按**槽位签名**找下标（原 `_slot_of_key` 的升级版）。
+
+        同 Key 多模型时，只按 Key 找会返回第一个匹配 → 切换起点错位。
+        """
+        for i, s in enumerate(self._slots):
+            if self._sig(s) == sig:
+                return i
+        return -1
+
+    def _sig_cooldown_left(self, sig: str) -> float:
+        """某个**槽位**还需要冷却多久（秒）。0 = 可用，inf = 永久废。"""
+        until = self._key_dead.get(sig)
+        if until is None:
+            return 0.0
+        if until == float('inf'):
+            return float('inf')
+        return max(0.0, until - time.time())
+
+    def _min_cooldown_left(self) -> float:
+        """池里**最早解冻**还需要多久；若全是永久废槽位则返回 -1。"""
+        best = -1.0
+        for s in self._slots:
+            left = self._sig_cooldown_left(self._sig(s))
+            if left == float('inf'):
+                continue
+            if left <= 0:
+                return 0.0
+            if best < 0 or left < best:
+                best = left
+        return best
+
+    def _sig_alive(self, sig: str) -> bool:
+        """🔴 2026-09-27：冷却表语义 —— 到期的临时冷却自动复活。
+
+        按**槽位签名**判定：同 Key 不同模型**互不影响**。
+        这样"一个模型额度耗尽"只会弃用那一个槽位，同 Key 的其他模型照常可用
+        ⇒ 腾讯每个模型各 100 万 token 可以逐个吃完，无需为每个模型各建一把 Key。
+        """
+        if not sig:
+            return False
+        until = self._key_dead.get(sig)
+        if until is None:
+            return True
+        if until == float('inf'):        # 永久废号
+            return False
+        if time.time() >= until:          # 冷却结束 → 复活
+            del self._key_dead[sig]
+            logger.info(f"🔑 AI 槽位（{self._sig_masked(sig)}）冷却结束，重新启用")
+            return True
+        return False
+
+    def _next_key(self) -> str:
+        """取下一个可用**槽位**并整体应用（Key+Endpoint+Model）；全不可用返回 ""。
+
+        🔴 2026-09-27 修下标错位：
+        `_keys` 是**去重后的 Key 列表**，而切换要的是 `_slots`（可能同一 Key
+        占多个槽位，如"同 Key 7B 文本 + VL 视觉"）。原实现用
+        `self._key_idx % len(self._keys)` 取下标再 `self._keys[i]`，得到的 Key
+        再喂给 `_apply_slot(i)` —— **下标是 `_keys` 的，却拿去索引 `_slots`**，
+        跨平台/同 Key 多槽位时必然切错。
+        现在直接以 `_slots` 为索引空间，用 `_apply_slot` 的取模自理。
+        """
+        if not self._slots:
+            return self.key
+        n = len(self._slots)
+        for _ in range(n):
+            i = self._key_idx % n
+            self._key_idx += 1
+            # 按**槽位签名**判定可用性（同 Key 不同模型互不牵连）
+            if self._sig_alive(self._sig(self._slots[i])):
+                # 一律走 `_apply_slot`（它会自行判断 Key/Endpoint/Model 是否
+                # 真的变了，并决定 announced 文案）—— 不在这里用 `k != self.key`
+                # 决定路径：同 Key 不同模型（文本槽位 → 视觉槽位）也必须切换。
+                self._apply_slot(i, announce=True)
+                return self._slots[i].get("key") or ""
+        # 🔴 2026-09-27 修：全不可用时返回空串。
+        #    原实现 `return self.key` 会让上层 `_key_alive(nxt)` 判 false 之后
+        #    仍然把当前（已死的）Key 当成"切换成功"，下一轮又打同一个死 Key。
+        return ""
+
+    @classmethod
+    def _is_network_error(cls, err: BaseException) -> bool:
+        """🔴 2026-09-27 新增：是不是**纯网络/传输层**故障（跟 Key 好坏无关）。
+
+        用户追问"额度没用完、只是网络连接不畅，会不会被当成用完了"——
+        实测（`_probe_net_fault.py`）12 种网络报文：连接失败/超时/断连/
+        DNS/SSL/代理/网关 HTML 错误页**都不会**被判成额度错误。
+        但为杜绝边缘误伤（例如报文里恰好含 "40123"、"403 bytes"、
+        "Max retries exceeded"），这里再立一道**显式闸门**：
+        凡属网络层异常，直接退出"弃用槽位"的判定链。
+
+        判定顺序：异常类型名 → httpx 传输层基类 → requests 网络基类。
+        """
+        if type(err).__name__ in cls._NETWORK_ERR_NAMES:
+            return True
+        try:
+            import httpx
+            if isinstance(err, (httpx.TransportError, httpx.TimeoutException)):
+                return True
+        except Exception:
+            pass
+        try:
+            import requests
+            if isinstance(err, (requests.exceptions.ConnectionError,
+                                requests.exceptions.Timeout,
+                                requests.exceptions.ProxyError,
+                                requests.exceptions.SSLError)):
+                return True
+        except Exception:
+            pass
+        return False
+
+    @classmethod
+    def _is_quota_error(cls, err: BaseException) -> bool:
+        """判断异常的 Key 是不是**已经废了**（换 Key 可解）。
+
+        🔴 2026-09-26 23:40 改名语义（原为"额度/限流"）：
+        实测发现"该换 Key"的情况有**两类**，行为上都是"弃用这个 Key、换下一个"：
+          ① 额度/限流：429 / rate limit / quota / token plan（免费额度打光）
+          ② Key 无效  ：401 Invalid token / AuthenticationError（Key 打错/被吊销）
+
+        两类都"换 Key 就能解决"，所以归到同一个判据里；
+        但日志里要区分（见 `_key_fault_kind`），否则用户看到"额度耗尽"
+        实际是 Key 打错，会去充值而解决不了问题。
+
+        依据真机报文：
+            429: "You've reached the API rate limit for free users.
+                  Upgrade to a Token Plan ..."  (type: AgnesAI_error)
+            401: "Invalid token (request id: ...)"  (type: AgnesAI_error)
+
+        🔴 2026-09-27 二次加固（用户追问"网络不畅会不会被误判成额度用完"）：
+          ① **纯网络故障直接返回 False**（见 `_is_network_error`）——
+             一次网络抖动绝不能让一个满额度的槽位"永久弃用"。
+          ② 裸数字状态码 `401/403/429` 改为**带上下文的正则**匹配：
+             原实现是 `'401' in s` 子串匹配，实测会被
+             `127.0.0.1:40123`（端口号）、`403 bytes of garbage`
+             （字节数）这类网络报文误命中 → 白扔一个好槽位。
+          ③ 删掉裸词 `'exceeded'`：它会命中经典的
+             `Max retries exceeded with url: ...`（纯网络故障报文）。
+             真额度报文的 "exceeded your current quota" 由 `quota` 兜住。
+        """
+        if cls._is_network_error(err):
+            return False
+        name = type(err).__name__
+        if name in ('RateLimitError', 'AuthenticationError', 'PermissionDeniedError'):
+            return True
+        s = str(err).lower()
+        # 状态码只在"HTTP 状态码上下文"里认（避免端口号 / 字节数误伤）
+        if re.search(r'(?:http|status|error)[ _-]*code[:= ]{0,2}(?:401|403|429)\b', s):
+            return True
+        if re.search(r'\bhttp[/ ]?1\.[01]["\s]{1,3}(?:401|403|429)\b', s):
+            return True
+        if re.search(r'\b(?:401|403|429)\s+'
+                     r'(?:unauthorized|forbidden|too many requests)', s):
+            return True
+        # JSON 形态：{"code":429,...} / {"status":429,...}
+        if re.search(r'["\'](?:code|status)["\']\s*:\s*(?:401|403|429)\b', s):
+            return True
+        markers = ('rate limit', 'rate_limit', 'quota', 'insufficient',
+                   'balance', '欠费', '额度', '余额不足',
+                   'too many requests', 'token plan', 'invalid token',
+                   'invalid api key', 'incorrect api key', 'unauthorized',
+                   'authentication', 'per minute', 'per second')
+        # ⚠️ 这里**故意不含**裸数字 '429'：实测它会被端口号/时间戳等误命中，
+        #    而"误判成额度耗尽的代价（永久丢一个满额度槽位）"远大于
+        #    "漏判的代价（该题换题库/失败）"。宁可漏判，不可误判。
+        return any(m in s for m in markers)
+
+    @classmethod
+    def _is_transient_limit(cls, err: BaseException) -> bool:
+        """🔴 2026-09-27 新增：区分**临时限流**（可冷却复活）与**永久废号**。
+
+        真机证据（agnes 免费档）：
+            K1 报 429 "You've reached the API rate limit for free users"，
+            但 **K2/K3/K4 同一时刻正常** → 说明这个 429 是**按账号的滑动窗口**
+            限流，不是"额度永久打光"。等一段时间会自动恢复。
+
+        原实现把 429 一律 `_key_dead.add()` 永久拉黑 —— 后果：
+            一份 100 题作业跑到一半所有 Key 都被拉黑，
+            后面 70 题全部无答案（真机踩坑：23:55 之后大面积"AI Key 已全部耗尽"）。
+
+        判据：报文里出现"限流/稍后再试"语义 → 临时（冷却可复活）。
+              出现"欠费/余额不足/quota/Key 无效"语义 → 永久。
+
+        🔴 2026-09-27 二次加固：
+          · 纯网络故障不参与本判据（`_is_network_error` 前置排除）；
+          · 补中文额度说法（"免费额度已用完"/"额度用尽"/"已达上限"…）→ 永久；
+          · 补 Key 无效类（invalid token / unauthorized / permission denied）
+            → 永久 —— Key 打错了不该给它冷却反复复活。
+        """
+        if cls._is_network_error(err):
+            return False
+        s = str(err).lower()
+        # 永久的：余额/额度真没了，或 Key 本身无效
+        # 🔴 2026-09-27 补漏（用户专门问"hy3 用完后能不能正常切换"）：
+        #   OpenAI / 腾讯 TokenHub 兼容格式的「额度耗尽」标准报文是
+        #     HTTP 429 + "You exceeded your current quota, please check
+        #                 your plan and billing details"  (insufficient_quota)
+        #   它**不含** "quota exceeded"（词序相反），原本一条都匹配不上，
+        #   于是落到最后的类型兜底 —— 429 被 openai SDK 抛成 RateLimitError，
+        #   判定为"临时限流"→ 45 秒后又切回已耗尽的槽位 → **反复撞墙、
+        #   永远递补不到下一个模型**。加一个宽判据 `quota` 覆盖全部变体。
+        _permanent = (
+            'insufficient balance', 'balance', '欠费', '余额不足',
+            'quota exceeded', 'no quota', 'billing', 'payment required',
+            'arrears', 'quota', 'insufficient_quota',
+            'exceeded your current quota',
+            # 中文"额度用完"类说法（2026-09-27 补）
+            '额度已用完', '额度用尽', '额度不足', '额度耗尽', '免费额度用完',
+            '免费额度已用完', '用量已满', '已达上限', '超出配额', '配额不足',
+            '套餐已用完', '已无可用额度',
+            # 英文"额度用完"类说法
+            'exhausted', 'used up', 'out of credit', 'credit exhausted',
+            'quota exhausted', 'no remaining',
+            # Key 无效/无权（永久，与额度无关）
+            'invalid token', 'invalid api key', 'incorrect api key',
+            'unauthorized', 'authentication', 'permission denied', 'key 无效',
+        )
+        if any(m in s for m in _permanent):
+            return False
+        # 临时的：限流 / 稍后再试
+        if any(m in s for m in ('rate limit', 'rate_limit', 'too many requests',
+                                'tpm', 'rpm', 'try again later', 'retry after',
+                                'slow down', '频率', '请求过于频繁', '稍后再试',
+                                'overloaded', '过载', 'busy')):
+            return True
+        # 类型兜底：RateLimitError 多数是滑动窗口。
+        # ⚠️ 注意顺序：必须在"额度/Key 无效"判据**之后**才用兜底，否则会把
+        #    "额度耗尽(429)"误判成临时限流（上面那条漏就是这么来的）。
+        return type(err).__name__ == 'RateLimitError'
+
+    @staticmethod
+    def _is_vlm_error(err: BaseException) -> bool:
+        """异常是否表示"当前模型不支持读图"（图片题专用判据）。
+
+        真机报文（硅基流动）：
+            Qwen/Qwen2.5-7B-Instruct + 图片
+            → 400 {"code":20041,
+                   "message":"The model is not a VLM (Vision Language Model).
+                              Please use text-only prompts."}
+        识别出它才能"换视觉槽位"而不是"丢图瞎猜"。
+        """
+        s = str(err).lower()
+        return ('not a vlm' in s or 'not a vision' in s
+                or 'vision language model' in s
+                or 'does not support image' in s
+                or 'not support image' in s
+                or 'image input' in s
+                or ('image' in s and 'not supported' in s)
+                or ('不支持' in s and ('图' in s or '视觉' in s)))
+
+    @staticmethod
+    def _key_fault_kind(err: BaseException) -> str:
+        """把 Key 故障分类成人类可读的原因（仅用于日志文案）。"""
+        name = type(err).__name__
+        s = str(err).lower()
+        if name in ('AuthenticationError', 'PermissionDeniedError') \
+                or 'invalid token' in s or 'invalid api key' in s \
+                or 'incorrect api key' in s or 'unauthorized' in s:
+            return "Key 无效/无权"
+        if name == 'RateLimitError' or '429' in s or 'rate limit' in s \
+                or 'quota' in s or 'token plan' in s:
+            return "额度/限流用尽"
+        return "不可用"
+
+    @classmethod
+    def _decide_dead_action(cls, endpoint: str, err: BaseException,
+                            n_revive: int) -> tuple:
+        """🔴 2026-09-27 新增：槽位报错后的处置决策（**纯函数**，单独可测）。
+
+        抽出来的目的：这段"永久弃用 / 冷却复活"的判断直接决定"会不会白扔
+        一个满额度槽位"，属高风险逻辑，必须能脱离整条作业链单测。
+        单测见 `_verify_keypool.py`。
+
+        Args:
+            endpoint: 当前槽位的 endpoint（判断是否一次性额度平台）
+            err: 平台抛出的异常
+            n_revive: 该槽位已"限流复活"过的次数
+
+        Returns:
+            (action, seconds, reason, bump_revive)
+            · action ∈ {'permanent', 'cooldown', 'none'}
+              'none' = 网络抖动，**不处置**（原样抛出，槽位保持可用）
+            · seconds: 冷却秒数（permanent 时为 inf）
+            · reason : 人类可读原因（写日志）
+            · bump_revive: 是否要把该槽位的复活计数 +1
+        """
+        # ⓪ 纵深防御：**只有"换 Key 能解决"的错误才允许处置槽位**。
+        #    网络抖动（超时/断连/DNS/SSL）与服务端 5xx、请求参数错误等
+        #    跟 Key 好坏无关，一律放行、保持槽位可用。
+        #    正常路径上 `_is_quota_error` 已挡住这些，这里再兜一层 ——
+        #    万一将来有人绕过那道闸门直接调本函数，也不会误伤好槽位。
+        if cls._is_network_error(err):
+            return ('none', 0.0, "网络抖动（不弃用槽位）", False)
+        if not cls._is_quota_error(err):
+            return ('none', 0.0, "非额度/鉴权类错误（不弃用槽位）", False)
+        oneshot = any(h in (endpoint or "") for h in cls._ONESHOT_HOSTS)
+        # ① 不是限流 → 额度/余额真耗尽，或 Key 无效 → 永久弃用
+        if not cls._is_transient_limit(err):
+            _kind = cls._key_fault_kind(err)
+            # ⚠️ 一次性平台上如果是"Key 无效"，别错报成"额度耗尽"——
+            #    否则用户会去充值，而问题其实是 Key 打错/被吊销。
+            reason = ("额度已耗尽（一次性额度，永久丢弃）"
+                      if (oneshot and _kind != "Key 无效/无权") else _kind)
+            return ('permanent', float('inf'), reason, False)
+        # ② 一次性平台 + 复活次数已用尽 → 反复限流，认定为不可用 → 永久
+        if oneshot and n_revive >= cls._ONESHOT_MAX_REVIVE:
+            return ('permanent', float('inf'),
+                    f"已 {n_revive} 次限流复活后仍不可用（一次性额度平台）", False)
+        # ③ 一次性平台 + 疑似限流 → 长冷却复活（逐次递增）
+        if oneshot:
+            return ('cooldown', cls._ONESHOT_COOLDOWN * (n_revive + 1),
+                    f"疑似限流（额度未必耗尽，第 {n_revive + 1}/"
+                    f"{cls._ONESHOT_MAX_REVIVE} 次复活）", True)
+        # ④ 永久免费平台的滑动窗口限流 → 短冷却复活
+        return ('cooldown', cls._COOLDOWN_SECONDS, "临时限流", False)
+
     def check_llm_connection(self) -> bool:
         """
         检查大模型连接是否可用
@@ -1973,12 +3718,13 @@ class AI(Tiku):
         with self._lock:
             logger.info(f'正在检查 {self.name} 连接...')
             try:
-                # 初始化客户端
+                # 初始化客户端（timeout 同 _make_client，防上游挂起堵死）
                 if self.http_proxy:
-                    httpx_client = httpx.Client(proxy=self.http_proxy)
-                    client = OpenAI(http_client=httpx_client, base_url=self.endpoint, api_key=self.key)
+                    httpx_client = httpx.Client(proxy=self.http_proxy, timeout=90)
+                    client = OpenAI(http_client=httpx_client, base_url=self.endpoint,
+                                    api_key=self.key, timeout=90)
                 else:
-                    client = OpenAI(base_url=self.endpoint, api_key=self.key)
+                    client = OpenAI(base_url=self.endpoint, api_key=self.key, timeout=90)
 
                 # 限流等待
                 self._wait_for_interval()
@@ -2052,9 +3798,12 @@ class SiliconFlow(Tiku):
         # 构造系统提示词
         system_prompt = ""
         if q_info['type'] == "single":
-            system_prompt = "本题为单选题，请根据题目和选项选择唯一正确答案，输出的是选项的具体内容，而不是内容前的ABCD，并以JSON格式输出：示例回答：{\"Answer\": [\"正确选项内容\"]}。除此之外不要输出任何多余的内容，也不要使用MD语法。如果你使用了互联网搜索，也请不要返回搜索的结果和参考资料"
+            system_prompt = "本题为单选题，你只能选择一个选项，请根据题目和选项回答问题，输出的是选项的具体内容（必须与选项原文逐字一致，含标点符号），而不是内容前的ABCD，并以JSON格式输出：示例回答：{\"Answer\": [\"正确选项内容\"]}。除此之外不要输出任何多余的内容，也不要使用MD语法。如果你使用了互联网搜索，也请不要返回搜索的结果和参考资料"
         elif q_info['type'] == 'multiple':
-            system_prompt = "本题为多选题，请选择所有正确选项，输出的是选项的具体内容，而不是内容前的ABCD，以JSON格式输出：示例回答：{\"Answer\": [\"选项1\",\"选项2\"]}。除此之外不要输出任何多余的内容，也不要使用MD语法。如果你使用了互联网搜索，也请不要返回搜索的结果和参考资料"
+            # 🔴 2026-09-27 对齐 query_all 的批量版提示词：那边写了"必须选择
+            # 两个或以上选项"，这边漏了 → AI 常只回一个选项（真机实测：
+            # "下列属于二十四史的有？"只答《史记》）→ 多选题白丢分。
+            system_prompt = "本题为多选题，你必须选择两个或以上选项，逐个判断每个选项，不要漏选。输出的是选项的具体内容（必须与选项原文逐字一致，含标点符号），而不是内容前的ABCD，以JSON格式输出：示例回答：{\"Answer\": [\"选项1的内容\",\n\"选项2的内容\"]}。每个正确选项作为数组的一个元素，不要合并成一段文字。除此之外不要输出任何多余的内容，也不要使用MD语法。如果你使用了互联网搜索，也请不要返回搜索的结果和参考资料"
         elif q_info['type'] == 'completion':
             system_prompt = "本题为填空题，请直接给出填空内容，以JSON格式输出：示例回答：{\"Answer\": [\"答案文本\"]}。除此之外不要输出任何多余的内容，也不要使用MD语法。如果你使用了互联网搜索，也请不要返回搜索的结果和参考资料"
         elif q_info['type'] == 'judgement':
@@ -2603,6 +4352,8 @@ PROVIDER_REGISTRY = {
     'TikuGo': TikuGo,
     'TikuLike': TikuLike,
     'TikuAdapter': TikuAdapter,
+    'TikuHive': TikuHive,
+    'TikuJszkk': TikuJszkk,
     'AI': AI,
     'SiliconFlow': SiliconFlow,
     'TikuManual': TikuManual,

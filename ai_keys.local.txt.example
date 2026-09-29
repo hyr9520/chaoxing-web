@@ -1,0 +1,17 @@
+{
+  "_说明": "把本文件另存为同目录的 ai_keys.local.txt 并填入自己的密钥。ai_keys.local.txt 已被 .gitignore 忽略，不会被提交。也可以用环境变量 CHAOXING_AI_KEYS 传同样格式的 JSON（优先级高于本文件）。",
+  "tencent": [
+    "sk-你的腾讯TokenHub第1把Key",
+    "sk-你的腾讯TokenHub第2把Key",
+    "sk-你的腾讯TokenHub第3把Key"
+  ],
+  "agnes": [
+    "sk-你的agnesKey1",
+    "sk-你的agnesKey2"
+  ],
+  "siliconflow": {
+    "key": "sk-你的硅基流动Key",
+    "endpoint": "https://api.siliconflow.cn/v1",
+    "model": "Qwen/Qwen3.5-4B"
+  }
+}

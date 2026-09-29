@@ -186,6 +186,26 @@ class LearnedAnswers:
             rec = self._load().get(title) or {}
             return str(rec.get("verified") or "").strip()
 
+    def get_verified_record(self, title: str) -> dict:
+        """返回 {"answer": str, "options": str} —— 供调用方做**选项一致性校验**。
+
+        🔴 2026-09-27 新增，原因（真机实测 A 卷）：
+        学习库只按**题干**归一化匹配，不校验选项。同一题干在不同试卷里
+        选项数/顺序不同时，库里旧答案的**字母**会被原样提交 → 系统性错位。
+        实测两例：「中国四大名著」库里 verified=ABC 但被答成 ABD；
+        「HTTP 请求方法」库里 verified=ABCD 但被答成 ABC。
+        所以查询侧必须拿到 options 一起比对。
+        """
+        title = normalize_title(title)
+        if not title:
+            return {}
+        with _LOCK:
+            rec = self._load().get(title) or {}
+            return {
+                "answer": str(rec.get("verified") or "").strip(),
+                "options": str(rec.get("options") or "").strip(),
+            }
+
     def get_wrong(self, title: str) -> list:
         """该题历史答错的答案列表（新→旧）。"""
         title = normalize_title(title)

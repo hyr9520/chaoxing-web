@@ -39,8 +39,24 @@ from api.homework import (
     scan_works,
     fetch_work,
     submit_work,
+    fetch_work_detail,
+    redo_work,
+    fetch_work_page,
+    submit_dohw,
+    iter_dohw_questions,
+    fetch_all_works_once,
+    fetch_all_works_detail,
+    fetch_redo_info_batch,
     HomeworkNeedsAttention,
     HomeworkUnavailable,
+    _WORK_STATUS_DONE,
+    PAGE_WORK_DOHW,
+)
+from api.exam import (
+    fetch_course_tokens,
+    fetch_exam_list,
+    parse_exam_list,
+    is_exam_done,
 )
 
 
@@ -113,6 +129,57 @@ class SessionManager:
                 else:
                     logger.warning(f"Thread-safe relogin failed: {login_result.get('msg')}")
             return False
+
+
+# ---- 自动避风控：**只认真实风控信号**（2026-09-29）----
+# 只有平台明确给出风控信号（403 / 验证码拦截）才计数 —— 这些是硬信号。
+# 累计 2 次就先冷却 10 分钟给账号喘息，把 `_note_risk_control` 原有的
+# "3 次熔断中止"挡在前面：冷却期内风控消退，成功上报会把计数清零。
+#
+# ⚠️ 为什么**不**用"wait_video_passed 判定超时"当触发：平台判定慢是常态
+# （实测正常视频要 9~19 分钟才通过），拿它当风控信号会误伤正常刷课。
+_RISK_HITS = 0              # 连续真实风控信号次数
+_COOLDOWN_UNTIL = 0.0       # 冷却截止时间戳
+_RISK_THRESHOLD = 2         # 累计几次真实风控后冷却（熔断阈值是 3，留一次余量）
+_COOLDOWN_SECS = 600        # 冷却时长（秒）
+_RISK_LOCK = threading.Lock()
+
+
+def note_risk_cooldown(where: str = ""):
+    """记一次真实风控信号；达到阈值就开启冷却。返回是否触发。"""
+    global _RISK_HITS, _COOLDOWN_UNTIL
+    with _RISK_LOCK:
+        _RISK_HITS += 1
+        hits = _RISK_HITS
+        if hits >= _RISK_THRESHOLD:
+            _RISK_HITS = 0
+            _COOLDOWN_UNTIL = time.time() + _COOLDOWN_SECS
+            logger.warning("连续 {} 次真实风控信号（{}）-> 冷却 {} 分钟（挡在熔断中止之前）",
+                           hits, where or "未知", _COOLDOWN_SECS // 60)
+            return True
+    return False
+
+
+def note_risk_clear():
+    """一次成功上报：清零风控计数。"""
+    global _RISK_HITS
+    with _RISK_LOCK:
+        _RISK_HITS = 0
+
+
+def cooldown_wait():
+    """worker 开始新任务点前调用：冷却期内主动等待，冷却结束自动继续。"""
+    while True:
+        remain = _COOLDOWN_UNTIL - time.time()
+        if remain <= 0:
+            return
+        logger.info("风控冷却中，剩余 {} 秒后自动继续", int(remain))
+        time.sleep(min(remain, 30))
+
+
+def cooldown_state() -> int:
+    """给界面/诊断用：还剩多少秒冷却。"""
+    return max(0, int(_COOLDOWN_UNTIL - time.time()))
 
 
 class Account:
@@ -288,6 +355,33 @@ def normalize_listening_answer(answer) -> str:
     return answer
 
 
+def _coerce_options_str(options) -> str:
+    """把各种形态的 options 统一成字符串（2026-09-27 新增）。
+
+    起因（真机实证）：考试链路传的 options 是 **list[dict]**
+    `[{letter:'A', value:'C', text:'圣诞节'}, …]`，而选项内容→字母的映射
+    函数一律按 **str** 处理 → `multi_cut` 拿到 list 直接失败 → 映射结果为空
+    → 日志刷「答案无法映射为选项字母，已舍弃」→ **考试每道选择题的答案全被丢**。
+    （作业链路传的是字符串，所以这个坑一直没暴露。）
+
+    - str          → 原样
+    - list[dict]   → "A. 圣诞节\nB. 端午节"（给 map_* 做文本匹配用）
+    - list[str]    → 直接拼接
+    """
+    if isinstance(options, (list, tuple)):
+        lines = []
+        for o in options:
+            if isinstance(o, dict):
+                letter = str(o.get("letter") or o.get("value") or "").strip()
+                text = str(o.get("text") or "").strip()
+                if letter or text:
+                    lines.append(f"{letter}. {text}" if text else letter)
+            elif str(o).strip():
+                lines.append(str(o))
+        return "\n".join(lines)
+    return str(options or "")
+
+
 def map_single_answer(res, options_str: str, origin_html_content="") -> str:
     """普通单选：把题库/AI 返回的「选项内容（词）」映射回「选项字母」。
 
@@ -297,6 +391,7 @@ def map_single_answer(res, options_str: str, origin_html_content="") -> str:
     返回映射出的字母；无法映射时返回空串（调用方走随机作答），
     避免把非法格式提交给平台。
     """
+    options_str = _coerce_options_str(options_str)   # ← 2026-09-27 兼容 list[dict]
     res_text = str(res).strip()
     # 已是单个选项字母：直接采用。
     # 关键：不能再做子序列匹配——单字母会误命中"第一个含该字母的选项"
@@ -345,6 +440,7 @@ def map_multiple_answer(res, options_str: str, origin_html_content="") -> str:
 
     返回排序去重后的字母串；无法映射时返回空串（调用方走随机作答）。
     """
+    options_str = _coerce_options_str(options_str)   # ← 2026-09-27 兼容 list[dict]
     res_text = str(res).strip()
     if not res_text:
         return ""
@@ -448,6 +544,33 @@ def random_answer(options: str, q_type: str) -> str:
         answer = "true" if random.choice([True, False]) else "false"
     logger.info(f"随机选择 -> {answer}")
     return answer
+
+
+def _ai_last_resort(tiku, q: dict) -> str:
+    """**随机蒙之前的最后一道**：让 AI 换个模型再答一次（2026-09-29 新增）。
+
+    用户原话：「随机的话风险就大了，只能是最下下下策」。
+
+    为什么要在这一层补：`AI._ensure_usable` 只覆盖 AI 自己的 `_query` 路径，
+    而**章节检测/作业的随机兜底在本文件三处**（`1663` / `1770` / `3308`），
+    触发条件是"query 返回空"或"答案映射失败" —— 那时 AI 层已经交过答案、
+    不会再重试，于是照样随机。实测：18:50 acc5 就出过 1 次随机
+    （补丁已注入，但拦不到这条路径）。
+
+    返回：可用答案（非空字符串）；拿不到则返回 ""，调用方照常随机。
+    任何异常一律吞掉 —— 它只是"加分项"，绝不能影响主流程。
+    """
+    try:
+        cands = getattr(tiku, "providers", None) or [tiku]
+        for p in cands:
+            fn = getattr(p, "force_retry", None)
+            if callable(fn):
+                ans = fn(q)
+                if ans and str(ans).strip():
+                    return str(ans).strip()
+    except Exception as e:                                     # noqa: BLE001
+        logger.debug(f"随机前 AI 重答失败（忽略，照常随机）：{e}")
+    return ""
 
 
 def _parse_work_record_list(html_text: str) -> list[tuple[int, float]]:
@@ -668,6 +791,27 @@ class Chaoxing:
         self.RISK_LIMIT = 3
         self._risk_hits = 0
         self._risk_lock = threading.Lock()
+        # 本轮被 403 反复拦截的 (jobid, playingTime) 组合。
+        # 2026-09-24 加：日志实测同一个视频从 0s 被反复重刷（403 → 跳过 →
+        # 进度没推进 → 下次又从 0s 撞同一面墙），每撞一次风控等级加重一级。
+        # 记住"这个视频在这个进度点被拦过"，本轮直接跳过，不再重复试探。
+        self._blocked_probes: set[tuple[str, int]] = set()
+        self._blocked_lock = threading.Lock()
+
+    def _mark_blocked(self, jobid, playing_time):
+        key = (str(jobid), int(playing_time))
+        with self._blocked_lock:
+            self._blocked_probes.add(key)
+
+    def is_blocked(self, jobid, playing_time) -> bool:
+        """该视频在这个进度点是否已被 403 拦过（本轮内不再重试）。"""
+        with self._blocked_lock:
+            return (str(jobid), int(playing_time)) in self._blocked_probes
+
+    def _clear_blocked(self):
+        """新一轮任务开始时清空屏蔽名单（冷却过后可以重新尝试）。"""
+        with self._blocked_lock:
+            self._blocked_probes.clear()
 
         # 题目配图下载（2026-09-13）：把登录会话注入 AI 题库，使其能带
         # cookies 抓取题干里的 <img>。非 AI 题库没有该方法，忽略即可。
@@ -686,6 +830,8 @@ class Chaoxing:
         with self._risk_lock:
             self._risk_hits += 1
             hits = self._risk_hits
+        # 真实风控信号同时驱动"软冷却"：在 3 次熔断中止之前先暂停喘息（2026-09-29）
+        note_risk_cooldown(where)
         if hits >= self.RISK_LIMIT:
             logger.error(
                 f"连续 {hits} 次触发平台风控（{where}）—— 已熔断并中止本轮任务。"
@@ -697,6 +843,7 @@ class Chaoxing:
         """一次成功的上报，说明风控已解除，重置计数。"""
         with self._risk_lock:
             self._risk_hits = 0
+        note_risk_clear()
 
     def login(self, login_with_cookies=False):
         if login_with_cookies:
@@ -913,7 +1060,11 @@ class Chaoxing:
         logger.trace("开始读取课程所有章节...")
         _resp = _session.get(_url)
 
-        logger.trace(f"原始章节列表内容:\n{_resp.text}")
+        # 🔴 2026-09-29 截断：原样打印整页 HTML，而平台进度采集线程每 60 秒
+        # 调一次本方法 → 日志每分钟被灌 ~200KB HTML，把有用的刷课日志全冲掉
+        # （真机踩坑：acc5 日志近 900KB 里 0 条真实日志、71% 是 HTML，
+        #   排查"卡住"时完全看不到日志流）。保留前 200 字足够定位问题。
+        logger.trace(f"原始章节列表内容(前200字):\n{_resp.text[:200]}")
         logger.info("课程章节读取成功...")
         return decode_course_point(_resp.text)
 
@@ -955,7 +1106,7 @@ class Chaoxing:
             _resp = _session.get("https://mooc1.chaoxing.com/mooc-ans/knowledge/cards", params=cards_params)
             if _resp.status_code != 200:
                 logger.error(f"未知错误: {_resp.status_code} 正在跳过")
-                logger.error(_resp.text)
+                logger.error(_resp.text[:500])
                 return [], {}
 
             _job_list, _job_info = decode_course_card(_resp.text)
@@ -978,7 +1129,10 @@ class Chaoxing:
         if not job_list:
             self.study_emptypage(course, point)
 
-        logger.trace(f"原始任务点列表内容:\n{_resp.text}")
+        # 🔴 2026-09-29 截断（同 get_course_point）：本方法**每刷一个章节任务点
+        # 都会调用**，原样打印整页 HTML → 日志被彻底淹没，排查"卡住"时看不到
+        # 任何有效日志（实测：日志 100% 是 HTML、每分钟涨 24KB）。
+        logger.trace(f"原始任务点列表内容(前200字):\n{_resp.text[:200]}")
         logger.info("章节任务点读取成功...")
 
         return job_list, job_info
@@ -1064,22 +1218,28 @@ class Chaoxing:
                         ocr_inst = ocr_init()
                         if ocr_inst:
                             self._ocr = ocr_inst
-                    captcha_solver = CxCaptcha(user_agent=ua, cookies=cookies_str, ocr=ocr_inst)
+                    captcha_solver = CxCaptcha(user_agent=ua, cookies=cookies_str, ocr=ocr_inst,
+                                               limiter=self.video_log_limiter)
+                    # ⚠ 只试一次（2026-09-24 改）：
+                    # 原来失败后重试 3 次，日志实测是「第1/2/3次尝试通关 → 验证码验证失败
+                    # → 多次验证码通关失败」，连续 3 轮全失败还在撞。验证码拦下来说明
+                    # 平台已经在盯这个账号，**每一次重试都在加重风控**，收益却是 0。
+                    # 正确做法：试一次，不行就把它当成一次风控信号交给熔断器处理。
                     solved = False
-                    for attempt in range(3):
-                        logger.info(f"第 {attempt + 1} 次尝试通关验证码...")
-                        if captcha_solver.try_pass():
-                            logger.success("验证码通关成功！")
-                            solved = True
-                            break
-                        else:
-                            logger.warning("验证码验证失败，正在重试...")
-                            time.sleep(2)
+                    logger.info("尝试通关验证码（单次，失败即计入风控）...")
+                    if captcha_solver.try_pass():
+                        logger.success("验证码通关成功！")
+                        solved = True
+                    else:
+                        logger.warning("验证码验证失败，不再重试（重试会加重风控）")
                     if solved:
                         _session.cookies.update(captcha_solver.s.cookies)
                         res = _session.get(_url, params=params, headers=headers)
                     else:
-                        logger.error("多次验证码通关失败，可能需要手动干预。")
+                        logger.error("验证码未能自动通过 —— 计入风控信号，需人工干预。")
+                        self._note_risk_control("验证码自动识别连续失败")
+                except RiskControlError:
+                    raise       # 熔断必须透传，不能被下面的 except Exception 吞掉
                 except Exception as e:
                     logger.error(f"验证码通关逻辑异常: {e}")
             return res
@@ -1101,7 +1261,7 @@ class Chaoxing:
             for rt in [0.9, 1]:
                 resp = perform_request(rt)
                 if resp.status_code == 200:
-                    logger.trace(resp.text)
+                    logger.trace(resp.text[:200])
                     return resp.json()["isPassed"], 200
                 elif resp.status_code == 403:
                     logger.warning("出现403报错, 正常尝试切换rt")
@@ -1113,7 +1273,11 @@ class Chaoxing:
                     break
 
         if resp.status_code == 200:
-            logger.trace(resp.text)
+            # ⚠️ 2026-09-29：这里原本是 `logger.trace(resp.text)` —— 上报**成功**的主路径，
+            # 每次视频进度上报都打一整页响应 HTML（日志 24KB/分钟、真实日志全被冲掉）。
+            # 上一轮 replace_all 只匹配到 20 空格缩进的那处，**12 空格缩进的这处漏了**
+            # （靠 `_verify_source_features.py` 发布前核验才抓到）。必须截断。
+            logger.trace(resp.text[:200])
             self._note_risk_ok()   # 上报成功 -> 风控计数归零
             return resp.json()["isPassed"], 200
 
@@ -1130,6 +1294,10 @@ class Chaoxing:
             # 403 是平台级风控信号：本地换会话/刷新令牌/换 rt 都救不回来。
             # 这里累加计数，达到阈值会抛 RiskControlError 直接终止整个任务，
             # 而不是按章节逐个重试（那会把风控次数放大十几倍直至封号）。
+            #
+            # 同时把这个 (视频, 进度点) 记进屏蔽名单：本轮不再碰它。
+            # 2026-09-24 加 —— 实测同一视频从 0s 被反复撞是风控升级的主因。
+            self._mark_blocked(_job.get("jobid"), _playingTime)
             self._note_risk_control("视频进度上报被 403 拦截")
             return False, 403
 
@@ -1154,7 +1322,7 @@ class Chaoxing:
 
         if resp.status_code != 200:
             logger.debug("刷新视频状态返回码异常: {}" % resp.status_code)
-            logger.debug(resp.text)
+            logger.debug(resp.text[:200])
             return None
 
         try:
@@ -1191,6 +1359,8 @@ class Chaoxing:
 
     def study_video(self, _course, _job, _job_info, _speed: float = 1.0,
                     _type: Literal["Video", "Audio"] = "Video") -> StudyResult:
+        # 风控冷却：上一轮连续判定超时会在这一行挡住，冷却结束自动继续（2026-09-29）
+        cooldown_wait()
         _session = SessionManager.get_session()
 
         headers = gc.VIDEO_HEADERS if _type == "Video" else gc.AUDIO_HEADERS
@@ -1219,6 +1389,16 @@ class Chaoxing:
         wait_time = int(random.uniform(30, 90))
 
         logger.info(f"开始任务: {_job['name']}, 总时长: {duration}s, 已进行: {play_time}s")
+
+        # 本轮已被 403 拦过的 (视频, 进度点) 直接跳过（2026-09-24 加）。
+        # 实测死循环：403 → 跳过任务点 → 视频进度没真的推进（仍 0s）→
+        # 下次重启又从 0s 刷同一个视频 → 再 403。这里从源头掐掉：
+        # 同一面墙本轮不撞第二次。冷却后 _clear_blocked() 会放行。
+        if self.is_blocked(_job.get("jobid"), play_time):
+            logger.warning(
+                "跳过已被风控拦截的视频（本轮不再重试，避免加重风控）: {} @ {}s",
+                _job["name"], play_time)
+            return StudyResult.FORBIDDEN
 
         forbidden_retry = 0
         max_forbidden_retry = 2
@@ -1257,11 +1437,17 @@ class Chaoxing:
                             logger.warning("403重试失败, 跳过当前任务")
                             return StudyResult.FORBIDDEN
                         forbidden_retry += 1
+                        # ⚠️ 403 退避必须分级（2026-09-24 改）：
+                        # 原来固定 sleep(2~4) 秒 —— 平台已经明确回 403 了，
+                        # 睡 2 秒就再来一次，在风控语境下等于没退避，
+                        # 实测 4.2 秒就打下一发，28 秒内打满 30 个请求。
+                        # 改为指数退避：第 1 次 30s，第 2 次 120s。
+                        backoff = 30 if forbidden_retry == 1 else 120
                         logger.warning(
-                            "出现403报错, 正在尝试刷新会话状态 (第{}次)",
-                            forbidden_retry,
+                            "出现403报错, 正在尝试刷新会话状态 (第{}次, 退避{}s)",
+                            forbidden_retry, backoff,
                         )
-                        time.sleep(random.uniform(2, 4))
+                        time.sleep(backoff)
                         refreshed_meta = self._recover_after_forbidden(_session, _job, _type)
                         if refreshed_meta and refreshed_meta.get("dtoken") and refreshed_meta.get(
                                 "duration") is not None:
@@ -1504,9 +1690,15 @@ class Chaoxing:
                 logger.debug(f"当前题目信息 -> {q}")
                 answer = ""
                 if not res:
-                    # 随机答题
-                    answer = random_answer(q["options"], q["type"])
-                    q[f'answerSource{q["id"]}'] = "random"
+                    # 🔴 随机前最后挣扎：让 AI 换模型再答一次（2026-09-29）
+                    _rescue = _ai_last_resort(self.tiku, dict(q))
+                    if _rescue:
+                        answer = _rescue
+                        q[f'answerSource{q["id"]}'] = "ai-retry"
+                    else:
+                        # 随机答题
+                        answer = random_answer(q["options"], q["type"])
+                        q[f'answerSource{q["id"]}'] = "random"
                 else:
                     # 根据响应结果选择答案
                     if q["type"] == "multiple":
@@ -1612,8 +1804,16 @@ class Chaoxing:
 
                     if not answer:  # 检查 answer 是否为空
                         logger.warning(f"找到答案但答案未能匹配 -> {res}\t随机选择答案")
-                        answer = random_answer(q["options"], q["type"])  # 如果为空，则随机选择答案
-                        q[f'answerSource{q["id"]}'] = "random"
+                        # 🔴 随机前最后挣扎：让 AI 换模型再答一次（2026-09-29）。
+                        # 这条路径最容易漏 —— 答案是**拿到了但映射失败**
+                        # （如 AI 把英文选项翻成中文），AI 层不会重试。
+                        _rescue = _ai_last_resort(self.tiku, dict(q))
+                        if _rescue:
+                            answer = _rescue
+                            q[f'answerSource{q["id"]}'] = "ai-retry"
+                        else:
+                            answer = random_answer(q["options"], q["type"])  # 如果为空，则随机选择答案
+                            q[f'answerSource{q["id"]}'] = "random"
                     else:
                         # ⚠ 只对**听力题 / 题组题**做连写字母规范化（2026-09-13 修复）
                         # 此前对所有题型无条件调用 normalize_listening_answer，
@@ -1902,7 +2102,7 @@ class Chaoxing:
                         logger.error(f'{"提交" if questions["pyFlag"] == "" else "保存"}答题失败 -> {res_json["msg"]}')
                         return StudyResult.ERROR
                 else:
-                    logger.error(f'{"提交" if questions["pyFlag"] == "" else "保存"}答题失败 -> {res.text}')
+                    logger.error(f'{"提交" if questions["pyFlag"] == "" else "保存"}答题失败 -> {res.text[:500]}')
                     return StudyResult.ERROR
 
             # 4.1 提交后自检：接口返回成功不等于答案被接收，回查服务端回显
@@ -2398,7 +2598,7 @@ class Chaoxing:
             },
         )
         if _resp.status_code != 200:
-            logger.error(f"阅读任务学习失败 -> [{_resp.status_code}]{_resp.text}")
+            logger.error(f"阅读任务学习失败 -> [{_resp.status_code}]{_resp.text[:500]}")
             return StudyResult.ERROR
         else:
             _resp_json = _resp.json()
@@ -2408,8 +2608,13 @@ class Chaoxing:
     # ======================================================================
     # 作业模块（2026-09-13 新增，独立于章节测验通道）
     # ======================================================================
-    def list_homeworks(self, course: dict) -> list[dict]:
-        """扫描某门课程的作业列表（只读，不产生任何作答行为）。"""
+    def list_homeworks(self, course: dict, include_all: bool = False) -> list[dict]:
+        """扫描某门课程的作业列表（只读，不产生任何作答行为）。
+
+        Args:
+            include_all: True 时连「已完成/已批阅」的也返回（供界面让用户
+                自行勾选"重做"）；默认 False 只返回待完成的。
+        """
         _session = SessionManager.get_session()
         self.rate_limiter.limit_rate()
         try:
@@ -2419,17 +2624,536 @@ class Chaoxing:
         except Exception as e:
             logger.warning(f"作业列表扫描异常（{course.get('title')}）：{e}")
             return []
+        if include_all:
+            logger.info(f"课程《{course.get('title')}》：{len(works)} 份作业（含已完成）")
+            return works
         # 已完成 / 已批阅的不再处理
         todo = []
         for w in works:
             st = (w.get("status") or "")
-            if st in ("已完成", "已批阅", "待批阅"):
+            if st in _WORK_STATUS_DONE:
                 logger.info(f"作业《{w.get('name')}》状态为「{st}」，跳过")
                 continue
             todo.append(w)
         logger.info(f"课程《{course.get('title')}》：{len(works)} 份作业，"
                     f"其中 {len(todo)} 份待完成")
         return todo
+
+    # ────────────────────────────────────────────────────────────────
+    # 🔴 2026-09-26 新增：提交前的**平台侧回读校验**
+    #
+    # 用户明确要求（原话）：
+    #   「提交时需要测它的完成率这些，都是要从平台那边获得正确的反馈。
+    #     比如已经把答案写上了才能点提交。」
+    #
+    # 背景（R语言医学数据分析两份 0 分事故）：
+    #   程序"以为"自己把答案填进去了，就直接提交 —— 但答案其实根本没写进去
+    #   （`Tiku.query()` 丢掉答案那个 bug）。平台侧没有任何反馈被检查，
+    #   于是两份作业都在"程序以为写对了"的情况下被提交成了 0 分。
+    #
+    # 解法：把「写答案」和「点提交」拆开，中间插一道**平台侧回读**：
+    #   ① tempSave（暂存）—— 只写不交，不消耗作答次数、不产生成绩
+    #   ② 重新拉答题页 —— 读平台上"每题到底存了什么"
+    #   ③ 逐题比对：程序认为写了 X，平台读回来是不是 X
+    #        · 全部对上 → 允许提交（这才叫"已经写上去了"）
+    #        · 有对不上 → 拒绝提交，明确报出是哪几题
+    #
+    # ⚠️ 关键前提：必须**真的能回读到答案**。若平台不把已存答案回显到答题页
+    #    （某些题型/改版后的页面），就退化为"校验不可用"——此时**不阻塞提交**，
+    #    但必须留下明确日志，绝不能假装校验通过了。
+    # ────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _parse_platform_answers(html_text: str) -> dict:
+        """从答题页 HTML 里抠出**平台当前已存**的答案。
+
+        🔴🔴 2026-09-26 二次修正（**这是"填空题判定不回显"误判的真因**）：
+
+        真机核对（`_dump_第2章-...-填空题.html`，72720 字节）发现
+        **填空题的答案根本不是放在 `input` 里，而是 `textarea`**：
+
+            <div id="ananas-editor-answer1" aria-label="已作答-1"></div>
+            <textarea name="answer2152924721" id="answer2152924721"
+                      style="display:none;">-1</textarea>
+
+        注意字段名的构成：`answer` + **qid(215292472)** + **空序号(1)**。
+        ⇒ 旧解析器只 select `input[name^=answer]` 且把 `answer2152924721`
+          整串当 qid（得到 `2152924721`，对不上任何题）→ 判定"平台不回显"
+          ⇒ 于是设了 `ECHO_TYPES` 把填空题排除在比对之外 —— **方向错了**。
+
+        正确的形态清单：
+          · 选择/多选/判断：<input type="hidden" name="answer{qid}" value="B">
+          · **填空题：<textarea name="answer{qid}{空序号}">xx</textarea>**
+          · 单选/多选勾选态：<input type="radio|checkbox" name="answer{qid}" checked>
+          · 少数改版页：<div data-answer="xx" data-qid="...">
+
+        `value` / textarea 文本里装的就是平台当前存的作答（未作答时为空）。
+        这就是"从平台获得正确反馈"的落点：**读它就知道答案有没有写上去**。
+
+        Returns:
+            {qid(str): 平台答案(str)} —— **只包含非空值**。
+            qid 一律是**纯数字题号**（去掉空序号后缀）。
+            返回空 dict 表示"这道页面里没有任何已存答案"（区别于"解析失败"）。
+        """
+        try:
+            from bs4 import BeautifulSoup
+            import html as _h
+        except Exception:
+            return {}
+        body = _h.unescape(html_text or "")
+        soup = BeautifulSoup(body, "html.parser")
+        out: dict = {}
+
+        # ── qid 归一：answer2152924721 → 215292472（去掉尾部空序号）
+        # 题号是 9 位纯数字（实测 215292472 / 215292590 / 215260741）。
+        # 规则：取开头连续数字，若长度 > 9 则截断到 9 位（空序号一般是 1~2 位）。
+        _qid_cache: dict = {}
+
+        def _norm_qid(raw: str) -> str:
+            if raw in _qid_cache:
+                return _qid_cache[raw]
+            digits = ""
+            for ch in raw:
+                if ch.isdigit():
+                    digits += ch
+                else:
+                    break
+            if not digits:
+                _qid_cache[raw] = ""
+                return ""
+            qid = digits if len(digits) <= 9 else digits[:9]
+            # 清理掉误留的尾随序号（个别页面多空连写 answer{qid}12）
+            _qid_cache[raw] = qid
+            return qid
+
+        def _put(qid: str, val: str, multi=False):
+            """写入结果。multi=True（多选/多空）用 '|' 连接。"""
+            val = (val or "").strip()
+            if not qid or not val:
+                return
+            if multi and out.get(qid):
+                if val not in str(out[qid]).split("|"):
+                    out[qid] = str(out[qid]) + "|" + val
+            else:
+                out[qid] = val
+
+        # 🔴🔴 2026-09-26 22:50 **四题型真实字段形态（真机 56216179 逐页核对）**
+        # ─────────────────────────────────────────────────────────────
+        #  单选  <input type="hidden" name="answer405811899" value="《齐民要术》">
+        #  多选  <input type="hidden" name="answers405811919" value="AB">  ← **复数 answers！**
+        #  判断  <input type="hidden" name="answer405811939" value="false">
+        #  填空  <textarea name="answer4058119591" style="display:none;">北京</textarea>
+        #        <textarea name="answer4058119592" style="display:none;">上海</textarea>
+        #        ⚠️ 多空 = answer{qid}1 / answer{qid}2 … **必须按尾号排序拼接**，
+        #           否则出现 "上海|北京" 这种颠倒（比错更致命：看起来写了其实错位）
+        #        （兄弟节点 <div id="ananas-editor-answer1" aria-label="已作答北京">
+        #          只是 UI 冗余，textarea 里就有真值 —— 仅当 textarea 空时才用它）
+        #  简答  <input type="hidden" name="answer405811979" value='长文本'>  ← **单引号！**
+        # ─────────────────────────────────────────────────────────────
+        # ⇒ 旧解析器三大漏洞：
+        #   ① 只 select `input[name^=answer]`，**漏了 `answers{qid}`（多选）**
+        #   ② 只认双引号 value，**漏了单引号 value（简答）**
+        #   ③ 多空没有按序号排序 → 拼接顺序错乱
+
+        # ① 通用：input / textarea，name 以 answer / answers 开头
+        #    多空/多选用 (qid, 序号) 聚合后再排序拼接
+        _mult: dict = {}        # qid -> [(seq, val)]
+        _sing: dict = {}        # qid -> val
+        for node in soup.select("input[name], textarea[name]"):
+            name = (node.get("name") or "").strip()
+            if not (name.startswith("answer") or name.startswith("answers")):
+                continue
+            is_multi = name.startswith("answers")   # 多选专用（复数）
+            rest = name[7:] if is_multi else name[6:]
+            qid = _norm_qid(rest)                    # 取前 9 位
+            if not qid:
+                continue
+            # 尾部剩下的数字 = 小问/空序号（没有则 0）
+            tail = rest[len(qid):] if len(rest) > len(qid) else ""
+            seq = int(tail) if tail.isdigit() else 0
+            typ = (node.get("type") or "").lower()
+            if typ in ("radio", "checkbox"):
+                if node.has_attr("checked"):
+                    _mult.setdefault(qid, []).append((seq, (node.get("value") or "").strip()))
+                continue
+            if node.name == "textarea":
+                val = (node.get_text() or "").strip()
+            else:
+                val = (node.get("value") or "").strip()
+                if not val:
+                    # 🔴 单引号 / 双引号 两种都要认（简答是单引号）
+                    raw_tag = str(node)
+                    m = re.search(r"""\bvalue\s*=\s*(['"])(.*?)\1""",
+                                  raw_tag, re.S)
+                    if m:
+                        val = (m.group(2) or "").strip()
+            if not val or val in ("-1",):     # -1 是平台"未作答"占位
+                continue
+            if is_multi or seq:
+                _mult.setdefault(qid, []).append((seq, val))
+            else:
+                _sing[qid] = val
+
+        for qid, v in _sing.items():
+            out[qid] = v
+        for qid, items in _mult.items():
+            items.sort(key=lambda x: x[0])          # 🔴 按序号排序，防错位
+            vals = []
+            for _, v in items:
+                if v and v not in vals:
+                    vals.append(v)
+            if vals:
+                out[qid] = "|".join(vals)
+
+        # ② 🔴 aria-label="已作答XX" —— **填空/简答的唯一可靠来源**
+        #    形态：<div id="ananas-editor-answer1" aria-label="已作答北京">
+        #          <div id="ananas-editor-answer"  aria-label="已作答长文本">
+        #    ⚠️ 多空必须**按 id 尾号排序**（answer1/answer2…），
+        #       否则 aria 出现顺序不定 → 测出 "上海|北京" 这种颠倒结果。
+        _aria_items = []          # (序号, 值)
+        for node in soup.select("[aria-label]"):
+            lab = (node.get("aria-label") or "").strip()
+            if not lab.startswith("已作答"):
+                continue
+            v = lab[len("已作答"):].strip()
+            if not v:
+                continue
+            nid = (node.get("id") or "")
+            m_seq = re.search(r"answer(\d+)$", nid)   # ananas-editor-answer1
+            seq = int(m_seq.group(1)) if m_seq else 999
+            _aria_items.append((seq, v))
+        _aria_items.sort(key=lambda x: x[0])
+        _aria_vals = [v for _, v in _aria_items]
+
+        if _aria_vals:
+            # 只在 ① 号没读到该题时补充（textarea 才是有值的权威来源）
+            txt_qids: list = []
+            for node in soup.select("textarea[name], input[name]"):
+                name = (node.get("name") or "").strip()
+                if not name.startswith("answer"):
+                    continue
+                qid = _norm_qid(name[6:])
+                if qid and qid not in txt_qids:
+                    txt_qids.append(qid)
+            if len(txt_qids) == 1:
+                qid = txt_qids[0]
+                if not out.get(qid):
+                    _put(qid, "|".join(_aria_vals), multi=True)
+            else:
+                for qid, v in zip(txt_qids, _aria_vals):
+                    if not out.get(qid):
+                        _put(qid, v)
+
+        # ③ 兜底：data-answer 属性回显
+        if not out:
+            for node in soup.select("[data-answer]"):
+                qid = (node.get("data-questionid")
+                       or node.get("data-qid") or "").strip()
+                val = (node.get("data-answer") or "").strip()
+                if qid and val:
+                    out[qid] = val
+        return out
+
+    def _verify_answers_on_platform(self, session, course, work, parsed,
+                                    questions, answers,
+                                    use_new=True, detail=None) -> dict:
+        """回读平台，确认答案真的写进去了（提交前的最后一道 gate）。
+
+        Returns:
+            {"ok": bool, "reason": str, "detail": [str], "confirmed": int,
+             "checked": bool}   # checked=False = 回读不可用，不做判定
+        """
+        def _result(ok, reason="", detail=None, confirmed=0, checked=True):
+            return {"ok": ok, "reason": reason, "detail": detail or [],
+                    "confirmed": confirmed, "checked": checked}
+
+        if not use_new:
+            # 旧版通道没有 tempSave/回读能力，明确标注"未校验"，不假装通过
+            logger.info("作业使用旧版提交通道，无平台回读能力（跳过回读校验）")
+            return _result(True, "旧版通道不支持回读", [], 0, checked=False)
+
+        total = len(questions)
+        if total == 0:
+            return _result(True, "无题目", [], 0, checked=False)
+
+        # ① 先暂存 —— 只写不交，不消耗作答次数
+        try:
+            save_res = self._submit_homework_once(
+                session, course, work, parsed, questions, answers, True, use_new)
+        except (PauseInterrupt, RiskControlError):
+            raise
+        except Exception as e:
+            return _result(False, f"暂存失败（无法确认答案已写入）：{e}")
+
+        if not (save_res or {}).get("status"):
+            msg = str((save_res or {}).get("msg") or "平台未返回原因")
+            return _result(False, f"暂存被平台拒绝：{msg}")
+
+        logger.info("作业已在平台暂存，开始回读校验…")
+
+        # ② 🔴🔴 逐页回读（2026-09-26 22:40 修）
+        #    旧写法只请求一次答题页 → 永远第 1 题（且带 workAnswerId 更糟）
+        #    → 只看到第 1 题的答案 → 其余全判"未写入" → 误拦 86 分作业。
+        #    现在按题目数逐页读，合并全部页的答案。
+        try:
+            plat = self._readback_all_pages(
+                session, course, work,
+                detail=detail or work.get("_detail") or None,
+                questions=questions)
+        except (PauseInterrupt, RiskControlError):
+            raise
+        except Exception as e:
+            logger.warning(f"回读答题页失败（不阻塞提交，但无法确认）：{e}")
+            return _result(True, f"回读页面失败：{e}", [], 0, checked=False)
+
+        if not plat:
+            logger.warning("回读未拿到任何已存答案，无法确认答案是否写入")
+            return _result(True, "回读拿不到页面内容", [], 0, checked=False)
+
+        # 🔴🔴 2026-09-26 真实回读实测结论（5003 / 张旭 / R语言医学数据分析 6 份作业）
+        # ─────────────────────────────────────────────────────────────
+        # 题型            平台是否回显   实测证据
+        # single(选择)      ✅ 回显       <input name="answer{qid}" value="B">
+        # multiple(多选)    ✅ 回显       （同上机制）
+        # judgement(判断)   ✅ 回显       <input name="answer{qid}" value="true">
+        # completion(填空)  ✅ **回显**   <textarea name="answer{qid}{空序号}">-1</textarea>
+        #
+        # ⚠️⚠️ 重大更正（2026-09-26 19:10）：
+        #   此前曾判定"填空题不回显"，并据此把填空题排除在比对之外。
+        #   那是**解析器的 bug**，不是平台特性 —— 旧解析器只 select `input`，
+        #   而填空题的答案放在 **`textarea`** 里，于是永远读不到 → 误判为不回显。
+        #   真机证据（`_dump_第2章-...-填空题.html`）：
+        #       <textarea name="answer2152924721" style="display:none;">-1</textarea>
+        #   答案 `-1` 明明就在页面上。已修 `_parse_platform_answers`（补 textarea）。
+        #
+        # ⇒ 结论：**四种题型全部参与回读比对**，一律"以平台为准"。
+        ECHO_TYPES = ("single", "multiple", "judgement", "completion")
+
+        def _norm(x):
+            """把答案归一化到"语义相同就算相同"的可比形态。
+
+            🔴 2026-09-26 实测踩坑：多选题的选项顺序**不代表答案不同**
+            （程序写 "CAB"、平台回显 "ABC" 是同一份作答），
+            原先直接 `upper()` 比较 → 被判成"不符" → **错误地拒绝提交**。
+            这里对"纯字母且像多选"的值做排序归一化。
+            """
+            s = str(x if x is not None else "").strip()
+            s = s.replace("|", "").replace("｜", "")
+            low = s.lower()
+            if low in ("true", "t", "1", "对", "正确", "是", "√", "yes", "y"):
+                return "true"
+            if low in ("false", "f", "0", "错", "错误", "否", "×", "no", "n"):
+                return "false"
+            s = re.sub(r"\s+", "", s).upper()
+            # 多选：全是字母（A-Z，长度≥2）→ 排序后比较，消除顺序差异
+            if len(s) >= 2 and re.fullmatch(r"[A-Z]+", s):
+                return "".join(sorted(set(s)))
+            return s
+
+        # 先看每种题型到底有没有回显能力（只要有 1 题读到值就算能回显）
+        echo_capable = set()
+        for q in questions:
+            qid = str(q["id"])
+            if plat.get(qid):
+                echo_capable.add(q.get("type"))
+        if not echo_capable and not plat:
+            # 一道都没读到 → 平台整体不回显（可能未作答，也可能不支持）
+            logger.warning("平台未回显任何已存答案（可能全部未作答，或该页不支持回读）"
+                           " → 本次提交**未经平台内容校验**")
+            return _result(True, "平台未回显任何答案", [], 0, checked=False)
+
+        def _get_ans(qid_raw):
+            """🔴🔴 2026-09-26 22:55 **answers 的 key 可能是 int 也可能是 str**。
+
+            `iter_dohw_questions` 写的是 `answers[q["id"]]`，而
+            `_parse_dohw_question` 返回的 id 是 **int**；但回读比对时
+            `qid = str(q["id"])` 是 **str** → `answers.get(qid)` 恒为 None
+            → 「应校验 59 题、确认 0 题」（真机实测踩到）。
+            这里 int / str 两种 key 都试。
+            """
+            for k in (qid_raw, str(qid_raw)):
+                try:
+                    if k in answers:
+                        return answers[k]
+                except TypeError:
+                    continue
+            try:
+                return answers.get(int(qid_raw))
+            except (TypeError, ValueError):
+                return None
+
+        confirmed, mismatch, missing, skipped = 0, [], [], []
+        for q in questions:
+            qid, qtype = str(q["id"]), q.get("type")
+            want = _get_ans(q["id"])
+            if want is None or not str(want).strip():
+                continue                     # 本来就没答案的题不参与比对
+            if qtype not in ECHO_TYPES:
+                skipped.append(f"[{qtype}] id={qid}（该题型平台不回显，跳过比对）")
+                continue
+            got = plat.get(qid)
+            if got is None:
+                # 该题型其它题能回显、但这题没有 → 说明这题确实没写进去
+                if qtype in echo_capable:
+                    missing.append(f"[{qtype}] id={qid} 平台未回显该题作答")
+                else:
+                    skipped.append(f"[{qtype}] id={qid}（该题型整体不回显）")
+                continue
+            if _norm(want) == _norm(got):
+                confirmed += 1
+            else:
+                mismatch.append(f"[{qtype}] id={qid} 程序写入「{want}」"
+                                f"→ 平台读回「{got}」")
+
+        # 应参与比对（= 可选型且有答案的题）
+        expect = sum(1 for q in questions
+                     if q.get("type") in ECHO_TYPES
+                     and _get_ans(q["id"]) is not None
+                     and str(_get_ans(q["id"])).strip())
+
+        logger.info(f"平台回读：应校验 {expect} 题（可选型），"
+                    f"确认 {confirmed} 题，不符 {len(mismatch)} 题，"
+                    f"未回显 {len(missing)} 题，跳过 {len(skipped)} 题（不可回显题型）")
+        if skipped:
+            for s in skipped[:5]:
+                logger.info(f"    跳过：{s}")
+
+        if mismatch or missing:
+            detail = mismatch[:15] + missing[:5]
+            reason = (f"平台回读不符：{len(mismatch)} 题内容不对、"
+                      f"{len(missing)} 题未回显（应校验 {expect} 题，确认 {confirmed} 题）")
+            return _result(False, reason, detail, confirmed)
+
+        if expect and confirmed < expect:
+            return _result(False,
+                           f"平台仅确认 {confirmed}/{expect} 题（答案未全部写入）",
+                           [], confirmed)
+
+        if expect == 0:
+            # 全是不可回显题型（例如整份都是填空题）→ 校验不可用，如实说明
+            return _result(True, "本作业题型均不可回读", [], 0, checked=False)
+
+        return _result(True, "", [], confirmed, checked=True)
+
+    def _fetch_raw_answer_page(self, session, course, work, detail=None,
+                               index=0) -> str:
+        """直接取答题页原始 HTML（供回读校验用）。失败返回空串。
+
+        🔴🔴🔴 2026-09-26 22:40 **回读必须走和翻页完全相同的姿势**：
+          ① **绝不能带 `workAnswerId`** —— 带了平台进"续答模式"，
+             永远返回第 1 题（回读只会看到第 1 题，其余全判"未写入"）。
+          ② **必须先清粘性 cookie（route/k8s/jrose）** —— 否则 index 失效，
+             同样永远第 1 题。
+          ③ 要带 `index=N` 才能取到第 N 题。
+
+        真机实测（56216179 / 100 题）：
+            带 workAnswerId + 不清 cookie → 每次都是第 1 题（回读 0/66）
+            用本函数姿势 → i=0/1/2/30/66/99 → 页面题号 1/2/3/31/67/100 ✅
+        """
+        try:
+            from api.homework import _drop_sticky_cookies
+        except Exception:
+            _drop_sticky_cookies = None
+        try:
+            detail = detail or {}
+            if _drop_sticky_cookies:
+                _drop_sticky_cookies(session)
+            params = {
+                "courseId": detail.get("courseid") or work.get("courseid")
+                            or course.get("courseId"),
+                "workId": detail.get("workid") or work.get("workid"),
+                "classId": detail.get("classid") or work.get("clazzid")
+                           or course.get("clazzId"),
+                "cpi": work.get("cpi") or course.get("cpi") or "",
+                "oldWorkId": "", "status": "1", "mooc": "1", "source": "0",
+                "checkIntegrity": "true",
+                "enc": detail.get("enc") or work.get("enc") or "",
+                # 🔴 唯一翻页手段；**不能**和 workAnswerId 并存
+                "index": str(index),
+            }
+            resp = session.get(PAGE_WORK_DOHW, params=params, timeout=30)
+            resp.raise_for_status()
+            return resp.text or ""
+        except (PauseInterrupt, RiskControlError):
+            raise
+        except Exception as e:
+            logger.warning(f"取答题页原始 HTML 失败：{e}")
+            return ""
+
+    def _readback_all_pages(self, session, course, work, detail, questions,
+                            max_pages=300) -> dict:
+        """**逐页回读**整份作业，合并成 {qid: 平台当前答案}。
+
+        Args:
+            questions: 题目清单（用来知道总页数；一个 question 一页）
+        Returns:
+            {qid(str): answer(str)}，只含非空值（= 平台真的存了的）
+        """
+        merged: dict = {}
+        n = len(questions) or 1
+        n = min(n, max_pages)
+        ok_pages = 0
+        for i in range(n):
+            try:
+                self.rate_limiter.limit_rate()
+            except Exception:
+                pass
+            html_text = self._fetch_raw_answer_page(
+                session, course, work, detail=detail, index=i)
+            if not html_text:
+                continue
+            ok_pages += 1
+            try:
+                part = self._parse_platform_answers(html_text)
+            except Exception as e:
+                logger.warning(f"回读第 {i + 1} 页解析失败：{e}")
+                continue
+            for k, v in (part or {}).items():
+                if v and not merged.get(k):
+                    merged[k] = v
+        logger.info(f"逐页回读完成：共取 {ok_pages}/{n} 页，"
+                    f"合并到 {len(merged)} 条平台答案")
+        return merged
+
+    def _answer_one_question(self, q: dict):
+        """坐**单道题**的答案（供翻页回调 `iter_dohw_questions` 使用）。
+
+        🔴 2026-09-26 20:15 新增。翻页协议要求"翻到哪题就答哪题"，所以
+        必须把"查答案"抽成单题回调，而不是等所有题抓齐再统一查。
+
+        与主流程里的查询逻辑保持一致：题库 → None 则返回 None
+        （翻页场景下**不随机蒙**，让上层按真实答案率决定要不要提交，
+         避免又把"蒙的答案"混进去当已作答）。
+        异常时返回 None，不打断翻页。
+        """
+        try:
+            ans = self.tiku.query(dict(q))
+        except (PauseInterrupt, RiskControlError):
+            raise
+        except Exception as e:
+            logger.warning(f"题目 {q.get('id')} 查询失败：{e}")
+            return None
+        if ans is None or not str(ans).strip():
+            logger.warning(f"题目 {q.get('id')} 未获答案 -> "
+                           f"{(q.get('title') or '')[:50]}")
+            return None
+        return ans
+
+    def _submit_homework_once(self, session, course, work, parsed, questions,
+                              answers, save_only, use_new=True,
+                              work_answer_id=None) -> dict:
+        """单次提交/暂存（供回读校验复用，避免重复内联）。
+
+        🔴 2026-09-26 20:15：新增 `work_answer_id` —— 翻页场景下必须把最新
+        的作答记录 ID 透传给 `submit_dohw`，否则正式交卷会带着旧 ID 提交，
+        平台可能认成"另一份记录"→ 答案对不上。
+        """
+        if use_new:
+            return submit_dohw(session, course, parsed, questions,
+                               answers, save_only=save_only,
+                               work_answer_id=work_answer_id)
+        return submit_work(session, course, work, parsed, questions,
+                           answers, save_only=save_only)
 
     def study_work_homework(self, course: dict, work: dict,
                             job_info: dict = None) -> StudyResult:
@@ -2447,9 +3171,105 @@ class Chaoxing:
         self.rate_limiter.limit_rate()
         work_name = work.get("name") or work.get("workid")
 
-        # 1. 抓题
+        # 0. 新通道（2026-09-26 新增）：列表页给的是 taskrefId，
+        #    需先取详情页拿 workId/workAnswerId/enc，必要时先「重做」重置作答。
+        detail = None
+        if work.get("taskrefid") and not work.get("_legacy"):
+            try:
+                detail = fetch_work_detail(_session, course, work)
+                logger.info(
+                    f"作业《{work_name}》详情：workId={detail.get('workid')} "
+                    f"得分={detail.get('score') or '未作答'} "
+                    f"可重做={detail.get('redotimes')} 次")
+            except (PauseInterrupt, RiskControlError):
+                raise
+            except HomeworkUnavailable as e:
+                logger.info(f"作业《{work_name}》当前不可做：{e}")
+                return StudyResult.SUCCESS
+            except HomeworkNeedsAttention:
+                raise
+            except Exception as e:
+                logger.error(f"作业《{work_name}》详情页获取失败：{e}")
+                return StudyResult.ERROR
+
+            # 已完成/已批阅的作业：只有用户明确勾了"重做"才动，否则跳过
+            if work.get("redo"):
+                self.rate_limiter.limit_rate()
+                try:
+                    rr = redo_work(_session, course, detail)
+                except (PauseInterrupt, RiskControlError):
+                    raise
+                except Exception as e:
+                    logger.error(f"作业《{work_name}》重做请求失败：{e}")
+                    return StudyResult.ERROR
+                if not rr.get("status"):
+                    raise HomeworkNeedsAttention(
+                        f"作业《{work_name}》重做被拒：{rr.get('msg')}")
+                logger.info(f"作业《{work_name}》已重置作答，开始重做")
+            elif (work.get("status") or "") in _WORK_STATUS_DONE:
+                logger.info(f"作业《{work_name}》已完成且未勾选重做，跳过")
+                return StudyResult.SUCCESS
+
+        # 1. 抓题（新通道优先，旧通道兜底）
+        #
+        # 🔴🔴🔴 2026-09-26 20:15 **架构级修正：逐题翻页**
+        #
+        # 真机定论：doHomeWork 答题页**一题一页**，form 里只有 1 个
+        # questionId / 1 个 index。旧代码 `fetch_work_page` 不传 index
+        # → 永远第 0 题 → 「50 题作业只做了 1 题」→ 只拿 2 分。
+        #
+        # 翻页必须**边翻边答边暂存**（真机 getTheNextQuestion 协议）：
+        #     GET ...&index=i → 答题 → POST tempSave=true → 拿新 answerId → i+1
+        # 所以这里把"抓题"和"作答"合并成一个流程。
+        _paging = None
+        if detail is not None:
+            _t_paging = time.time()
+            try:
+                _paging = iter_dohw_questions(
+                    _session, course, detail,
+                    answer_fn=lambda q: self._answer_one_question(q),
+                    cpi=detail.get("cpi") or course.get("cpi", ""),
+                    save_each=True,
+                )
+            except HomeworkUnavailable as e:
+                logger.info(f"作业《{work_name}》当前不可做：{e}")
+                return StudyResult.SUCCESS
+            except (PauseInterrupt, RiskControlError):
+                raise
+            except HomeworkNeedsAttention:
+                raise
+            except Exception as e:
+                logger.error(f"作业《{work_name}》翻页抓题失败：{e}")
+                return StudyResult.ERROR
+            logger.info(f"作业《{work_name}》翻页抓题完成，"
+                        f"耗时 {time.time() - _t_paging:.1f}s，"
+                        f"共 {len(_paging.get('questions') or [])} 题")
+
         try:
-            parsed = fetch_work(_session, course, work, job_info or {})
+            if _paging is not None:
+                # 翻页结果已经是完整题目列表，直接用
+                parsed = {
+                    "title": work_name,
+                    "questions": _paging["questions"],
+                    "form": {},
+                    "total": _paging["total"],
+                    "answer_id": _paging["answer_id"],
+                    "error": None,
+                }
+                # 用第一题的原始页补回公共表单字段（提交时需要）
+                if _paging["questions"]:
+                    try:
+                        # 🔴 不传 work_answer_id：传了会进"续答模式"→ index 失义
+                        _p0 = fetch_work_page(
+                            _session, course, detail, cpi=detail.get("cpi", ""),
+                            index=0)
+                        parsed["form"] = _p0.get("form") or {}
+                        parsed["index"] = _p0.get("index", 0)
+                        parsed["total"] = _p0.get("total") or _paging["total"]
+                    except Exception as e:
+                        logger.warning(f"补公共表单字段失败（不致命）：{e}")
+            else:
+                parsed = fetch_work(_session, course, work, job_info or {})
         except HomeworkUnavailable as e:
             logger.info(f"作业《{work_name}》当前不可做：{e}")
             return StudyResult.SUCCESS
@@ -2475,42 +3295,205 @@ class Chaoxing:
         # 2. 搜答案（复用题库，含学习库/缓存/AI 全链路）
         answers: dict = {}
         usable = 0
-        for q in questions:
-            qid = q["id"]
-            # 常规题型走题库；判断题/填空/简答的答案形态校验已在 answer_check 覆盖
+        # 🔴 2026-09-26：「蒙的答案」与「真答案」必须分开计数。
+        # 原先 `ans = random_answer(...)` 之后就统一 `usable += 1`，
+        # 于是随机蒙出来的答案也算作"已解出" → 覆盖率永远显示 100%
+        # → 覆盖率闸门（COVER_RATE）形同虚设，用户看到"覆盖率 100%"
+        # 以为全做对了，实际上一份作业里可能有题是瞎填的。
+        # 线上实例（2026-09-26 18:19，R语言医学数据分析）：
+        #   填空题无答案 → 随机选"无"（空串）→ 覆盖率仍报 100% → 提交出去
+        guessed = []
+        # 🔴🔴 2026-09-26 用户质疑后新增：**"到底有没有真做题"的硬检查**。
+        #
+        # 用户原话：「我不是质疑你到底有没有真的去做这个题，
+        #            你得真正的去做这个题才行啊」
+        #
+        # 判据：真实做题**必须**经过题库查询/AI 请求，这是**网络耗时**，
+        # 不可能瞬间完成。实测（2026-09-26 18:58，真实题目）：
+        #     填空题（题库未命中→真实调 AI）：1.78 秒
+        #     判断题（题库未命中→真实调 AI）：2.35 秒
+        # 而 18:19 出事那次，从"未能获取答案"到"提交成功"只用了 **66 毫秒**
+        # —— 这个速度物理上不可能完成任何网络请求，等于**空手交卷**。
+        #
+        # 所以：答一题耗时 < 0.05 秒，且该题被判定"无答案"→ 视为异常，
+        # 记入 no_work_evidence，由下面的闸门拦住，绝不再允许"秒交"。
+        ANSWER_MIN_SECONDS = 0.05
+        no_work_evidence = []      # "看起来根本没做题"的证据
+        t_work_start = time.time()
+
+        # 🔴 2026-09-26 20:15：若已走翻页流程，答案**已经在翻页时逐题查过并暂存**
+        #    （见 iter_dohw_questions 的 answer_fn），这里直接复用，绝不重复查询
+        #    —— 重复查询不但浪费 token，还可能因缓存不一致导致"查两次答案不同"。
+        if _paging is not None and _paging.get("answers"):
+            for q in questions:
+                qid = q["id"]
+                ans = _paging["answers"].get(qid)
+                answers[qid] = ans
+                if ans is not None and str(ans).strip():
+                    usable += 1
+                else:
+                    guessed.append((qid, q.get("type"), str(ans)[:40]))
+            total_cost = time.time() - t_work_start
+            logger.info(f"作业《{work_name}》答案复用翻页结果（{len(answers)} 题）")
+        else:
+            for q in questions:
+                qid = q["id"]
+                t_q0 = time.time()
+                # 常规题型走题库；判断题/填空/简答的答案形态校验已在 answer_check 覆盖
+                try:
+                    ans = self.tiku.query(dict(q))
+                except (PauseInterrupt, RiskControlError):
+                    raise
+                except Exception as e:
+                    logger.warning(f"题目 {qid} 查询失败：{e}")
+                    ans = None
+                q_cost = time.time() - t_q0
+                if ans is None or not str(ans).strip():
+                    logger.warning(f"题目 {qid} 未能获取答案 -> {q['title'][:50]}")
+                    # 🔴 随机前最后挣扎：让 AI 换个模型再答一次（2026-09-29）。
+                    # 用户要求"随机只能是最下下下策"——这里给它一次机会。
+                    _rescue = _ai_last_resort(self.tiku, dict(q))
+                    if _rescue:
+                        ans = _rescue
+                    else:
+                        ans = random_answer(q.get("options", ""), q.get("type"))
+                        guessed.append((qid, q.get("type"), str(ans)[:40]))
+                    if q_cost < ANSWER_MIN_SECONDS:
+                        no_work_evidence.append(
+                            f"[{q.get('type')}] id={qid} 查询仅耗时 {q_cost*1000:.0f}ms 就"
+                            f"判定无答案（真实查题库/AI 至少要数百毫秒）")
+                answers[qid] = ans
+                if str(ans).strip():
+                    usable += 1
+
+            total_cost = time.time() - t_work_start
+            logger.info(f"作业《{work_name}》作答阶段总耗时 {total_cost:.2f}s，"
+                        f"平均每题 {total_cost / total:.2f}s")
+
+        cover_rate = usable / total if total else 0
+        real_rate = (total - len(guessed)) / total if total else 0
+        # 🔴🔴 2026-09-26 修（第二个漏洞）：
+        # 原先只打印 cover_rate（含"蒙的答案"），闸门也用它 —— 而 random_answer
+        # 对填空题返回的是字符串「无」、对判断题返回 "false"，**都是非空**，
+        # 于是 usable 把它们全算进去 → cover_rate 永远 100% → 闸门形同虚设。
+        # 线上铁证（2026-09-26 18:19:41.800）：
+        #   题目 215292472 未能获取答案
+        #   随机选择（completion 占位）-> 无
+        #   答案覆盖率 100%              ← 一道题都没答对却报 100%
+        #   提交成功 -> success！        ← 66 毫秒后空答案交出去
+        # ⇒ 日志与闸门一律改用 **real_rate（真实答案率）**，
+        #   cover_rate 只作为"答案字段非空率"参考值附注。
+        logger.info(f"作业《{work_name}》真实答案率 {real_rate * 100:.0f}%"
+                    f"（{total - len(guessed)}/{total} 题有可靠答案；"
+                    f"另有 {len(guessed)} 题是占位值，不计入）")
+        logger.info(f"  （参考）答案字段非空率 {cover_rate * 100:.0f}% "
+                    f"—— 这个数字**不代表答对**，请以上面的真实答案率为准")
+        if guessed:
+            logger.warning(f"  以下 {len(guessed)} 道题没有可靠答案（已用占位值填充）：")
+            for qid, qtype, val in guessed[:10]:
+                logger.warning(f"    - [{qtype}] id={qid} -> {val or '(空)'}")
+
+        # 🔴🔴 2026-09-26 用户明确要求（原话）：
+        #   「我只是说凭程序反馈回来的正确率这些，测试这些，然后提交时需要
+        #     测它的完成率这些，都是要从平台那边获得正确的反馈。
+        #     比如已经把答案写上了才能点提交。」
+        #
+        # ⇒ 要求不是"不提交"，而是：**提交前必须回读平台，确认答案真的落上去了**。
+        #   把"写答案"和"点提交"分成两步，中间加一道平台侧回读校验：
+        #     ① 先 tempSave（暂存）—— 这一步只写不交，不消耗作答次数
+        #     ② 回读答题页 —— 看平台上每题到底存了什么
+        #     ③ 逐题比对：程序认为写了 X，平台读回来是不是 X
+        #        · 全对上 → 才允许提交（这是"完成率"的真实依据）
+        #        · 有对不上 → 拒绝提交，报告"哪几题没写进去"
+        #
+        # 这样"提交"这个动作就有了**平台侧证据**支撑，
+        # 而不是靠程序自己推断"应该写进去了"（R语言两份 0 分就是这么来的）。
+        cover_threshold = getattr(self.tiku, "COVER_RATE", 0.8)
+        use_new = detail is not None
+        # 🔴 2026-09-26 20:15：翻页流程下，平台每暂存一次就换一个新
+        #    workRelationAnswerId，**正式提交必须带最新的那个**
+        #    （真机 submitFormNew 里 answerId = $("#workRelationAnswerId").val()）。
+        _final_answer_id = (_paging or {}).get("answer_id") if _paging else None
+
+        def _do_submit(save_only: bool):
+            return self._submit_homework_once(
+                _session, course, work, parsed, questions,
+                answers, save_only, use_new,
+                work_answer_id=_final_answer_id)
+
+        # ══════════════════════════════════════════════════════════
+        # 🛑 第一道闸：**"根本没做题"的证据**（最快的一道，先拦）
+        #
+        # 用户质疑原话：「我不是质疑你到底有没有真的去做这个题，
+        #                你得真正的去做这个题才行啊」
+        #
+        # 触发条件：有题在 <50ms 内就被判定"无答案"。
+        # 真实查题库要 HTTP 往返、调 AI 要 1~3 秒（实测 1.78s / 2.35s），
+        # 50ms 内出结果 = 根本没发出请求 = 空手交卷。
+        # 线上铁证：18:19 那次从"无答案"到"提交成功"仅 66ms。
+        # ══════════════════════════════════════════════════════════
+        if no_work_evidence:
+            msg = (f"作业《{work_name}》未提交：检测到**疑似未真正作答**"
+                   f"（{len(no_work_evidence)}/{total} 题查询耗时异常短）")
+            logger.error("=" * 66)
+            logger.error(f"🛑 {msg}")
+            for line in no_work_evidence[:10]:
+                logger.error(f"    {line}")
+            logger.error(f"    作答阶段总耗时仅 {total_cost:.2f}s"
+                         f"（真实做题通常每题需 0.5~3 秒）")
+            logger.error("  已保存草稿，未提交 —— 避免又一次空答案 0 分。")
+            logger.error("=" * 66)
             try:
-                ans = self.tiku.query(dict(q))
+                _do_submit(save_only=True)
             except (PauseInterrupt, RiskControlError):
                 raise
             except Exception as e:
-                logger.warning(f"题目 {qid} 查询失败：{e}")
-                ans = None
-            if ans is None or not str(ans).strip():
-                logger.warning(f"题目 {qid} 未能获取答案 -> {q['title'][:50]}")
-                ans = random_answer(q.get("options", ""), q.get("type"))
-            answers[qid] = ans
-            if str(ans).strip():
-                usable += 1
+                logger.warning(f"作业《{work_name}》保存草稿异常：{e}")
+            raise HomeworkNeedsAttention(msg)
 
-        cover_rate = usable / total if total else 0
-        logger.info(f"作业《{work_name}》答案覆盖率 {cover_rate * 100:.0f}%")
+        # ── 提交前的平台侧回读校验 ────────────────────────────────
+        # 只有真拿到"平台确认答案已写入"才允许交卷。
+        # 校验不通过 = 绝不可提交（否则就是第二份 0 分作业）。
+        verify = self._verify_answers_on_platform(
+            _session, course, work, parsed, questions, answers,
+            use_new=use_new, detail=detail)
 
-        # 覆盖率过低时不盲交 —— 像听力题那样整份硬交会直接 0 分。
-        # 处理策略对齐章节测验：先"保存"草稿（tempsave 不消耗作答次数），
-        # 把已解出的答案留住，再暂停汇报，让用户看到哪些题没答上、可手动补。
-        cover_threshold = getattr(self.tiku, "COVER_RATE", 0.8)
-        if (not self.tiku.SUBMIT) and cover_rate < cover_threshold:
-            msg = (f"作业《{work_name}》答案覆盖率仅 {cover_rate * 100:.0f}%"
-                   f"（阈值 {cover_threshold * 100:.0f}%），已保存草稿、未提交")
+        if not verify.get("ok"):
+            reason = verify.get("reason") or "未能从平台确认答案已写入"
+            msg = f"作业《{work_name}》未提交：{reason}"
+            logger.warning("=" * 66)
+            logger.warning(f"⚠ {msg}")
+            for line in (verify.get("detail") or [])[:20]:
+                logger.warning(f"    {line}")
+            logger.warning("  已把能确认的答案保存为草稿，请到学习通核对后自行交卷。")
+            logger.warning("=" * 66)
+            try:
+                _do_submit(save_only=True)
+            except (PauseInterrupt, RiskControlError):
+                raise
+            except Exception as e:
+                logger.warning(f"作业《{work_name}》保存草稿异常：{e}")
+            raise HomeworkNeedsAttention(msg)
+
+        n_ok = verify.get("confirmed", 0)
+        logger.info(f"作业《{work_name}》平台回读校验通过："
+                    f"{n_ok}/{total} 道答案已在平台上确认写入 → 允许提交")
+
+        # 🔴 2026-09-26 修：闸门必须用 **real_rate**（真实答案率）。
+        # 用 cover_rate（含"蒙的占位值"）会让闸门永远失效 —— 见上面 18:19 的
+        # 线上铁证：一道题都没答上来，却报"覆盖率 100%"直接交卷。
+        if (not self.tiku.SUBMIT) and real_rate < cover_threshold:
+            msg = (f"作业《{work_name}》真实答案率仅 {real_rate * 100:.0f}%"
+                   f"（阈值 {cover_threshold * 100:.0f}%，"
+                   f"{len(guessed)} 题无可靠答案），已保存草稿、未提交")
             logger.warning(msg)
             try:
-                save_res = submit_work(_session, course, work, parsed, questions,
-                                       answers, save_only=True)
+                save_res = _do_submit(save_only=True)
                 if save_res.get("status"):
                     logger.info(f"作业《{work_name}》草稿已保存（未提交）")
                 else:
-                        logger.warning(
-                            f"作业《{work_name}》草稿保存被拒：{save_res.get('msg')}")
+                    logger.warning(
+                        f"作业《{work_name}》草稿保存被拒：{save_res.get('msg')}")
             except (PauseInterrupt, RiskControlError):
                 raise
             except Exception as e:
@@ -2519,8 +3502,7 @@ class Chaoxing:
 
         # 3. 提交
         try:
-            res = submit_work(_session, course, work, parsed, questions, answers,
-                              save_only=False)
+            res = _do_submit(save_only=False)
         except (PauseInterrupt, RiskControlError):
             raise
         except Exception as e:
@@ -2539,15 +3521,614 @@ class Chaoxing:
             return StudyResult.ERROR
 
         logger.info(f"作业《{work_name}》提交成功 -> {res.get('msg')}")
+
+        # 4. 回收成绩 → 沉淀进学习库（判对的答案下次直接命中）
+        self._harvest_homework_scores(_session, course, work, parsed, questions)
+
         return StudyResult.SUCCESS
 
-    def process_homeworks(self, course: dict, stop_flag=None) -> dict:
-        """做完一门课程的全部作业。
+    def _harvest_homework_scores(self, session, course, work, parsed, questions):
+        """提交后回收逐题判分，把答对的答案沉淀进学习库（learned_answers）。
+
+        平台提交响应里可能带逐题标记；不一定都带，这里做**尽力而为**：
+        带就沉淀，不带就静默跳过，绝不因回收失败影响主流程。
+        """
+        try:
+            from api.learned import LearnedAnswers
+            learner = LearnedAnswers()
+            correct = 0
+            # 新版页面：提交后重开答题页，页面上的 answer{qid} 保留上次作答，
+            # 配合每题的对错标记即可判断。为避免多打一次请求，这里只在
+            # 响应里明确给出逐题结果时才沉淀。
+            marks = (parsed.get("_marks") or {})
+            for q in questions:
+                qid = q["id"]
+                if qid not in marks:
+                    continue
+                ans, mark = marks[qid]
+                if mark == "dui" and ans:
+                    learner.record(q["title"], str(ans), "dui",
+                                   options=q.get("options"))
+                    correct += 1
+            if correct:
+                logger.info(f"作业《{work.get('name')}》回收 {correct} 道已判对的答案")
+        except Exception as e:
+            logger.debug(f"作业成绩回收跳过（不影响主流程）：{e}")
+
+    def scan_homeworks_all(self, courses: list, include_done: bool = True,
+                           with_redo: bool = True) -> dict:
+        """扫描**所有课程**的作业清单（只读，绝不提交）。
+
+        Args:
+            with_redo: 是否额外逐份拉「重做次数 / 取分规则」。
+                这两项只存在于作业详情页，列表页拿不到，所以要**逐份请求**。
+                只对**已完成**的作业拉（未作答的没有重做一说），
+                并发 6 条，实测 51 份约 8~12 秒。
+
+        Returns:
+            {"courses": [{
+                "courseid", "title",
+                "works": [{"name","status","taskrefid","enc_task","redo","score",
+                           "redotimes","redo_total","redo_used","score_rule"}]
+             }...],
+             "total": n, "todo": n}
+        """
+        out = []
+        total = todo = 0
+
+        # 快路径：stu-work 列表页一次就返回全部课程的作业 → 只请求 1 次。
+        # 慢路径（兜底）：逐课程请求，兼容"全量页拿不到该课程"的情况。
+        #
+        # 🔴 2026-09-26 关键修正：全量页的 courseId（班次 ID）与 get_course_list 的
+        # courseId（模板 ID）**是两套体系，交集为 0**。实测 58 门课 vs 8 个作业
+        # courseId，匹配数 0 —— 这正是用户反复反馈"作业怎么还是没有"的根因。
+        # 可靠桥梁是**课程名**：作业条目自带的 course_full（取自 aria-label 的
+        # 「所属课程XXX」，是完整名）。
+        grouped, id2name = {}, {}
+        try:
+            grouped, id2name = fetch_all_works_detail(SessionManager.get_session())
+        except Exception as e:
+            logger.warning(f"作业全量扫描失败，回退逐课程模式：{e}")
+            grouped, id2name = {}, {}
+
+        # 🔴🔴 2026-09-26 二次修正（推翻上一条结论）：
+        # 实测确认 **作业页的 courseId 与 get_course_list 的 courseId 是同一套**
+        # （R语言 265817798、Python 265817797、离散数学 260672158 … 9/9 全中）。
+        # 之前"交集为 0"的结论是**在 courseId 字段还没被正确解析时测的**，属误判。
+        #
+        # 既然 ID 同源 → **直接用 courseId 匹配（O(1)、零歧义）**。
+        # 课程名只作极端兜底（名字会被平台截断成「R语言医学数...」，
+        # 单靠名字匹配反而会漏课 —— 曾因此丢掉 6 门课的作业）。
+        by_id: Dict[str, list] = {str(k): v for k, v in grouped.items() if k}
+
+        # 课程名索引（兜底用）
+        by_name: Dict[str, list] = {}
+        for gcid, ws in grouped.items():
+            nm = (id2name.get(gcid) or "").strip()
+            if nm:
+                by_name.setdefault(nm, []).extend(ws)
+            else:
+                by_name.setdefault("__unknown__", []).extend(ws)
+
+        def _name_key(t: str) -> str:
+            """课程名归一化：去掉空白与全角/半角差异，便于跨页匹配。"""
+            t = (t or "").strip()
+            t = t.split(" - ")[0].strip() if " - " in t else t
+            return re.sub(r"\s+", "", t)
+
+        name_idx = {_name_key(k): k for k in by_name if k != "__unknown__"}
+
+        # 记录「已被某门课认领」的全量页 courseId → 剩下的就是孤儿作业
+        # （2026-09-26：班级型课程 HHHH 的作业属于此类，见主循环后的补齐段）
+        claimed_cids: set = set()
+
+        def _lookup_works(course: dict):
+            """找课程对应的作业列表。
+
+            优先级：① courseId 精确匹配（主路径，ID 同源必然命中）
+                    ② 课程名精确/前缀匹配（兜底，应对个别课程 ID 不一致）
+            """
+            cid = str(course.get("courseId") or "")
+            if cid and cid in by_id:
+                claimed_cids.add(cid)
+                return by_id[cid]
+            # ---- 兜底：按名字 ----
+            k = _name_key(course.get("title") or "")
+            if not k:
+                return None
+            if k in name_idx:
+                gcid = name_idx[k]
+                claimed_cids.add(gcid)
+                return by_name[gcid]
+            for nk, orig in name_idx.items():
+                if not nk:
+                    continue
+                if k.startswith(nk) or nk.startswith(k):
+                    claimed_cids.add(orig)
+                    return by_name[orig]
+            return None
+
+        def _mk_items(works):
+            items = []
+            for w in works:
+                st = w.get("status") or ""
+                is_todo = st not in _WORK_STATUS_DONE
+                items.append({
+                    "name": w.get("name"),
+                    "status": st or "未完成",
+                    "taskrefid": w.get("taskrefid"),
+                    "workrelationid": w.get("workrelationid"),
+                    "enc_task": w.get("enc_task"),
+                    "courseid": w.get("courseid"),
+                    "clazzid": w.get("clazzid"),
+                    "userid": w.get("userid"),
+                    "cpi": w.get("cpi"),
+                    # 🔴 必须带上 href：详情页只有走这个完整 URL（含 enc_task 签名）
+                    # 才拿得到 redoTimes / 取分规则，手工拼参数会被打回 3991B 壳页。
+                    "href": w.get("href"),
+                    "todo": is_todo,
+                    # 🔴 2026-09-26 语义修正：redo 原来写成 `not is_todo`
+                    # （=已完成的默认勾重做），但实测这会让"已完成"的作业
+                    # 被当成要重做 → 用户看到 6 份已完成全被勾上。
+                    # 现在**重做必须由用户显式勾**，默认一律 False。
+                    "redo": False,
+                    # 下面几项由 with_redo 阶段填充
+                    "redotimes": None,
+                    "redo_total": None,
+                    "redo_used": None,
+                    "score": "",
+                    "score_rule": "",
+                })
+            return items
+
+        for c in courses:
+            cid = str(c.get("courseId") or "")
+            # 全量页拿到过数据 → 该列表就是"有作业的课程"全集，
+            # 匹配不上 = 这门课确实没作业，**不必再逐门请求**（省 28 秒）。
+            # 只有全量页整体失败（grouped 为空）时才逐课程兜底。
+            #
+            # 🔴 2026-09-28：**额外课程**（超星班等）不在 stu-work 全量页里，
+            #    走快路径必然 `_lookup_works` 返回 None → 被 `continue` 静默
+            #    跳过。必须对它们强制走逐课程请求。
+            if grouped and not c.get("extra"):
+                works = _lookup_works(c)
+                if works is None:
+                    continue
+            else:
+                if c.get("extra") and not c.get("cpi"):
+                    # 额外课程只有 courseId+clazzId、没有 cpi，而作业列表接口
+                    # 需要它 → 复用考试链路那套「课程中间页 302 解析」拿 cpi。
+                    try:
+                        from api.exam import fetch_course_tokens
+                        tk = fetch_course_tokens(SessionManager.get_session(), c)
+                        if tk.get("cpi"):
+                            c = {**c, "cpi": tk["cpi"]}
+                            logger.info(f"额外课程《{c.get('title')}》"
+                                        f"解析到 cpi={tk['cpi']}")
+                        else:
+                            logger.warning(f"额外课程《{c.get('title')}》"
+                                           f"未能解析出 cpi，作业列表可能为空")
+                    except Exception as e:
+                        logger.warning(f"额外课程 cpi 解析失败：{e}")
+                try:
+                    works = self.list_homeworks(c, include_all=include_done)
+                except (PauseInterrupt, RiskControlError):
+                    raise
+                except Exception as e:
+                    logger.warning(f"课程《{c.get('title')}》作业扫描失败：{e}")
+                    works = []
+            items = _mk_items(works)
+            for it in items:
+                total += 1
+                if it["todo"]:
+                    todo += 1
+            if items:
+                # 🔴 2026-09-28 修重复卡片：无论走**快路径还是慢路径**，只要产出了
+                #    条目就算"这门课已认领"。此前 `claimed_cids` 只在 `_lookup_works`
+                #    （快路径）里更新，而**额外课程走慢路径**（`list_homeworks`）
+                #    → 不被记为已认领 → 下面的「孤儿作业补齐」段又补一份同 courseId
+                #    的卡片。实测 acc2 的 241139787（办公软件高级…）出现两次：
+                #      其一（extra）：无 clazzId / 无 cpi
+                #      其二（orphan）：有 clazzId=141547852
+                #    更糟的是 `taskByCourse()` 用 find() 取**第一个**匹配
+                #    → 拿到缺 clazzId 的那份，提交作业时课程信息不全。
+                if cid:
+                    claimed_cids.add(cid)
+                out.append({"courseid": cid,
+                            "title": c.get("title"), "works": items})
+
+        # ---- 补齐「孤儿作业」：全量页有、但没有任何课程认领的作业 ----
+        #
+        # 🔴 2026-09-26 新增：学生号可通过「建班级」得到一类**班级型课程**
+        # （实测 HHHH，courseId=267569467）。它**不在 get_course_list() 里**
+        # （实测 createcourse=0 / teacherEndCourse=0，39 门课全是 roletype=3），
+        # 所以上面按课程遍历的主循环永远碰不到它 → 用户能看到作业消息，
+        # 程序里却「怎么都扫不到」，无法作答。
+        #
+        # 修法：全量页 `stu-work` 本来一次就返回**所有**课程的作业，
+        # 主循环漏掉的（= 未被任何课程认领的 courseId）在这里原样补成
+        # 一个「伪课程卡片」，标题取作业自带的完整课程名（HHHH）。
+        # 这样这类测试课无需任何额外配置即可扫描/勾选/作答。
+        if grouped:
+            # 从作业条目里抽 clazzId / cpi（同课程的所有作业一致，取第一个非空）
+            clazzid2: Dict[str, str] = {}
+            cpi2: Dict[str, str] = {}
+            for _gcid, _ws in grouped.items():
+                for _w in _ws:
+                    if _w.get("clazzid") and _gcid not in clazzid2:
+                        clazzid2[_gcid] = str(_w["clazzid"])
+                    if _w.get("cpi") and _gcid not in cpi2:
+                        cpi2[_gcid] = str(_w["cpi"])
+            for gcid, ws in grouped.items():
+                if not gcid or gcid in claimed_cids:
+                    continue
+                orphan_items = _mk_items(ws)
+                if not orphan_items:
+                    continue
+                title = (id2name.get(gcid) or "").strip() or gcid
+                logger.info(f"发现未归属课程的作业：{title}（{gcid}），"
+                            f"{len(orphan_items)} 份")
+                total += len(orphan_items)
+                todo += sum(1 for it in orphan_items if it["todo"])
+                # 伪课程卡片：补齐 courseId/clazzId/cpi，让下游（详情兜底、
+                # 作答、界面渲染）与原课程卡片行为一致
+                _clz = clazzid2.get(gcid, "")
+                _cpi = cpi2.get(gcid, "")
+                # 🔴 2026-09-28：**自动登记**孤儿课程，免去用户手填
+                #    courseId + clazzId。孤儿作业取自 stu-work 全量页，其
+                #    courseId 与 get_course_list 同源、clazzId 由条目自带，
+                #    两个值都是平台给的（不用猜）。登记后**考试**扫描也能
+                #    覆盖这门课 —— 考试没有全局接口，必须先知道
+                #    courseId+clazzId 才能进课程页（用户问的"为什么不直接
+                #    把课程加到列表"就是这个）。`add()` 自带去重，重复扫描
+                #    不会写重复项。
+                if _clz:
+                    try:
+                        from api import extra_courses
+                        if all(str(_it.get("courseid")) != gcid
+                               for _it in extra_courses.load()):
+                            extra_courses.add(gcid, _clz, title)
+                            logger.info(f"已自动登记额外课程：{title}"
+                                        f"（courseId={gcid} clazzId={_clz}）")
+                    except Exception as e:
+                        logger.warning(f"自动登记额外课程失败：{e}")
+                out.append({"courseId": gcid, "courseid": gcid,
+                            "title": title, "clazzId": _clz, "cpi": _cpi,
+                            "works": orphan_items, "orphan": True})
+
+        # ---- 补「重做次数 / 取分规则」（只读，逐份详情页）----
+        if with_redo and out:
+            cbyid = {str(c.get("courseId") or ""): c for c in courses}
+            # 只查已完成的：没做过的作业谈不重做
+            probe = []
+            for c in out:
+                for it in c["works"]:
+                    if not it["todo"]:
+                        w = {
+                            "taskrefid": it.get("taskrefid"),
+                            "workid": it.get("taskrefid"),
+                            "courseid": it.get("courseid") or c["courseid"],
+                            "clazzid": it.get("clazzid"),
+                            "userid": it.get("userid"),
+                            "cpi": it.get("cpi"),
+                            "enc_task": it.get("enc_task"),
+                            # 🔴 带上 href —— 详情页只有走这个完整 URL 才拿得到
+                            # redoTimes / 取分规则（实测手工拼参数会被打回壳页）
+                            "href": it.get("href"),
+                        }
+                        probe.append(w)
+            if probe:
+                try:
+                    info = fetch_redo_info_batch(
+                        SessionManager.get_session(), cbyid, probe)
+                except Exception as e:
+                    logger.warning(f"重做信息批量拉取失败：{e}")
+                    info = {}
+                for c in out:
+                    for it in c["works"]:
+                        k = str(it.get("taskrefid") or "")
+                        d = info.get(k)
+                        if not d or not d.get("ok"):
+                            continue
+                        it["redotimes"] = d.get("redotimes", 0)
+                        it["redo_total"] = d.get("redo_total", 0)
+                        it["redo_used"] = d.get("redo_used", 0)
+                        it["score"] = d.get("score", "")
+                        it["score_rule"] = d.get("score_rule", "")
+                n_ok = sum(1 for v in info.values() if v.get("ok"))
+                logger.info(f"重做信息：{n_ok}/{len(probe)} 份拉取成功")
+
+        # 🔴 2026-09-28 兜底去重：同一 courseId 只留一份（保留**信息更全**的，
+        #    即带 clazzId 的那份）。上面两条路径理论上已互斥，这里防历史缓存
+        #    与将来回归 —— 重复卡片会让同一份作业被做两遍，且前端
+        #    `taskByCourse()` 用 find() 取第一个匹配，可能拿到缺 clazzId 的那份。
+        if out:
+            _by: dict = {}
+            _order: list = []
+            for _c in out:
+                _k = str(_c.get("courseid") or "") or f"__{id(_c)}"
+                if _k not in _by:
+                    _by[_k] = _c
+                    _order.append(_k)
+                elif not _by[_k].get("clazzId") and _c.get("clazzId"):
+                    _by[_k] = _c
+            if len(_by) != len(out):
+                logger.warning(f"作业扫描去重：{len(out)} → {len(_by)} 门"
+                               f"（同 courseId 重复卡片）")
+            out = [_by[_k] for _k in _order]
+
+        return {"courses": out, "total": total, "todo": todo}
+
+    # ------------------------------------------------------------------
+    # 考试模块（2026-09-26 新增）：独立 exam，与作业/章节测验完全分开
+    # ------------------------------------------------------------------
+    def scan_exams_all(self, courses: list, progress=None) -> dict:
+        """扫描**所有课程**的考试清单（只读，绝不提交）。
+
+        ⚠️ 考试由老师发布后才出现；未发布时平台返回「暂无考试」，
+        此时该课程不会出现在结果里（属正常，不是失败）。
+
+        Returns:
+            {"courses": [{"courseid","title","exams":[{title,status,...}]}],
+             "total": n, "todo": n, "scanned": n, "failed": n}
+        """
+        from api.exam import scan_exams_all as _scan
+        from api import extra_courses
+        _session = SessionManager.get_session()
+
+        # 🔴 2026-09-27：并入「额外课程」（超星班等不在课程列表接口里的课程）。
+        #    这类课程没有 cpi，扫描时由课程中间页 302 的 Location 自动解析。
+        # 🔴 2026-09-28：调用方（`scan_all_tasks` / 作业扫描）现在也会先并一次，
+        #    这里按 courseId 去重，避免同一门课被扫两遍。
+        try:
+            _have = {str(c.get("courseId")) for c in (courses or [])}
+            _extra = [c for c in extra_courses.as_courses()
+                      if str(c.get("courseId")) not in _have]
+        except Exception as e:
+            logger.warning(f"读取额外课程失败（不影响常规扫描）：{e}")
+            _extra = []
+        if _extra:
+            logger.info(f"考试扫描：常规课程 {len(courses or [])} 门"
+                        f" + 额外课程 {len(_extra)} 门")
+        return _scan(_session, list(courses or []) + _extra, progress=progress)
+
+    def scan_all_tasks(self, courses: list, with_exam: bool = True,
+                       exam_progress=None) -> dict:
+        """一次扫完「作业 + 考试」，供选课界面登录后自动调用。
+
+        作业走快路径（stu-work 全量页 1 次请求，约 0.5 秒）；
+        考试必须逐课程拿令牌（约 0.3 秒/门，58 门约 17 秒）。
+
+        Returns:
+            {"courses": [{courseid,title,works:[...],exams:[...]}],
+             "work_total","work_todo","exam_total","exam_todo","exam_failed"}
+        """
+        # 🔴 2026-09-28：并入「额外课程」，让**作业与考试共用同一份课程源**。
+        #    此前只有考试扫描自己并（`scan_exams_all` 内部），作业扫描只认
+        #    传进来的 courses → 登录后自动扫描会出现"某门课考试扫得到、
+        #    作业却扫不到"（用户报："既然能识别出来考试和作业，为什么不把
+        #    那个课程直接加到列表"）。这里统一并一次，两条链路都覆盖。
+        courses = list(courses or [])
+        try:
+            from api import extra_courses
+            _have = {str(c.get("courseId")) for c in courses}
+            _extra = [c for c in extra_courses.as_courses()
+                      if str(c.get("courseId")) not in _have]
+            if _extra:
+                logger.info(f"作业+考试扫描：常规课程 {len(courses)} 门"
+                            f" + 额外课程 {len(_extra)} 门")
+            courses += _extra
+        except Exception as e:
+            logger.warning(f"并入额外课程失败（不影响常规扫描）：{e}")
+
+        works_res = self.scan_homeworks_all(courses, include_done=True)
+        exams_res = {"courses": [], "total": 0, "todo": 0, "failed": 0}
+        if with_exam:
+            try:
+                exams_res = self.scan_exams_all(courses, progress=exam_progress)
+            except (PauseInterrupt, RiskControlError):
+                raise
+            except Exception as e:
+                logger.warning(f"考试扫描失败（不影响作业）：{e}")
+
+        # 合并：以作业结果为主键，考试挂到同 courseid 下
+        merged: dict = {}
+        order: list = []
+        for c in works_res.get("courses") or []:
+            cid = str(c.get("courseid") or "")
+            if cid and cid not in merged:
+                merged[cid] = c
+                order.append(cid)
+            merged.setdefault(cid, c)["exams"] = []
+        for c in exams_res.get("courses") or []:
+            cid = str(c.get("courseid") or "")
+            if not cid:
+                continue
+            if cid not in merged:
+                merged[cid] = {"courseid": cid, "title": c.get("title"),
+                               "works": []}
+                order.append(cid)
+            merged[cid]["exams"] = c.get("exams") or []
+        # 补齐字段，避免前端 undefined
+        for cid in order:
+            merged[cid].setdefault("works", [])
+            merged[cid].setdefault("exams", [])
+
+        return {
+            "courses": [merged[cid] for cid in order],
+            "work_total": works_res.get("total", 0),
+            "work_todo": works_res.get("todo", 0),
+            "exam_total": exams_res.get("total", 0),
+            "exam_todo": exams_res.get("todo", 0),
+            "exam_failed": exams_res.get("failed", 0),
+        }
+
+    # ------------------------------------------------------------------
+    # 考试作答（2026-09-26 新增，手机端协议，链路见 api/exam.py）
+    # ------------------------------------------------------------------
+
+    def _exam_answer_fn(self, q: dict):
+        """考试单题作答回调（复用题库 + AI 兜底链路，与作业同源）。"""
+        try:
+            # 🔴 2026-09-27 修 bug：考试题目的 `type` 是**数字**
+            #    （0 单选 / 1 多选 / 2 填空 / 3 判断 / 4 简答），
+            #    而题库+AI 链路全程按**字符串**（'single'/'multiple'/…）判断。
+            #    结果：`check_answer(answer, 0, tiku)` 落到 else 分支
+            #    → `check_submittable` 返回 False → **AI 给出的答案被一律判为
+            #    "类型不符"丢弃**（真机日志：「AI大模型答题 返回答案类型不符，
+            #    回退到下一个题库」，10 道题里 9 道明明答了却全被扔）。
+            #    这里只做一次映射给查询用，**不改动原始题目 dict**
+            #    （后续 build_answer_form 仍按数字 type 走）。
+            _q = dict(q)
+            if isinstance(_q.get("type"), int):
+                _q["type"] = {0: "single", 1: "multiple", 2: "completion",
+                              3: "judgement", 4: "shortanswer"}.get(
+                                  _q["type"], str(_q["type"]))
+            ans = self.tiku.query(_q)
+        except (PauseInterrupt, RiskControlError):
+            raise
+        except Exception as e:
+            logger.warning(f"[考试] 题目 {q.get('id')} 查询失败：{e}")
+            return None
+        if ans is None or not str(ans).strip():
+            logger.warning(f"[考试] 题目 {q.get('id')} 未获答案 -> "
+                           f"{(q.get('title') or '')[:50]}")
+            return None
+        return ans
+
+    def study_exam_one(self, course: dict, exam: dict, user_id: str = "",
+                       code: str = "", auto_submit: bool = None) -> dict:
+        """跑完一场考试（进考场→逐题作答→交卷）。
+
+        ⚠️ **会真实消耗一次作答机会**，前端须由用户逐场确认后再调用。
+
+        Args:
+            exam: 考试条目，须含 exam_id（或 test_paper_id）+ enc_task
+            auto_submit: True=答完直接交；False=只暂存（审核提交）；
+                         None 时取配置 auto_submit
+        """
+        from api.exam import run_exam, fetch_exam_list_phone
+
+        if auto_submit is None:
+            auto_submit = bool(self.config.get("auto_submit", True))
+        # 🔴 2026-09-27 修根因：**考试提交通道必须带真实 uid**。
+        # `get_exam_signature(uid, ...)` 把 uid 编进风控签名（`enc_val = f"{uid}"`），
+        # `data.userId` 也是它。而整条考试链路此前 user_id 一路是空串 →
+        # 签名按 uid=0 计算 → 平台一律回 `提交失败：无效操作`：
+        # 逐题暂存和交卷**全部被拒**（实测 100% 复现；日志里 50 题"暂存成功"
+        # 只是我们的代码没检查返回体，实际平台全拒了）。
+        # 对齐 CxKitty 的 `uid=self.acc.puid`：这里从 cookie 取（`get_uid()`）。
+        if not user_id:
+            try:
+                user_id = str(self.get_uid() or "")
+                logger.info(f"[考试] 已自动补齐 uid={user_id}")
+            except Exception as _e:
+                logger.warning(f"[考试] 取 uid 失败，提交可能被拒：{_e}")
+        # 🔴 2026-09-27：`Chaoxing` 上根本没有 pause_event 属性（作业链路靠
+        # PauseInterrupt 异常暂停，从不持有该事件），直接取会 AttributeError ——
+        # 这段是 2026-09-26 随考试链路一起写的，但直到今天首次「开考」才被执行。
+        # 用 getattr 兜住：没有该属性时等同"未暂停"。
+        _pe = getattr(self, "pause_event", None)
+        if _pe is not None and _pe.is_set():
+            raise PauseInterrupt()
+
+        # 缺 enc_task 时，现场用手机端列表补
+        if not exam.get("enc_task"):
+            try:
+                lst = fetch_exam_list_phone(SessionManager.get_session(), course, user_id)
+            except Exception as e:
+                logger.warning(f"手机端考试列表拉取失败：{e}")
+                lst = []
+            want = str(exam.get("exam_id") or exam.get("test_paper_id") or "")
+            for it in lst:
+                if str(it.get("exam_id")) == want:
+                    exam = {**exam, **it}
+                    break
+
+        title = exam.get("title") or exam.get("name") or "考试"
+        logger.info(f"▶ 开始考试《{title}》"
+                    f"（{'自动交卷' if auto_submit else '仅暂存'}）")
+        t0 = time.time()
+        try:
+            res = run_exam(SessionManager.get_session(), course, exam,
+                           answer_fn=lambda q: self._exam_answer_fn(q),
+                           user_id=user_id, code=code,
+                           auto_submit=auto_submit)
+        except (PauseInterrupt, RiskControlError):
+            raise
+        except Exception as e:
+            logger.error(f"考试《{title}》异常：{type(e).__name__}: {e}")
+            return {"ok": False, "title": title,
+                    "msg": f"{type(e).__name__}: {e}"}
+        logger.info(f"■ 考试《{title}》结束：{res.get('msg')}"
+                    f"（耗时 {time.time() - t0:.1f}s）")
+        res["title"] = title
+        res["exam_id"] = exam.get("exam_id") or exam.get("test_paper_id") or ""
+        return res
+
+    def process_exams(self, course: dict, stop_flag=None,
+                      exam_list: list = None, user_id: str = "",
+                      code: str = "", auto_submit: bool = None) -> dict:
+        """做完一门课程的全部（或指定的）考试。
+
+        Args:
+            exam_list: 指定要做的考试清单；None 时 = 该课全部可作答考试
+        默认**逐场确认**由前端控制：前端只把用户勾选的传进来。
+        """
+        from api.exam import fetch_exam_list_phone, can_take_exam
+
+        cid = str(course.get("courseId") or "")
+        if exam_list is None:
+            try:
+                lst = fetch_exam_list_phone(SessionManager.get_session(), course, user_id)
+            except Exception as e:
+                logger.warning(f"考试列表拉取失败（{course.get('title')}）：{e}")
+                lst = []
+            # 只挑真正能进考场的（手机端列表 status 字段）
+            todo = []
+            for it in lst:
+                st = it.get("status") or ""
+                if any(w in st for w in ("已完成", "已批阅", "已过期", "已取消")):
+                    continue
+                todo.append(it)
+        else:
+            todo = list(exam_list)
+
+        done = skipped = 0
+        results = []
+        for ex in todo:
+            if stop_flag is not None and getattr(stop_flag, "is_set", None) \
+                    and stop_flag.is_set():
+                break
+            _pe2 = getattr(self, "pause_event", None)
+            if _pe2 is not None and _pe2.is_set():
+                raise PauseInterrupt()
+            r = self.study_exam_one(course, ex, user_id=user_id, code=code,
+                                    auto_submit=auto_submit)
+            results.append(r)
+            if r.get("ok"):
+                done += 1
+            else:
+                skipped += 1
+        return {"done": done, "skipped": skipped, "results": results,
+                "courseid": cid}
+
+    def process_homeworks(self, course: dict, stop_flag=None,
+                          work_list: list = None) -> dict:
+        """做完一门课程的全部（或指定的）作业。
+
+        Args:
+            work_list: 指定要做的作业清单（含 taskrefid/redo）。
+                       None 时 = 该课全部待完成的作业。
 
         Returns:
             {"done": n, "skipped": n, "need_attention": [原因...]}
         """
-        todo = self.list_homeworks(course)
+        if work_list is not None:
+            todo = list(work_list)
+            logger.info(f"课程《{course.get('title')}》按指定清单处理 {len(todo)} 份作业")
+        else:
+            todo = self.list_homeworks(course)
         result = {"done": 0, "skipped": 0, "need_attention": []}
         for w in todo:
             if stop_flag is not None and stop_flag():

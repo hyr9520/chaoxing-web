@@ -111,6 +111,38 @@ chaoxing_data/
 
 > 不设置任何环境变量时，行为与上游完全一致（单实例、数据在项目根目录）。
 
+### 🔐 AI 密钥配置（仓库不内置任何密钥）
+
+本仓库是**公开仓库**，源码里**不含任何 AI Key**。程序按以下优先级读取密钥：
+
+1. 环境变量 `CHAOXING_AI_KEYS` —— 内容为同样格式的 JSON 字符串，优先级最高
+2. 项目根目录的 `ai_keys.local.txt` —— JSON 文件，已被 `.gitignore` 忽略
+
+**两者都没有时**：AI 池为空，程序**照常启动**，答题自动走内置题库兜底（`use=local`）。
+
+配置方法：复制模板并填入自己的 Key。
+
+```bash
+cp ai_keys.local.txt.example ai_keys.local.txt
+```
+
+`ai_keys.local.txt` 的格式：
+
+```json
+{
+  "tencent": ["sk-腾讯TokenHubKey1", "sk-腾讯TokenHubKey2"],
+  "agnes": ["sk-agnesKey1"],
+  "siliconflow": {
+    "key": "sk-硅基流动Key",
+    "endpoint": "https://api.siliconflow.cn/v1",
+    "model": "Qwen/Qwen3.5-4B"
+  }
+}
+```
+
+> `tencent` / `agnes` / `siliconflow` 三层都是可选的，缺哪层就自动跳过哪层。
+> ⚠️ 填好的 `ai_keys.local.txt` **不要**提交到任何公开仓库。
+
 ### ⚠️ 并发建议
 
 同一 IP 的请求密度过高会被平台判定异常并**回退进度**。推荐：

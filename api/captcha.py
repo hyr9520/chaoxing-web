@@ -68,7 +68,8 @@ class CxCaptcha:
         'submit': '/html/processVerify.ac'
     }
 
-    def __init__(self, user_agent: str, cookies: str, ocr: Optional[DdddOcr] = _MISSING):
+    def __init__(self, user_agent: str, cookies: str, ocr: Optional[DdddOcr] = _MISSING,
+                 limiter=None):
         """
         初始化 CxCaptcha 实例。
 
@@ -76,6 +77,10 @@ class CxCaptcha:
             user_agent (str): 用户代理字符串。
             cookies (str): 会话 cookies。
             ocr (DdddOcr, optional): 已初始化的 DdddOcr 对象。如果未提供则自动初始化；如果显式传入 None 则禁用 OCR。据DdddOcr官方说明，每次初始化和初始化后的首次识别速度都非常慢，所以推荐传入一个现成的DdddOcr对象实现复用。
+            limiter (RateLimiter, optional): 限流器（2026-09-24 加）。**强烈建议传入**：
+                验证码流程内部会发 3 个 HTTP 请求（getCaptcha + submitCaptcha，
+                加上重试共 9 个），原来这些请求**完全不受限流约束**，
+                实测 4.7 秒内打出 9 个请求 —— 这正是账号被风控的放大器之一。
         """
 
         self.user_agent = user_agent
@@ -87,8 +92,19 @@ class CxCaptcha:
             'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8'
         })
         self.s.verify = False
+        self.limiter = limiter
 
         self.ocr = ocr_init() if ocr is _MISSING else ocr
+
+    def _throttle(self):
+        """验证码流程内的请求限流（2026-09-24）。
+
+        验证码被拦下来说明平台已经在盯这个账号，此刻**更应该放慢**而不是猛打。
+        限流器由调用方注入（与视频上报共用同一个），保证"上报+验证码"整体
+        受同一个速率约束，而不是各自为政。
+        """
+        if self.limiter is not None:
+            self.limiter.limit_rate(random_time=True, random_max=1.5)
 
     def getCaptcha(self) -> Optional[bytes]:
         """
@@ -100,6 +116,7 @@ class CxCaptcha:
         api = self.host + self.api['get']
         random_t = randint(0, 2147483647)
 
+        self._throttle()
         res = self.s.get(api, params={'t': random_t})
         if res.status_code == 200 and res.headers['Content-Type'] == 'image/png':
             return res.content
@@ -122,6 +139,7 @@ class CxCaptcha:
             'ucode': cap_token,
             'app': 0
         }
+        self._throttle()
         res = self.s.get(api, params=params)
         if res.status_code == 302:
             return True

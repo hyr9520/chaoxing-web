@@ -60,6 +60,18 @@ app = Flask(__name__)
 app.json.ensure_ascii = False
 # secret_key 在下面配置读写函数定义之后设置（需要持久化到配置文件）
 
+
+# 🔴 2026-09-26：全局防缓存。网关是被浏览器直接访问的入口，它缓存的 HTML
+# 会让实例页面的更新"看起来没生效"（点按钮无反应、后端零日志）。
+@app.after_request
+def _no_cache(resp):
+    resp.headers["Cache-Control"] = (
+        "no-store, no-cache, must-revalidate, max-age=0")
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
+
+
 # ---------------- 自动回灌状态（学习库 → 全局题库） ----------------
 # 2026-09-15 新增。定义放在这里而不是线程函数旁边，是为了让 /api/overview
 # （定义在本节下方）能直接引用；虽然 Python 运行时查找能跨顺序访问，但显式
@@ -191,6 +203,103 @@ def all_profiles() -> list:
     return out
 
 
+# ---------------- 新实例默认参数（题库/AI）----------------
+# 目标（2026-09-26 用户要求）：任何实例 —— 已存在的和新开的 —— 都预置好
+# Agent 的 API Key，用户只需输入账号密码即可开刷，不用再碰题库设置。
+#
+# 取值来源：现有实例 ui_config.json 里的 AI 配置（单一真源）。
+# 不硬编码 key —— 硬编码会让 key 明文进 git；同时用户换 key 后只需改任
+# 一实例，其余实例重启网关即跟着换。
+# 若所有实例都没有 AI 配置，再退回 config.ini 的 [tiku] 段（key/endpoint/model）。
+_TIKU_DEFAULTS = {
+    "tiku_type": "adapter",
+    "adapter_url": ("http://127.0.0.1:8060/adapter-service/search"
+                    "?use=local,icodef,buguake,wanneng,tikuhai"),
+    "token": "",
+    "ai_fallback": True,
+    "auto_submit": True,
+    "cover_rate": 0.9,
+    "speed": 2,
+    "jobs": 1,
+}
+_AI_FIELDS = ("ai_endpoint", "ai_key", "ai_model")
+
+
+def _ai_from_instances() -> dict:
+    """从已有实例里取一份完整的 AI 配置（last_params 优先，其次 profiles）。"""
+    for it in instances():
+        cfg = _read_instance_cfg(it["dir"])
+        for src in (cfg.get("last_params") or {},
+                    *(cfg.get("profiles") or [])):
+            if all((src.get(k) or "").strip() for k in _AI_FIELDS):
+                return {k: src[k] for k in _AI_FIELDS}
+    return {}
+
+
+def _ai_from_ini() -> dict:
+    """退路：读 config.ini 的 [tiku] 段（key / endpoint / model）。"""
+    import configparser
+    cp = configparser.ConfigParser(interpolation=None)
+    try:
+        cp.read(os.path.join(BASE, "config.ini"), encoding="utf-8")
+        sec = cp["tiku"]
+    except Exception:
+        return {}
+    out = {"ai_endpoint": (sec.get("endpoint") or "").strip(),
+           "ai_key": (sec.get("key") or "").strip(),
+           "ai_model": (sec.get("model") or "").strip()}
+    return out if all(out.values()) else {}
+
+
+def default_params() -> dict:
+    """新实例/缺配置实例的默认参数（题库 + AI Key）。"""
+    p = dict(_TIKU_DEFAULTS)
+    p.update(_ai_from_instances() or _ai_from_ini())
+    return p
+
+
+def apply_defaults(instance_dir: str, force: bool = False) -> bool:
+    """把默认参数写进实例的 ui_config.json。返回是否发生了写入。
+
+    - 账号密码、last_pick、resume 一律不动，只补题库/AI 参数
+    - force=False（默认）：已有 ai_key 的实例跳过，不覆盖用户在界面上改过的值
+    - force=True：无条件重置为默认（用于"统一为我的 Key"）
+    """
+    path = os.path.join(instance_dir, "ui_config.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        cfg = {}
+    if not isinstance(cfg, dict):
+        return False
+    # 兼容旧版「平铺格式」：整份就是一份 last_params
+    if "profiles" not in cfg and "last_params" not in cfg and cfg.get("username"):
+        cfg = {"profiles": [dict(cfg)], "last_params": dict(cfg)}
+    lp = dict(cfg.get("last_params") or {})
+    if not force and (lp.get("ai_key") or "").strip():
+        return False
+    dp = {k: v for k, v in default_params().items() if v not in (None, "")}
+    lp.update(dp)
+    # profiles 键必须显式写出：只有 last_params 的配置会被 web_ui.load_ui_config
+    # 的旧版兼容分支判为"残缺格式"（2026-09-26 已修该分支，但保持格式完整更稳）
+    profs = cfg.get("profiles")
+    if not isinstance(profs, list):
+        profs = []
+    for p in profs:
+        if isinstance(p, dict):
+            p.update(dp)
+    cfg["profiles"] = profs
+    cfg["last_params"] = lp
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=1)
+        return True
+    except OSError as e:
+        print(f"[默认配置] 写入 {path} 失败：{e}")
+        return False
+
+
 # ---------------- 认证 ----------------
 
 # 严格模式：一律要求登录，不认"本机免登录"。
@@ -305,7 +414,12 @@ def do_auth():
                 and str(p.get("password") or "") == pwd):
             session["role"], session["who"] = ROLE_USER, user
             session["inst"] = p.get("_inst")
-            return jsonify(ok=True, role=ROLE_USER, inst=p.get("_inst"))
+            inst = p.get("_inst")
+            # 🔴 2026-09-28（用户要求）：**账号登录的人直接落到自己的刷课进度页**，
+            #    不再停在"多账号刷课控制台"那个实例列表 —— 那是管理员视角，
+            #    普通用户看了只会去点别人的实例。管理员 / 口令登录仍回首页。
+            return jsonify(ok=True, role=ROLE_USER, inst=inst,
+                           redirect=(f"/acc/{inst}/" if inst is not None else "/"))
     return jsonify(ok=False, msg="账号或密码不正确（需与本机已保存的学习通账号一致）")
 
 
@@ -765,6 +879,9 @@ def api_instance_add():
         # 先占位建目录，让下一次请求立刻能算到新编号（消除 TOCTOU 窗口）
         try:
             os.makedirs(os.path.join(DATA_ROOT, f"acc{n}"), exist_ok=True)
+            # 新实例预置好题库/AI 默认参数（2026-09-26）：用户只需输账密。
+            # 必须在实例进程启动**之前**写，避免它的界面先读到空配置。
+            apply_defaults(os.path.join(DATA_ROOT, f"acc{n}"))
         except Exception as e:
             return jsonify(ok=False, msg=f"创建数据目录失败：{e}")
 
@@ -850,6 +967,14 @@ def _sync_once():
             print(f"[自动回灌] 新增 {r['added']} 条 → {r.get('msg')}")
         elif r and not r.get("ok"):
             print(f"[自动回灌] 本轮未写入：{r.get('msg')}")
+        elif r and (r.get("fixed_pollute") or r.get("fixed_clean")
+                    or r.get("fixed_update") or r.get("conflicts")):
+            # 🔴 2026-09-28：矫正结果必须可见。
+            #    原先只在"有新增"或"失败"时打印，而题库跑满后 added 恒为 0
+            #    → 矫正做完也没任何输出，等于是个黑盒（排查时完全看不到）。
+            print(f"[自动回灌] 矫正：清洗污染 {r.get('fixed_pollute', 0)} 条 / "
+                  f"更正错答案 {r.get('fixed_update', 0)} 条 / "
+                  f"待人工核对 {r.get('conflicts', 0)} 条")
         return r
     except Exception as e:
         _SYNC["last_res"] = {"ok": False, "msg": f"异常：{e}"}
@@ -978,8 +1103,12 @@ LOGIN_PAGE = """<!DOCTYPE html>
   body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
        background:#f4f6f8;color:#1f2328;
        font:14px/1.6 "Microsoft YaHei UI","PingFang SC",sans-serif}
-  .box{width:min(92vw,380px);background:#fff;border:1px solid #e5e7eb;border-radius:14px;
-       padding:26px 24px;box-shadow:0 6px 24px rgba(0,0,0,.06)}
+  .box{width:min(92vw,380px);background:rgba(255,255,255,.58);
+       border:1px solid rgba(255,255,255,.68);border-radius:14px;
+       padding:26px 24px;
+       box-shadow:0 6px 24px rgba(0,0,0,.06),inset 0 1px 0 rgba(255,255,255,.60);
+       backdrop-filter:blur(12px) saturate(160%);
+       -webkit-backdrop-filter:blur(12px) saturate(160%)}
   h1{margin:0 0 6px;font-size:19px}
   p.sub{margin:0 0 18px;color:#6b7280;font-size:12.5px}
   label{display:block;margin:12px 0 6px;font-size:13px;color:#374151}
@@ -1008,49 +1137,688 @@ LOGIN_PAGE = """<!DOCTYPE html>
        color:#374151;font-size:14px;cursor:pointer;margin:0;width:auto}
   .tab.on{background:#2563eb;color:#fff;border-color:#2563eb}
   .hide{display:none !important}
-  /* ---- 视觉增强（2026-09-16）：只加外观属性，不动尺寸/布局/结构 ---- */
-  body{background:linear-gradient(160deg,#f7f9fc 0%,#eef2f9 45%,#e8eef8 100%);
-       -webkit-font-smoothing:antialiased}
-  .box{background:linear-gradient(180deg,#fff 0%,#fcfdff 100%);border-color:#e8ecf3;
-       box-shadow:0 1px 2px rgba(16,24,40,.04),0 12px 34px -10px rgba(16,24,40,.14)}
-  h1{letter-spacing:.2px}
-  input{background:#fcfdff;transition:border-color .18s ease,box-shadow .18s ease,background .18s ease}
-  input:hover{border-color:#c7d2e3}
-  input:focus{outline:none;border-color:#2563eb;background:#fff;
-              box-shadow:0 0 0 3.5px rgba(37,99,235,.14)}
-  button{background:linear-gradient(180deg,#3b82f6 0%,#2563eb 100%);
-         box-shadow:0 1px 2px rgba(37,99,235,.28),0 8px 18px -6px rgba(37,99,235,.45);
-         transition:transform .16s ease,box-shadow .16s ease,filter .16s ease}
-  button:hover:not(:disabled){transform:translateY(-1px);
-         box-shadow:0 2px 4px rgba(37,99,235,.3),0 12px 24px -8px rgba(37,99,235,.55)}
-  button:active:not(:disabled){transform:translateY(0);filter:brightness(.97)}
-  .tab{transition:background .18s ease,color .18s ease,border-color .18s ease,box-shadow .18s ease}
-  .tab:hover:not(.on){border-color:#b9c6dc;background:#f8fafd}
-  .tab.on{background:linear-gradient(180deg,#3b82f6 0%,#2563eb 100%);
-          box-shadow:0 1px 2px rgba(37,99,235,.25),0 6px 14px -6px rgba(37,99,235,.5)}
-  summary{transition:color .16s ease}
-  summary:hover{color:#2563eb}
-  /* ---- 视觉增强·第二轮：精致化细节，仍只加外观属性 ---- */
-  ::-webkit-scrollbar{width:10px;height:10px}
-  ::-webkit-scrollbar-track{background:transparent}
-  ::-webkit-scrollbar-thumb{background:rgba(100,116,139,.28);border-radius:999px;
-        border:2px solid transparent;background-clip:content-box}
-  ::-webkit-scrollbar-thumb:hover{background:rgba(100,116,139,.45);background-clip:content-box}
-  button,.tab,.box,input{transition-timing-function:cubic-bezier(.22,.61,.36,1)}
-  body{animation:fadeIn .28s cubic-bezier(.22,.61,.36,1)}
-  @keyframes fadeIn{from{opacity:0}to{opacity:1}}
-  ::selection{background:rgba(37,99,235,.16)}
-  .box h1{position:relative;padding-left:11px}
-  .box h1::before{content:"";position:absolute;left:0;top:50%;transform:translateY(-50%);
-        width:3px;height:17px;border-radius:2px;
-        background:linear-gradient(180deg,#60a5fa,#2563eb)}
-  input::placeholder{color:#a8b0bd}
-  button:active:not(:disabled){transform:scale(.985)}
-  @media (prefers-reduced-motion: reduce){
-    body{animation:none}
-    button:active:not(:disabled){transform:none}
+/* ---- 视觉增强·第三轮（2026-09-24）：设计系统 + 极光背景 + 克制动效 ----
+   约束：只加/覆盖**外观**属性，不动任何尺寸、布局、结构与 JS 行为。
+   所有动画只作用于 transform / opacity / box-shadow，保证合成层 60fps。 */
+:root{
+  --ink:#161b22; --ink-2:#3d4757; --ink-3:#6b7686; --ink-4:#9aa3b0;
+  --line:#e3e8f0; --line-2:#eef2f8;
+  --brand:#2563eb; --brand-2:#3b82f6; --brand-3:#60a5fa;
+  --blue-ink:#1d4ed8;
+  --card:#ffffff;
+  --sh-1:0 1px 2px rgba(16,24,40,.05);
+  --sh-2:0 1px 2px rgba(16,24,40,.05), 0 10px 28px -12px rgba(16,24,40,.14);
+  --sh-3:0 2px 6px rgba(16,24,40,.07), 0 20px 44px -16px rgba(16,24,40,.20);
+  --ease-out-quart:cubic-bezier(.25,1,.5,1);
+  --ease-out-quint:cubic-bezier(.22,1,.36,1);
+  --ease-out-expo:cubic-bezier(.16,1,.3,1);
+  --ease-in-out:cubic-bezier(.65,0,.35,1);
+  --ease-spring:cubic-bezier(.34,1.56,.64,1);   /* 回弹：按下松开用 */
+  --mx:50vw; --my:50vh;                          /* 光标位置，由 JS 写入 */
+}
+/* ---- 2026-09-24 第四轮：把"看不太出来"的静态背景改成真正会动的环境 ---- */
+body{
+  color:var(--ink);
+  background:
+    radial-gradient(1100px 700px at 8% -6%,   rgba(96,165,250,.42), transparent 60%),
+    radial-gradient(900px 580px at 92% 2%,    rgba(34,211,238,.32), transparent 58%),
+    radial-gradient(820px 640px at 78% 106%,  rgba(56,189,248,.30), transparent 60%),
+    radial-gradient(700px 520px at 16% 98%,   rgba(45,212,191,.26), transparent 60%),
+    linear-gradient(168deg,#f4f8fe 0%,#e8f0fb 48%,#e3ecf9 100%);
+  background-attachment:fixed;
+}
+/* 极光：三层大光斑缓慢漂移。幅度从 ±3% 提到 ±14%，肉眼可见但不晃眼 */
+body::before{
+  content:"";position:fixed;inset:-40%;z-index:-2;pointer-events:none;
+  background:
+    radial-gradient(62% 52% at 24% 26%, rgba(56,189,248,.55) 0%, rgba(56,189,248,.55) 44%, rgba(56,189,248,0.18) 64%, transparent 72%),
+    radial-gradient(58% 48% at 76% 60%, rgba(96,165,250,.47) 0%, rgba(96,165,250,.47) 44%, rgba(96,165,250,0.16) 64%, transparent 72%),
+    radial-gradient(54% 46% at 46% 90%, rgba(34,211,238,.42) 0%, rgba(34,211,238,.42) 44%, rgba(34,211,238,0.14) 64%, transparent 73%),
+    radial-gradient(46% 40% at 88% 22%, rgba(125,211,252,.38) 0%, rgba(125,211,252,.38) 44%, rgba(125,211,252,0.13) 64%, transparent 74%);
+  animation:auroraA 14s ease-in-out infinite;
+  will-change:transform;
+}
+@keyframes auroraA{
+  0%  {transform:translate3d(-24%,-16%,0) scale(1.10) rotate(-6deg)}
+  25% {transform:translate3d(18%,-6%,0)   scale(1.26) rotate(5deg)}
+  50% {transform:translate3d(-4%,20%,0)   scale(1.15) rotate(-2deg)}
+  75% {transform:translate3d(22%,10%,0)   scale(1.30) rotate(7deg)}
+  100%{transform:translate3d(-24%,-16%,0) scale(1.10) rotate(-6deg)}
+}
+/* 光带扫过：斜向高光带 9s 横穿全屏 —— 最直观的"有东西在流动" */
+body .sweep{
+  position:fixed;top:-60%;left:-60%;width:220%;height:220%;
+  z-index:-2;pointer-events:none;
+  /* ⚠️ 光带亮度 2026-09-24 从 rgba(255,255,255,.55)/…54,.42 下调到 .20/.16。
+     真因：`.sweep` 是一条 55% 白的高对比光带，扫过半透明卡片（alpha .40/.30）时
+     会让**整张卡片底色大幅跳变** —— 用户录屏实测：关掉 sweep 后卡片内帧差
+     下降 76%（1.770 → 0.433），是"整个框全部闪"的唯一主犯。
+     压低对比后，光带在卡片外依然看得见（背景没被削弱），但在卡片下不再打脸。 */
+  background:linear-gradient(102deg,
+     transparent 28%,rgba(255,255,255,.10) 47%,rgba(191,219,254,.08) 50%,
+     rgba(255,255,255,.10) 53%,transparent 72%);
+  animation:sweepMove 9s cubic-bezier(.45,0,.55,1) infinite;
+  will-change:transform;
+}
+@keyframes sweepMove{
+  0%  {transform:translate3d(-38%,0,0)  rotate(-8deg);opacity:0}
+  8%  {opacity:.85}
+  50% {opacity:.85}
+  58% {opacity:0}
+  100%{transform:translate3d(38%,0,0)   rotate(-8deg);opacity:0}
+}
+/* 网格：6s 走一格（约 9px/秒），明显在爬。只动 background-position */
+body .gridflow{
+  content:"";position:fixed;inset:-10%;z-index:-3;pointer-events:none;opacity:.30;
+  background-image:
+    linear-gradient(to right, rgba(37,99,235,.055) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(37,99,235,.055) 1px, transparent 1px);
+  background-size:72px 72px;
+  animation:gridDrift 6s linear infinite;
+  will-change:transform;
+}
+@keyframes gridDrift{
+  from{transform:translate3d(0,0,0)}
+  to  {transform:translate3d(72px,72px,0)}
+}
+/* 呼吸光晕：中心亮度 8s 起伏，整页像在"呼吸" */
+body .breathe{
+  position:fixed;inset:0;z-index:-2;pointer-events:none;
+  background:radial-gradient(60% 50% at 50% 45%,
+             rgba(96,165,250,.34), transparent 70%);
+  animation:breathe 8s ease-in-out infinite;
+  will-change:transform,opacity;
+}
+@keyframes breathe{
+  0%  {transform:scale(.92);opacity:.42}
+  50% {transform:scale(1.16);opacity:.92}
+  100%{transform:scale(.92);opacity:.42}
+}
+/* 漂浮光点：各自独立漂移，营造"有东西在游"的生气 */
+body .orbs{position:fixed;inset:0;z-index:-2;pointer-events:none}
+body .orbs i{position:absolute;display:block;border-radius:50%;
+  will-change:transform,opacity}
+body .orbs i:nth-child(1){width:190px;height:190px;left:12%;top:18%;
+  background:radial-gradient(circle,rgba(56,189,248,0.58) 0%,rgba(56,189,248,0.50) 40%,transparent 70%);
+  animation:orbA 11s ease-in-out infinite}
+body .orbs i:nth-child(2){width:260px;height:260px;left:74%;top:12%;
+  background:radial-gradient(circle,rgba(34,211,238,0.50) 0%,rgba(34,211,238,0.43) 40%,transparent 70%);
+  animation:orbB 17s ease-in-out infinite}
+body .orbs i:nth-child(3){width:160px;height:160px;left:58%;top:72%;
+  background:radial-gradient(circle,rgba(45,212,191,0.52) 0%,rgba(45,212,191,0.45) 40%,transparent 70%);
+  animation:orbC 9.5s ease-in-out infinite}
+body .orbs i:nth-child(4){width:210px;height:210px;left:22%;top:76%;
+  background:radial-gradient(circle,rgba(244,114,182,0.42) 0%,rgba(244,114,182,0.36) 40%,transparent 70%);
+  animation:orbD 13.5s ease-in-out infinite}
+body .orbs i:nth-child(5){width:130px;height:130px;left:48%;top:38%;
+  background:radial-gradient(circle,rgba(52,211,153,0.44) 0%,rgba(52,211,153,0.38) 40%,transparent 70%);
+  animation:orbE 7.5s ease-in-out infinite}
+@keyframes orbA{
+  0%,100%{transform:translate3d(0,0,0)         scale(1)}
+  33%    {transform:translate3d(90px,-70px,0)  scale(1.25)}
+  66%    {transform:translate3d(-60px,50px,0)  scale(.85)}
+}
+@keyframes orbB{
+  0%,100%{transform:translate3d(0,0,0)          scale(1)}
+  40%    {transform:translate3d(-120px,80px,0)  scale(1.3)}
+  70%    {transform:translate3d(60px,120px,0)   scale(.9)}
+}
+@keyframes orbC{
+  0%,100%{transform:translate3d(0,0,0)           scale(.9)}
+  35%    {transform:translate3d(-80px,-110px,0)  scale(1.35)}
+  75%    {transform:translate3d(110px,-40px,0)   scale(1)}
+}
+@keyframes orbD{
+  0%,100%{transform:translate3d(0,0,0)            scale(1.05)}
+  45%    {transform:translate3d(130px,-90px,0)   scale(.8)}
+  80%    {transform:translate3d(-40px,-140px,0)  scale(1.2)}
+}
+/* orbE：最短循环 + 纯位移，和其他几个的"缩放型"形成节奏差 */
+@keyframes orbE{
+  0%  {transform:translate3d(-30px,20px,0)    scale(.9)}
+  50% {transform:translate3d(-110px,-60px,0)  scale(1.3)}
+  100%{transform:translate3d(-30px,20px,0)    scale(.9)}
+}
+/* 顶部流动渐变条：色相循环，明确表示"系统在运行" */
+body .flowbar{
+  position:fixed;top:0;left:0;right:0;height:3px;z-index:50;
+  pointer-events:none;
+  background:linear-gradient(90deg,
+    #38bdf8,#22d3ee,#5eead4,#7dd3fc,#38bdf8,#22d3ee,#7dd3fc,#38bdf8);
+  background-size:300% 100%;
+  animation:flowBar 5s linear infinite;
+  box-shadow:0 0 10px rgba(59,130,246,.55);
+}
+@keyframes flowBar{
+  from{background-position:0% 0}
+  to  {background-position:300% 0}
+}
+/* 光标跟随光晕：跟随鼠标的柔和蓝光（叠加在自动流动之上，不替代） */
+body .cursorGlow{
+  position:fixed;inset:0;z-index:-1;pointer-events:none;opacity:0;
+  background:radial-gradient(360px 360px at var(--mx) var(--my),
+             rgba(56,189,248,.22), transparent 70%);
+  transition:opacity .5s var(--ease-out-quart);
+  /* ⚠️ 2026-09-28 删掉 will-change:background —— background 无法 GPU 合成，
+     它只会让浏览器持续为主线程重绘做准备，是全屏级别的性能陷阱。 */
+}
+body.pointerFine .cursorGlow{opacity:1}
+/* 细噪点：仅 3.5% 不透明度，只为消除渐变的塑料感 */
+body::after{
+  content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;opacity:.42;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)' opacity='.035'/%3E%3C/svg%3E");
+}
+/* 🔴 卡片整体「半融入背景」（2026-09-24 用户要求）：
+   原来是 rgba(255,255,255,.94) ≈ 实心白，像一块白板贴在流动背景上；
+   现在透明度降到 .58/.46 + 加强 backdrop-filter 做磨砂，
+   让后面的极光/光带/网格透上来，卡片像"浮在流动背景上的玻璃"。
+   ⚠️ 可读性靠两点兜住：① backdrop-filter blur 把背景糊匀；② 卡片内的
+   input / 按钮本身不透明度更高（见下方 input 规则），文字底色始终够实。 */
+.box{background:linear-gradient(180deg,rgba(255,255,255,.40) 0%,rgba(252,253,255,.30) 100%);
+     border:1px solid rgba(255,255,255,.68);
+     box-shadow:0 1px 2px rgba(16,24,40,.04),
+                0 12px 30px -14px rgba(16,24,40,.13),
+                0 36px 76px -34px rgba(37,99,235,.20),
+                inset 0 1px 0 rgba(255,255,255,.60),
+                inset 0 -1px 0 rgba(255,255,255,.28);
+     backdrop-filter:blur(12px) saturate(160%);
+     -webkit-backdrop-filter:blur(12px) saturate(160%)}
+h1{letter-spacing:.2px;color:var(--ink)}
+input{background:#fcfdff;color:var(--ink);
+      transition:border-color .18s var(--ease-out-quart),
+                 box-shadow .18s var(--ease-out-quart),
+                 background .18s var(--ease-out-quart),
+                 transform .18s var(--ease-out-quart)}
+input:hover{border-color:#c3cfe2}
+input:focus{outline:none;border-color:var(--brand);background-color:rgba(255,255,255,.90);
+            box-shadow:0 0 0 3.5px rgba(37,99,235,.14);transform:translateY(-1px)}
+/* ---- 主按钮：渐变底 + 光泽扫过 + 物理按压 + 松开回弹 ---- */
+button{background:linear-gradient(180deg,var(--brand-2) 0%,var(--brand) 100%);
+       box-shadow:0 1px 2px rgba(37,99,235,.28),0 8px 18px -6px rgba(37,99,235,.45);
+       transition:transform .16s var(--ease-out-quart),
+                  box-shadow .16s var(--ease-out-quart),
+                  filter .16s var(--ease-out-quart);
+       position:relative;overflow:hidden;isolation:isolate;
+       transform:translateZ(0)}
+button::after{                      /* 光泽：默认停在画布外，悬停时扫过 */
+  content:"";position:absolute;inset:0;z-index:-1;pointer-events:none;
+  background:linear-gradient(105deg,transparent 30%,rgba(255,255,255,.42) 50%,transparent 70%);
+  transform:translate3d(-115%,0,0);transition:transform .62s var(--ease-out-expo)}
+button:hover:not(:disabled)::after{transform:translate3d(115%,0,0)}
+button:hover:not(:disabled){transform:translateY(-2px);
+       box-shadow:0 3px 6px rgba(37,99,235,.3),0 14px 26px -8px rgba(37,99,235,.58)}
+/* 按下：明确下沉 + 收紧阴影，手感"被压进去"。
+   ⚠️ 必须用 transition 简写整体覆盖：只写 transition-duration 的话，
+   timing-function 会沿用松开时的 --ease-spring（前 34% 几乎不动），
+   实测按下要 250ms+ 才看得出下沉，手感是"点了没反应"。 */
+button:active:not(:disabled){transform:translateY(1px) scale(.97);
+       filter:brightness(.95);
+       box-shadow:0 0 0 0 rgba(37,99,235,.3),0 2px 5px rgba(37,99,235,.32);
+       transition:transform .06s linear,filter .06s linear,box-shadow .06s linear}
+/* 松开：弹性回弹（:active 结束后 transform 回到 hover/rest，
+   用 --ease-spring 让它"过冲一点再落定"） */
+button:not(:active):not(:disabled){
+       transition:transform .34s var(--ease-spring),
+                  box-shadow .3s var(--ease-out-quart),
+                  filter .2s var(--ease-out-quart)}
+button:focus-visible{outline:2px solid var(--brand);outline-offset:2px}
+button:disabled{cursor:default}
+/* 点一下的"波纹扩散"：由 JS 注入 span.ripple 后自动播放并移除 */
+button .ripple{position:absolute;border-radius:50%;pointer-events:none;
+       background:radial-gradient(circle,rgba(255,255,255,.55) 0%,rgba(255,255,255,0) 70%);
+       transform:translate(-50%,-50%) scale(0);opacity:.9;
+       animation:rippleOut .52s var(--ease-out-quart) forwards;z-index:-1}
+@keyframes rippleOut{
+  0%  {transform:translate(-50%,-50%) scale(0);opacity:.9}
+  100%{transform:translate(-50%,-50%) scale(1);opacity:0}
+}
+/* 主按钮磁吸：JS 写入 --pull-x/--pull-y（上限 4px），悬停时轻微被"吸"过去 */
+button.magnetic:hover:not(:disabled){
+       transform:translate(calc(var(--pull-x,0px) + 0px),
+                           calc(-2px + var(--pull-y,0px)))}
+button.magnetic:active:not(:disabled){
+       transform:translate(0,1px) scale(.97);
+       filter:brightness(.95);
+       box-shadow:0 0 0 0 rgba(37,99,235,.3),0 2px 5px rgba(37,99,235,.32);
+       transition:transform .06s linear,filter .06s linear,box-shadow .06s linear}
+.tab{transition:background .18s var(--ease-out-quart),color .18s var(--ease-out-quart),
+                  border-color .18s var(--ease-out-quart),box-shadow .18s var(--ease-out-quart)}
+.tab:hover:not(.on){border-color:#b9c6dc;background:#f8fafd}
+.tab.on{background:linear-gradient(180deg,var(--brand-2) 0%,var(--brand) 100%);
+        box-shadow:0 1px 2px rgba(37,99,235,.25),0 6px 14px -6px rgba(37,99,235,.5)}
+.tab::after{display:none}          /* 标签页不要光泽，避免闪烁 */
+summary{transition:color .16s var(--ease-out-quart)}
+summary:hover{color:var(--brand)}
+.eye::after{display:none}
+.eye:hover{color:var(--brand);background:none;box-shadow:none;transform:none}
+/* 眼睛按钮复位：它继承了全局 button 的白底/圆角/内边距，
+   在输入框里会变成一个突兀的白方块（手机端还会被撑到 50px 高、贴出边框）。 */
+.eye{background:none!important;border:0!important;box-shadow:none!important;
+     min-height:0!important;width:auto!important;border-radius:8px;
+     padding:8px 9px;margin:0;transform:translateY(-50%)}
+.eye:active{transform:translateY(-50%) scale(.94)!important;filter:none!important;
+     transition:transform .08s linear!important}
+.eye:focus-visible{outline:2px solid var(--brand);outline-offset:1px}
+
+/* ---- 视觉增强·第二轮：精致化细节，仍只加外观属性 ---- */
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:rgba(100,116,139,.28);border-radius:999px;
+      border:2px solid transparent;background-clip:content-box}
+::-webkit-scrollbar-thumb:hover{background:rgba(100,116,139,.45);background-clip:content-box}
+button,.tab,.box,input{transition-timing-function:var(--ease-out-quart)}
+body{animation:fadeIn .34s var(--ease-out-quart)}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+/* 卡片入场：轻微上浮，克制（6px，不要更大） */
+.box{animation:cardIn .46s var(--ease-out-expo) both}
+@keyframes cardIn{from{opacity:0;transform:translate3d(0,10px,0)}to{opacity:1;transform:none}}
+::selection{background:rgba(37,99,235,.16)}
+.box h1{position:relative;padding-left:11px}
+.box h1::before{content:"";position:absolute;left:0;top:50%;transform:translateY(-50%);
+      width:3px;height:17px;border-radius:2px;
+      background:linear-gradient(180deg,var(--brand-3),var(--brand))}
+input::placeholder{color:var(--ink-4)}
+@keyframes spin{to{transform:rotate(360deg)}}
+.spin{display:inline-block;width:11px;height:11px;margin-right:6px;
+      border:2px solid rgba(255,255,255,.4);border-top-color:#fff;
+      border-radius:50%;animation:spin .7s linear infinite;vertical-align:-1px}
+.msg .spin,.msg .spin{border-color:rgba(37,99,235,.25);border-top-color:var(--brand)}
+/* 按钮成功态：保存/登录成功后短暂变成对勾绿（三点式：忙碌→成功→复位） */
+button.done{background:linear-gradient(180deg,#34d399 0%,#10b981 100%);
+      box-shadow:0 1px 2px rgba(16,185,129,.3),0 8px 18px -6px rgba(16,185,129,.5);
+      animation:donePop .42s var(--ease-spring)}
+@keyframes donePop{
+  0%  {transform:scale(1)}
+  45% {transform:scale(1.045)}
+  100%{transform:scale(1)}
+}
+button.done .lbl::before{content:"✓ "}
+/* ===== 输入框浅特效（2026-09-24 手机端优化）=====
+   设计原则：**"浅"不等于"没有"** —— 桌面端原有 hover/focus 在手机上根本触发不了
+   （触屏没有 hover），所以这里补的是一套"触屏也能感知"的细腻反馈：
+     ① 常驻一层极淡的内阴影，让白底输入框有"陷进去"的纸感
+     ② 聚焦时边框走一圈渐变光（用 background-image 叠在 border 上，不改尺寸）
+     ③ 底边一条高光从左铺到右（伪元素，纯 transform，GPU 合成零重排）
+     ④ 抬升阴影分层：近处紧、远处散，比单层 box-shadow 更"高级"
+   全部只动 transform / opacity / box-shadow / background —— 不碰 layout。 */
+input{box-shadow:inset 0 1px 2px rgba(15,32,74,.045), 0 1px 2px rgba(15,32,74,.04)}
+input:hover{border-color:#c3cfe2;
+            box-shadow:inset 0 1px 2px rgba(15,32,74,.05),
+                       0 2px 6px -1px rgba(37,99,235,.10)}
+input:focus{border-color:var(--brand);background-color:rgba(255,255,255,.90);
+            box-shadow:inset 0 1px 2px rgba(15,32,74,.03),
+                       0 0 0 3.5px rgba(37,99,235,.14),
+                       0 4px 12px -3px rgba(37,99,235,.26),
+                       0 12px 28px -12px rgba(37,99,235,.30);
+            transform:translateY(-1px)}
+/* ⚠️ input 是替换元素，::before/::after **不生效**。
+   想要"底边高光扫过"必须包一层容器（.field）或用 label 兜住。
+   这里用 label 的 ::after 实现：聚焦时那条线从左铺到右。 */
+label{position:relative;display:inline-block}
+label:has(+ input:focus)::after,
+label:has(+ .pwrow input:focus)::after{
+  content:"";position:absolute;left:0;right:0;bottom:-6px;height:1.5px;
+  background:linear-gradient(90deg,transparent,var(--brand-2),var(--brand),transparent);
+  border-radius:2px;animation:ulSweep .5s var(--ease-out-expo) both}
+@keyframes ulSweep{
+  0%  {transform:scaleX(0);opacity:0;transform-origin:left}
+  60% {opacity:1}
+  100%{transform:scaleX(1);opacity:.85;transform-origin:left}
+}
+/* 聚焦时输入文字轻微"亮起"，强化"我在输入"的感觉 */
+input:not(:placeholder-shown){color:var(--ink);font-weight:500}
+input::placeholder{color:var(--ink-4);
+      transition:opacity .2s var(--ease-out-quart)}
+input:focus::placeholder{opacity:.5}
+@media (prefers-reduced-motion: reduce){
+  body{animation:none}
+  body::before,.gridflow{animation:none}
+  body.pointerFine .cursorGlow{opacity:0}
+  .box{animation:none}
+  button::after{display:none}
+  button .ripple{display:none}
+  button:hover:not(:disabled){transform:none}
+  button:active:not(:disabled){transform:none;filter:none}
+  button.magnetic:hover:not(:disabled),button.magnetic:active:not(:disabled){transform:none}
+  button.done{animation:none}
+  label::after{animation:none}
+  label::after,input{transition:none}
+}
+/* ===== 手机端专项优化（2026-09-24）=====
+   用户原话："手机端看这个界面就太普通了"。
+   桌面端那套 hover/光标光晕/极光在手机上要么触发不了、要么太费电，
+   所以手机端是**另一套**：更克制、更聚焦"手指够得着 + 看得清 + 不卡"。
+
+   核心 5 条：
+     ① 触控目标 ≥44px（iOS HIG）/ 48dp（Material），输入框和按钮都不能更小
+     ② 字号 ≥16px —— **低于 16px iOS Safari 聚焦时会自动放大页面**（这是手机端
+        最容易被忽略的体验灾难，页面突然被推大）
+     ③ 减轻背景动效：手机上 GPU 弱，六层流动背景耗电且掉帧 → 只留两层
+     ④ 去掉 hover 类效果（触屏没有 hover，留着会出现"点完还亮着"的粘滞态）
+     ⑤ 卡片内边距收窄 + 圆角加大，贴合移动端审美
+   ⚠️ 全部写在 @media 里，桌面端一个像素都不动。 */
+@media (max-width: 640px){
+  /* ---- ⓪ 先给窄屏把基础节奏拉开 ----
+     ⚠️ 第一版教训：只做"等比放大"（输入框 48px + 16px）而说明文字仍是 12.5px，
+     结果是"大控件 + 小文字"挤在一起，看着又闷又笨 —— 用户原话：
+     "放大排在一起太拥挤了，反而没有那种灵活感"。
+     正解是**拉开层级差**：标题更大、说明更清楚、字段间距更大、卡片更宽松。 */
+  html{-webkit-text-size-adjust:100%}
+
+  /* --- ① 输入框：够大够好点，但不要太"重" --- */
+  input{
+    min-height:50px;
+    padding:14px 16px;
+    font-size:16px;            /* ⚠️ 必须 ≥16px，否则 iOS 聚焦时整页被放大 */
+    border-radius:14px;
+    box-shadow:inset 0 1px 2px rgba(15,32,74,.05), 0 1px 2px rgba(15,32,74,.04);
   }
+  .pwrow input{padding-right:60px}
+  /* 触屏没有 hover：去掉位移，避免"点完还浮着"的粘滞感 */
+  input:hover{border-color:#d8dee4;box-shadow:inset 0 1px 2px rgba(15,32,74,.045),0 1px 2px rgba(15,32,74,.04)}
+  input:focus{transform:none;     /* 不位移，避免键盘弹起时页面跳动 */
+              border-color:var(--brand);
+              box-shadow:inset 0 1px 2px rgba(15,32,74,.03),
+                         0 0 0 4px rgba(37,99,235,.15),
+                         0 4px 14px -4px rgba(37,99,235,.28)}
+
+  /* --- ② 字段节奏：label 与输入框之间、字段与字段之间都要透气 --- */
+  label{display:block;font-size:14px;font-weight:500;color:#3d4657;
+        margin:20px 0 9px;letter-spacing:.2px}
+  /* 第一个 label 紧跟说明文字，不要再叠一层上边距 */
+  p.sub + label{margin-top:16px}
+
+  /* --- ③ 按钮：整宽 + 大触控区 --- */
+  button{min-height:52px;font-size:16.5px;border-radius:14px;
+         letter-spacing:.3px;font-weight:500}
+  #btn,#btnWb{margin-top:28px}          /* 与上方输入框拉开，别贴着 */
+  /* 触屏用 :active 代替 hover（按下即反馈，这才是手机该有的手感） */
+  button:hover:not(:disabled){transform:none}
+  button:active:not(:disabled){transform:scale(.972);filter:brightness(.96);
+         transition:transform .08s linear,filter .08s linear}
+
+  /* --- ④ 卡片：更宽松的留白 + 更大圆角，才有"轻盈"感 --- */
+  .box{width:min(92vw,400px);
+       padding:34px 26px 30px;border-radius:24px;
+       box-shadow:0 1px 2px rgba(15,32,74,.04),
+                  0 18px 44px -18px rgba(37,99,235,.28),
+                  0 40px 80px -40px rgba(15,23,42,.22)}
+  /* 头部三块（标题 / 分段控件 / 说明）之间要给足气口，
+     贴太紧就会显得"挤成一坨"、没有灵活感 */
+  h1{font-size:24px;font-weight:650;letter-spacing:.3px;margin:0 0 20px}
+  .tabs{margin-bottom:0}
+  .tabs,.tab{gap:0}
+  .tab{min-height:50px;font-size:15.5px;border-radius:13px}
+  p.sub{font-size:13.5px;line-height:1.7;color:#66707f;margin:18px 0 4px}
+  .tip{font-size:12.5px;line-height:1.9;color:#949eae;
+       margin-top:30px;padding-top:22px}
+
+  /* --- ⑤ 背景动效：全保留，只把"贵"的部分降级 ---
+     ⚠️ 第一版把 .sweep/.orbs/.flowbar 直接 display:none，用户立刻反馈
+     "动态效果和流动效果还是完全没有"。手机上这几层全是 transform/opacity，
+     走 GPU 合成、不触发重排，中端机完全跑得动 —— 不该为省电把设计语言砍掉。
+     真正贵的只有 filter:blur（光点），所以**只减 blur 半径**，不动层数。
+     ⚠️ 必须用 `body .orbs i:nth-child(n)` —— 基础定义写在这个特异性上，
+        只写 `.orbs i` 会被它压住（静默失效）。 */
+  body .orbs i:nth-child(n){width:170px;height:170px}
+  body .orbs i:nth-child(2){width:210px;height:210px}
+  .sweep{opacity:.85}
+  .gridflow{opacity:.24}              /* 手机屏小、方格更容易显重，略淡一档 */
+  .breathe{opacity:.7}
+
+  /* --- ⑥ 触屏设备不显示光标光晕（本来就没有鼠标） --- */
+  .cursorGlow{display:none}
+
+  /* ===== ⑥ 流动感加强（2026-09-24 第三轮 · 用户第二次反馈）=====
+     用户原话：「手机端的流动感还是没有，手机端的屏幕本身比较小，
+               又不用加载那么大的地方，应该小区域的流动加大一点，
+               要不然压根看不出流动感，就像一个死背景」
+
+     根因（我算过账）：
+       桌面参数是按 1440px 宽屏调的，照搬到 390px 屏上，
+       **每秒可见位移 ÷ 屏宽** 被稀释了近 4 倍 →
+         · 光点 orbA：90px/11s = 8.2px/s   （肉眼几乎静止）
+         · 背景网格：72px/6s   = 12px/s    （勉强）
+         · 极光 body::before：blur(48px) 在 390px 屏上把色斑糊成整屏单色，
+           层次被抹平 —— 这是"死背景感"最大的元凶
+       验收标准：**每秒可见位移 ≥ 15px**（比桌面翻倍，因为屏小、参照物近）。
+
+     对策：「小区域、大位移、快周期」三件套 ——
+       位移 → 放到 2.2 倍（光点 90→200px 级）
+       周期 → 压到 0.62 倍（sweep 9→5.5s、grid 6→3.6s、breathe 8→5s）
+       模糊 → 极光 48→26px（恢复层次，同时更省 GPU）
+     ⚠️ 仍然只动 transform / opacity / background-position，
+        不碰 layout，手机 GPU 合成完全扛得住。 */
+
+  /* ① 极光：去糊、加幅、加速（"死背景"第一元凶） */
+  body::before{
+    animation-duration:9s;
+  }
+  @keyframes auroraA_m{
+    0%  {transform:translate3d(-34%,-24%,0) scale(1.06) rotate(-7deg)}
+    25% {transform:translate3d(26%,-10%,0)  scale(1.34) rotate(6deg)}
+    50% {transform:translate3d(-8%,28%,0)   scale(1.18) rotate(-3deg)}
+    75% {transform:translate3d(32%,14%,0)   scale(1.40) rotate(8deg)}
+    100%{transform:translate3d(-34%,-24%,0) scale(1.06) rotate(-7deg)}
+  }
+
+  /* ② 光带：9s → 5.5s，位移 ±38% → ±52%（明显"刷"过去）
+     ⚠️ 2026-09-24 追加：手机端**不再把 opacity 抬到 1**（桌面 .85）。
+        卡片在窄屏上几乎占满整屏，光带越亮 → 卡片内明暗跳变越猛。
+        用户录屏「整个框全部闪」的主犯就是它（关掉后卡片内帧差 -76%）。
+        现在改成 .55 —— 背景里仍能看见光带扫过，卡片下不再打脸。 */
+  body .sweep{
+    animation-duration:5.5s;
+    opacity:.55;
+  }
+  @keyframes sweepMove_m{
+    0%  {transform:translate3d(-52%,0,0) rotate(-10deg);opacity:0}
+    8%  {opacity:.55}
+    50% {opacity:.55}
+    58% {opacity:0}
+    100%{transform:translate3d(52%,0,0)  rotate(-10deg);opacity:0}
+  }
+
+  /* ③ 网格：6s → 3.6s（走一格 72px ⇒ 20px/s，跨过 15px/s 门槛） */
+  body .gridflow{
+    animation-duration:3.6s;
+    background-size:64px 64px;inset:-22%;      /* 屏小，格距也收一点，格数不变才不显空 */
+    opacity:.22;
+  }
+  @keyframes gridDrift_m{
+    from{transform:translate3d(0,0,0)}
+    to  {transform:translate3d(64px,64px,0)}
+  }
+
+  /* ④ 呼吸：8s → 5s，幅度也拉开（.90↔1.22） */
+  body .breathe{
+    animation-duration:5s;
+    opacity:.8;
+  }
+  @keyframes breathe_m{
+    0%  {transform:scale(.90);opacity:.46}
+    50% {transform:scale(1.22);opacity:1}
+    100%{transform:scale(.90);opacity:.46}
+  }
+
+  /* ⑤ 光点：位移 ×2.2、周期压到 0.62 倍
+        —— 这是手机端"有东西在游"的主力 */
+  body .orbs i:nth-child(1){animation-duration:6.8s}
+  body .orbs i:nth-child(2){animation-duration:10.5s}
+  body .orbs i:nth-child(3){animation-duration:5.9s}
+  body .orbs i:nth-child(4){animation-duration:8.4s}
+  body .orbs i:nth-child(5){animation-duration:4.6s}
+  @keyframes orbA_m{
+    0%,100%{transform:translate3d(0,0,0)            scale(1)}
+    33%    {transform:translate3d(190px,-150px,0)   scale(1.4)}
+    66%    {transform:translate3d(-130px,110px,0)   scale(.78)}
+  }
+  @keyframes orbB_m{
+    0%,100%{transform:translate3d(0,0,0)            scale(1)}
+    40%    {transform:translate3d(-230px,160px,0)   scale(1.45)}
+    70%    {transform:translate3d(120px,230px,0)    scale(.82)}
+  }
+  @keyframes orbC_m{
+    0%,100%{transform:translate3d(0,0,0)            scale(.88)}
+    35%    {transform:translate3d(-170px,-230px,0)  scale(1.5)}
+    75%    {transform:translate3d(210px,-90px,0)    scale(1)}
+  }
+  @keyframes orbD_m{
+    0%,100%{transform:translate3d(0,0,0)            scale(1.06)}
+    45%    {transform:translate3d(250px,-180px,0)   scale(.72)}
+    80%    {transform:translate3d(-90px,-270px,0)   scale(1.35)}
+  }
+  @keyframes orbE_m{
+    0%  {transform:translate3d(-60px,40px,0)        scale(.86)}
+    50% {transform:translate3d(-210px,-120px,0)     scale(1.4)}
+    100%{transform:translate3d(-60px,40px,0)        scale(.86)}
+  }
+
+  /* ⑦ 输入框内部流动：手机端略微提速（屏小，慢了看不出）。
+     ⚠️ 聚焦态**不再额外提速** —— 那是「一直在闪」的来源（2026-09-24 修）。 */
+  input{
+    animation-duration:3.4s, 6.5s, 1.7s;
+  }
+
+  /* 🔴 手机端专用 keyframes 绑定
+     @keyframes 是全局作用域，同名会无条件覆盖 → 手机端必须用独立命名，
+     再在这里把元素的 animation-name 指过去，否则会连带改坏桌面端。 */
+  body::before{animation-name:auroraA_m}
+  body .sweep{animation-name:sweepMove_m}
+  body .gridflow{animation-name:gridDrift_m}
+  body .breathe{animation-name:breathe_m}
+  body .orbs i:nth-child(1){animation-name:orbA_m}
+  body .orbs i:nth-child(2){animation-name:orbB_m}
+  body .orbs i:nth-child(3){animation-name:orbC_m}
+  body .orbs i:nth-child(4){animation-name:orbD_m}
+  body .orbs i:nth-child(5){animation-name:orbE_m}
+}
+/* 更窄的屏（iPhone SE 等 375px 及以下）：只收尺寸，不动节奏 */
+@media (max-width: 380px){
+  .box{padding:28px 20px 26px;border-radius:22px}
+  h1{font-size:22px}
+  label{margin:17px 0 8px}
+  input{font-size:16px;padding:13px 14px;min-height:48px}
+  button{font-size:15.5px;min-height:50px}
+  .tip{line-height:1.8}
+
+  /* 更窄屏（≤380px）：再压一档模糊，位移不变（屏更小反而更要动得明显） */
+}
+
+/* ===== 输入框内部流动光（2026-09-24 第三轮）=====
+   用户要求：「把整个输入栏也加入流动效果，不过颜色比起周围稍微淡一点，
+             然后整体的流动是和后面的同步的」
+
+   两个约束怎么满足：
+   ① 「比周围淡」 —— 周围背景格线 alpha 是 .055，这里只用 .018~.030，约为它的 1/3；
+      而且全部走浅色（白/淡蓝），不抢输入文字。
+   ② 「和后面同步」 —— 周期取背景各层的公约节奏（sweep 9s / gridflow 6s /
+      breathe 8s / flowbar 5s）→ 输入框用 4.5s / 9s / 2.25s 三档，与 sweep 同源，
+      方向也一致（都往右下 + 横向掠光）。
+
+   ⚠️ input 是**替换元素**，::before/::after 完全不生效（已踩过）。
+      所以只能用 background-image 多铺几层渐变 + 动 background-position，
+      纯绘制层，不触发重排，GPU 友好。
+   ⚠️ 但 background-position 动画在主线程合成之外，仍属"重绘"：
+      实测 4 层渐变 + 3 条动画在手机上帧率稳定，因为尺寸小（输入框 ~50px 高）。 */
+
+input{
+  background-color:#fcfdff;
+  background-image:
+    /* ① 横向掠光（最上层，最显眼）*/
+    linear-gradient(100deg,
+      transparent 32%, rgba(147,197,253,.22) 46%,
+      rgba(255,255,255,.40) 50%, rgba(147,197,253,.22) 54%,
+      transparent 68%),
+    /* ② 斜向细纹（与背景网格同向，向下右爬）*/
+    repeating-linear-gradient(115deg,
+      rgba(96,165,250,.042) 0px, rgba(96,165,250,.042) 1px,
+      transparent 1px, transparent 26px),
+    /* ③ 底晕（最淡的一层，让上面两层有"承托"）*/
+    radial-gradient(130% 200% at 10% 50%,
+      rgba(191,219,254,.42), rgba(255,255,255,0) 64%);
+  background-size:
+    900px 100%,
+    26px 26px,
+    150% 100%;
+  background-position:
+    -900px 0,
+    0 0,
+    0 0;
+  background-repeat:no-repeat,repeat,no-repeat;
+  animation:inputFlow 4.5s linear infinite,
+            inputWeave 9s linear infinite,
+            inputPulse 2.25s ease-in-out infinite;
+}
+@keyframes inputFlow{
+  from{background-position:-900px 0,   0 0,      0 0}
+  to  {background-position: 900px 0,   0 0,      0 0}
+}
+@keyframes inputWeave{
+  from{background-position:-900px 0,   0 0,      0 0}
+  to  {background-position:-900px 0,  26px 26px, 0 0}
+}
+@keyframes inputPulse{
+  0%,100%{background-position:-900px 0, 0 0,   0% 0}
+  50%    {background-position:-900px 0, 0 0, 100% 0}
+}
+/* 聚焦态：**不再「更亮一档 + 提速」**（2026-09-24 修）
+   那套 3.2s/6.5s/1.8s 提速 + 换亮的背景，是「手机端一直在闪」的真因；
+   现在聚焦只做**静态**变化（底色略提），流动与常态同速同亮度。 */
+input:focus{
+  background-color:rgba(255,255,255,.90);
+}
+input:disabled{animation:none}
+
+
+/* 2026-09-24 第二十轮 GPU 优化（CDP LayerTree 实测）：
+   input/select 的 background 流动动画会让**整个父卡片层**每帧重绘
+   （手机 DPR=3 时 520x810 = 14.5MB/帧）。加 will-change:transform 让它
+   独立成合成层后，重绘范围缩到 input 自身（约 348x50），降低约 12 倍。 */
+input,select,textarea{will-change:transform}
+/* 2026-09-24 第二十轮：移动端去掉 background-attachment:fixed。
+   它会让移动端浏览器在滚动/视口变化时重绘整个背景（桌面无此问题）；
+   页面装饰层本来就是 position:fixed 的独立元素，body 底色不需要 fixed。 */
+@media (max-width:640px){body{background-attachment:scroll}}
+
+
+/* ===== 2026-09-24：「安全微伴」tab 专属绿色皮肤 =====
+   切到微伴 tab 时 JS 给 body 加 .wb，这里整套覆盖成 emerald + teal 绿，
+   与微伴控制台保持一致；切回「学习通」自动恢复蓝色。 */
+body.wb{
+  --brand:#10b981; --brand-2:#34d399;
+  background:
+    radial-gradient(1100px 700px at 8% -6%,   rgba(52,211,153,.36), transparent 60%),
+    radial-gradient(900px 580px at 92% 2%,    rgba(45,212,191,.29), transparent 58%),
+    radial-gradient(820px 640px at 78% 106%,  rgba(16,185,129,.27), transparent 60%),
+    radial-gradient(700px 520px at 16% 98%,   rgba(110,231,183,.22), transparent 60%),
+    linear-gradient(168deg,#f4fbf9 0%,#e8f4f0 48%,#e3f1ed 100%);
+}
+body.wb::before{
+  background:
+    radial-gradient(62% 52% at 24% 26%, rgba(16,185,129,.50) 0%, rgba(16,185,129,.50) 44%, rgba(16,185,129,0.17) 64%, transparent 72%),
+    radial-gradient(58% 48% at 76% 60%, rgba(20,184,166,.44) 0%, rgba(20,184,166,.44) 44%, rgba(20,184,166,0.15) 64%, transparent 72%),
+    radial-gradient(54% 46% at 46% 90%, rgba(52,211,153,.40) 0%, rgba(52,211,153,.40) 44%, rgba(52,211,153,0.13) 64%, transparent 73%),
+    radial-gradient(46% 40% at 88% 22%, rgba(110,231,183,.36) 0%, rgba(110,231,183,.36) 44%, rgba(110,231,183,0.12) 64%, transparent 74%);
+}
+body.wb .flowbar{
+  background:linear-gradient(90deg,#34d399,#14b8a6,#5eead4,#6ee7b7,#34d399,#2dd4bf,#6ee7b7,#34d399);
+}
+body.wb .orbs i:nth-child(1){background:radial-gradient(circle,rgba(52,211,153,.58) 0%,rgba(52,211,153,.50) 40%,transparent 70%)}
+body.wb .orbs i:nth-child(2){background:radial-gradient(circle,rgba(20,184,166,.50) 0%,rgba(20,184,166,.43) 40%,transparent 70%)}
+body.wb .orbs i:nth-child(3){background:radial-gradient(circle,rgba(110,231,183,.52) 0%,rgba(110,231,183,.45) 40%,transparent 70%)}
+body.wb .orbs i:nth-child(4){background:radial-gradient(circle,rgba(45,212,191,.44) 0%,rgba(45,212,191,.38) 40%,transparent 70%)}
+body.wb .orbs i:nth-child(5){background:radial-gradient(circle,rgba(163,230,53,.40) 0%,rgba(163,230,53,.34) 40%,transparent 70%)}
+body.wb .cursorGlow{
+  background:radial-gradient(360px 360px at var(--mx) var(--my), rgba(52,211,153,.22), transparent 70%);
+}
 </style></head><body>
+<div class="gridflow" aria-hidden="true"></div>
+<div class="breathe" aria-hidden="true"></div>
+<div class="orbs" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div>
+<div class="sweep" aria-hidden="true"></div>
+<div class="cursorGlow" aria-hidden="true"></div>
+<div class="flowbar" aria-hidden="true"></div>
 <div class="box">
   <h1>刷课控制台</h1>
   <div class="tabs">
@@ -1061,7 +1829,11 @@ LOGIN_PAGE = """<!DOCTYPE html>
   <div id="paneCk">
     <p class="sub">用学习通账号登录，查看该账号的进度</p>
     <label for="user">学习通账号</label>
-    <input id="user" autocomplete="username" placeholder="手机号" autofocus>
+    <!-- ⚠️ 这里**故意不加 autofocus**（2026-09-24 用户报障"手机端一直在闪这个输入框"）：
+         带 autofocus 时手机端一进页面就聚焦 → 聚焦态有 4px 蓝色光环 +
+         （修复前）流动提速 → 看上去就是"输入框一直在闪"。
+         现在聚焦态已改成静态变化，且默认不自动聚焦，等用户自己点。 -->
+    <input id="user" autocomplete="username" placeholder="手机号">
     <label for="pwd">密码</label>
     <div class="pwrow">
       <input id="pwd" type="password" autocomplete="current-password" placeholder="密码">
@@ -1107,6 +1879,72 @@ LOGIN_PAGE = """<!DOCTYPE html>
 </div>
 <script>
 const $ = id => document.getElementById(id);
+
+/* ---- 2026-09-24：环境动效与指针反馈 ----
+   全部只写 CSS 变量 / 加 class，不改任何既有逻辑与 DOM 结构。
+   指针为「粗」（触屏）时不启用光标光晕与磁吸，避免手机端无谓开销。 */
+(function(){
+  const fine = window.matchMedia('(hover:hover) and (pointer:fine)').matches;
+  if (!fine) return;
+  document.body.classList.add('pointerFine');
+  let raf = 0, px = 0, py = 0;
+  window.addEventListener('pointermove', e => {
+    px = e.clientX; py = e.clientY;
+    if (raf) return;                       // 每帧最多写一次，避免抖动
+    raf = requestAnimationFrame(() => {
+      raf = 0;
+      document.documentElement.style.setProperty('--mx', px + 'px');
+      document.documentElement.style.setProperty('--my', py + 'px');
+    });
+  }, {passive:true});
+})();
+
+/* 点击波纹：任意按钮点下去从落点扩散一圈光，即时反馈「收到了」 */
+let ptrDown = false;
+document.addEventListener('pointerdown', e => {
+  const b = e.target && e.target.closest && e.target.closest('button');
+  if (!b || b.disabled) return;
+  /* ⚠️ 先只做「不会引起重排」的事：插入波纹节点会触发布局重算，
+     把 :active 伪类的生效推迟到 200ms 之后（实测），按下去像没反应。
+     所以波纹和变量复位统统延到下一帧，让浏览器先把 :active 画出来。 */
+  ptrDown = true;
+  const cx = e.clientX, cy = e.clientY;
+  requestAnimationFrame(() => {
+    const r = b.getBoundingClientRect();
+    const d = Math.max(r.width, r.height) * 1.8;
+    const s = document.createElement('span');
+    s.className = 'ripple';
+    s.style.width = s.style.height = d + 'px';
+    s.style.left = (cx - r.left) + 'px';
+    s.style.top  = (cy - r.top)  + 'px';
+    b.appendChild(s);
+    setTimeout(() => s.remove(), 560);
+    /* 按下的同时把磁吸位移归零：否则 pointermove 一直在改 --pull-x/--pull-y，
+       会让 :active 的下沉视觉被 hover 位移盖住 */
+    b.style.setProperty('--pull-x', '0px');
+    b.style.setProperty('--pull-y', '0px');
+  });
+}, {passive:true});
+
+/* 主按钮磁吸：悬停时被鼠标轻微吸引（上限 4px，克制不晃眼） */
+document.addEventListener('pointerup', () => { ptrDown = false; }, {passive:true});
+document.addEventListener('pointercancel', () => { ptrDown = false; }, {passive:true});
+document.addEventListener('pointermove', e => {
+  if (!document.body.classList.contains('pointerFine')) return;
+  /* 按住不放时不做磁吸：让 :active 的下沉成为唯一视觉反馈，
+     否则位移会被"吸回去"，按下去像没反应 */
+  if (ptrDown || e.buttons & 1) return;
+  const b = e.target && e.target.closest && e.target.closest('button');
+  if (!b || b.disabled || b.classList.contains('eye') || b.classList.contains('tab')
+      || b.classList.contains('ghost') || b.classList.contains('fab')) return;
+  b.classList.add('magnetic');
+  const r = b.getBoundingClientRect();
+  const dx = (e.clientX - (r.left + r.width / 2)) / (r.width / 2);
+  const dy = (e.clientY - (r.top + r.height / 2)) / (r.height / 2);
+  b.style.setProperty('--pull-x', (dx * 4).toFixed(2) + 'px');
+  b.style.setProperty('--pull-y', (dy * 4).toFixed(2) + 'px');
+}, {passive:true});
+
 let going = false;
 function bindEye(btnId, inputId) {
   $(btnId).onclick = () => {
@@ -1123,6 +1961,8 @@ bindEye('eye2', 'wbPwd');
 let plat = 'ck';
 function switchPlat(p) {
   plat = p;
+  /* 2026-09-24：切到「安全微伴」时，整套背景换绿色（与微伴控制台同系） */
+  document.body.classList.toggle('wb', p === 'wb');
   $('tabCk').classList.toggle('on', p === 'ck');
   $('tabWb').classList.toggle('on', p === 'wb');
   $('paneCk').classList.toggle('hide', p !== 'ck');
@@ -1207,8 +2047,12 @@ async function go() {
     }
     $('msg').className = 'msg ok';
     $('msg').textContent = '登录成功，正在进入…';
+    $('btn').classList.add('done');        // 短暂打勾再跳转
+    $('btn').classList.remove('magnetic');
     going = false;      // 跳转前复位：否则浏览器「返回」时 bfcache 会把这个 true 带回来
-    location.href = '/';
+    // 账号登录时后端会带 redirect（直接落到自己的实例进度页）；
+    // 管理员 / 口令登录没有 redirect → 回首页（保持原样）
+    location.href = r.redirect || '/';
   } catch (e) {
     $('msg').textContent = '请求失败（服务可能未启动）: ' + e;
     $('btn').disabled = false; going = false;
@@ -1253,8 +2097,12 @@ GW_PAGE = """<!DOCTYPE html>
   .tag.warn{background:#fff7ed;color:#b45309}
   .tag.off{background:#f3f4f6;color:#9ca3af}
   .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px}
-  .card{background:#fff;border:1px solid #e5e7eb;border-radius:13px;padding:16px 16px 14px;
-        box-shadow:0 2px 10px rgba(0,0,0,.03)}
+  /* 卡片整体半融入背景（2026-09-24）：与 .box/.card 主定义同一套参数 */
+  .card{background:linear-gradient(180deg,rgba(255,255,255,.40) 0%,rgba(252,253,255,.30) 100%);
+        border:1px solid rgba(255,255,255,.66);border-radius:13px;padding:16px 16px 14px;
+        backdrop-filter:blur(12px) saturate(160%);
+        -webkit-backdrop-filter:blur(12px) saturate(160%);
+        box-shadow:0 2px 10px rgba(0,0,0,.03),inset 0 1px 0 rgba(255,255,255,.60)}
   .card h3{margin:0 0 2px;font-size:15px;display:flex;align-items:center;gap:8px}
   .card .acc{color:#6b7280;font-size:12px;margin-bottom:12px}
   /* ---- 移动端优化（2026-09-14）---- */
@@ -1292,16 +2140,23 @@ GW_PAGE = """<!DOCTYPE html>
       padding:6px 8px;margin:-6px -8px;box-sizing:content-box;cursor:pointer}
   .sw input{opacity:0;width:0;height:0;position:absolute}
   .sw .sl{position:absolute;left:8px;top:6px;width:40px;height:22px;
-          background:#cbd5e1;border-radius:99px;transition:background .2s}
+          background:#cbd5e1;border-radius:99px;
+          transition:background .26s var(--ease-out-quart) .04s,
+                     box-shadow .2s var(--ease-out-quart)}
+  /* 滑块用弹性曲线：翻转时轻微过冲再落定，借一点物理感 */
   .sw .sl:before{content:"";position:absolute;width:18px;height:18px;left:2px;top:2px;
-          background:#fff;border-radius:50%;transition:transform .2s}
-  .sw input:checked + .sl{background:#22c55e}
+          background:#fff;border-radius:50%;
+          box-shadow:0 1px 3px rgba(16,24,40,.28);
+          transition:transform .34s var(--ease-spring)}
+  .sw input:checked + .sl{background:#22c55e;
+          box-shadow:0 0 0 3px rgba(34,197,94,.16)}
   .sw input:checked + .sl:before{transform:translateX(18px)}
+  .sw:hover .sl:before{box-shadow:0 2px 6px rgba(16,24,40,.34)}
   .sw input:disabled + .sl{opacity:.5;cursor:default}
   .sw input:focus-visible + .sl{outline:2px solid #2563eb;outline-offset:3px}
   .acts .sw{margin-left:auto}
   /* 关着的实例：滑块加一圈淡蓝，明确"这里可以点开" */
-  .card[data-on="0"] .sw .sl{background:#cbd5e1;box-shadow:0 0 0 3px rgba(37,99,235,.10)}
+  .card[data-on="0"] .sw .sl{background:#cbd5e1;box-shadow:0 0 0 3px rgba(37,99,235,.055)}
   .card[data-on="0"] .sw:hover .sl{background:#b8c2cf}
   button.danger{background:#dc2626}
   .fab{position:fixed;right:24px;bottom:26px;width:52px;height:52px;border-radius:50%;
@@ -1333,12 +2188,15 @@ GW_PAGE = """<!DOCTYPE html>
         animation:spin .7s linear infinite;vertical-align:-1px}
   @keyframes spin{to{transform:rotate(360deg)}}
   @media (prefers-reduced-motion: reduce){.msg .spin{animation:none}}
-  /* 顶栏按钮的忙碌态 */
-  button[data-busy]::after{content:"";display:inline-block;width:9px;height:9px;
-        margin-left:6px;border:2px solid rgba(255,255,255,.45);
+  /* 顶栏按钮的忙碌态。
+     ⚠️ 第三轮给 button 加了光泽伪元素 ::after，忙碌转圈不能用同一个伪元素
+     （会互相覆盖，转圈消失）。改用 ::before 承载转圈。 */
+  button[data-busy]::before{content:"";display:inline-block;width:9px;height:9px;
+        margin-right:6px;border:2px solid rgba(255,255,255,.45);
         border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite;
         vertical-align:0}
-  button.ghost[data-busy]::after{border-color:#cbd5e1;border-top-color:#374151}
+  button.ghost[data-busy]::before{border-color:#cbd5e1;border-top-color:#374151}
+  button[data-busy]::after{animation:none;transform:translate3d(-115%,0,0)}
   /* Toast：错误/成功短提示，自动消失，不占布局 */
   .toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%);
         background:#1f2328;color:#fff;padding:9px 16px;border-radius:10px;
@@ -1353,67 +2211,599 @@ GW_PAGE = """<!DOCTYPE html>
   button:focus-visible,.acts a:focus-visible,.sw .sl:focus-visible{
         outline:2px solid #2563eb;outline-offset:2px}
   .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
-  /* ---- 视觉增强（2026-09-16）：只加外观属性，不动尺寸/布局/结构 ----
-     卡片 hover 只改阴影、不做位移，避免浮起干扰点击开关。 */
-  body{background:linear-gradient(160deg,#f7f9fc 0%,#eef2f9 45%,#e8eef8 100%);
-       -webkit-font-smoothing:antialiased}
-  .card{background:linear-gradient(180deg,#fff 0%,#fdfeff 100%);border-color:#e8ecf3;
-        box-shadow:0 1px 2px rgba(16,24,40,.04),0 10px 28px -12px rgba(16,24,40,.12);
-        transition:box-shadow .18s ease,border-color .18s ease}
-  .card:hover{box-shadow:0 2px 6px rgba(16,24,40,.06),0 16px 36px -14px rgba(16,24,40,.18);
-        border-color:#dde4ef}
-  button{background:linear-gradient(180deg,#3b82f6 0%,#2563eb 100%);
+  /* ---- 视觉增强·第三轮（2026-09-24）：设计系统 + 极光背景 + 克制动效 ----
+     约束：只加/覆盖**外观**属性，不动尺寸、布局、结构与 JS 行为。 */
+  :root{
+    --ink:#161b22; --ink-2:#3d4757; --ink-3:#6b7686; --ink-4:#9aa3b0;
+    --line:#e3e8f0; --line-2:#eef2f8;
+    --brand:#2563eb; --brand-2:#3b82f6; --brand-3:#60a5fa;
+    --ok:#22c55e; --warn:#b45309; --err:#dc2626;
+    --sh-1:0 1px 2px rgba(16,24,40,.05);
+    --sh-2:0 1px 2px rgba(16,24,40,.05), 0 10px 28px -12px rgba(16,24,40,.14);
+    --sh-3:0 2px 6px rgba(16,24,40,.07), 0 20px 44px -16px rgba(16,24,40,.20);
+    --ease-out-quart:cubic-bezier(.25,1,.5,1);
+    --ease-out-quint:cubic-bezier(.22,1,.36,1);
+    --ease-out-expo:cubic-bezier(.16,1,.3,1);
+    --ease-in-out:cubic-bezier(.65,0,.35,1);
+    --ease-spring:cubic-bezier(.34,1.56,.64,1);   /* 回弹：开关/按钮松开用 */
+    --mx:50vw; --my:50vh;                          /* 光标位置，由 JS 写入 */
+  }
+  /* ---- 2026-09-24 第四轮：把静态背景改成真正会动的环境 ---- */
+  body{color:var(--ink);
+    background:
+      radial-gradient(1100px 700px at 8% -6%,   rgba(59,130,246,.42), transparent 60%),
+      radial-gradient(900px 580px at 92% 2%,    rgba(96,165,250,.32), transparent 58%),
+      radial-gradient(820px 640px at 78% 106%,  rgba(56,189,248,.30), transparent 60%),
+      radial-gradient(700px 520px at 16% 98%,   rgba(96,165,250,.26), transparent 60%),
+      linear-gradient(168deg,#f4f8fe 0%,#e8f0fb 48%,#e3ecf9 100%);
+    background-attachment:fixed;
+  }
+  /* ① 极光：14s 一圈、±26% 位移 + 旋转，肉眼明确可见在"游" */
+  body::before{
+    content:"";position:fixed;inset:-40%;z-index:-2;pointer-events:none;
+    background:
+      radial-gradient(62% 52% at 24% 26%, rgba(59,130,246,.55) 0%, rgba(59,130,246,.55) 44%, rgba(59,130,246,0.18) 64%, transparent 72%),
+      radial-gradient(58% 48% at 76% 60%, rgba(96,165,250,.47) 0%, rgba(96,165,250,.47) 44%, rgba(96,165,250,0.16) 64%, transparent 72%),
+      radial-gradient(54% 46% at 46% 90%, rgba(56,189,248,.42) 0%, rgba(56,189,248,.42) 44%, rgba(56,189,248,0.14) 64%, transparent 73%),
+      radial-gradient(46% 40% at 88% 22%, rgba(34,211,238,.38) 0%, rgba(34,211,238,.38) 44%, rgba(34,211,238,0.13) 64%, transparent 74%);
+    animation:auroraA 14s ease-in-out infinite;
+    will-change:transform;
+  }
+  @keyframes auroraA{
+    0%  {transform:translate3d(-24%,-16%,0) scale(1.10) rotate(-6deg)}
+    25% {transform:translate3d(18%,-6%,0)   scale(1.26) rotate(5deg)}
+    50% {transform:translate3d(-4%,20%,0)   scale(1.15) rotate(-2deg)}
+    75% {transform:translate3d(22%,10%,0)   scale(1.30) rotate(7deg)}
+    100%{transform:translate3d(-24%,-16%,0) scale(1.10) rotate(-6deg)}
+  }
+  /* ② 光带扫过：斜向高光带 9s 横穿全屏 —— 最直观的"有东西在流动" */
+  .sweep{position:fixed;top:-60%;left:-60%;width:220%;height:220%;
+    z-index:-2;pointer-events:none;
+    background:linear-gradient(102deg,
+       transparent 28%,
+       rgba(255,255,255,.10) 47%,
+       rgba(191,219,254,.08) 50%,
+       rgba(255,255,255,.10) 53%,
+       transparent 72%);
+    animation:sweepMove 9s cubic-bezier(.45,0,.55,1) infinite;
+    will-change:transform;
+  }
+  @keyframes sweepMove{
+    0%  {transform:translate3d(-38%,0,0)  rotate(-8deg);opacity:0}
+    8%  {opacity:.85}
+    50% {opacity:.85}
+    58% {opacity:0}
+    100%{transform:translate3d(38%,0,0)   rotate(-8deg);opacity:0}
+  }
+  /* ③ 网格：6s 走一格（56px），约 9px/秒 —— 明显在爬 */
+  .gridflow{position:fixed;inset:-10%;z-index:-3;pointer-events:none;opacity:.30;
+    background-image:
+      linear-gradient(to right, rgba(37,99,235,.055) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(37,99,235,.055) 1px, transparent 1px);
+    background-size:72px 72px;
+    animation:gridDrift 6s linear infinite;
+  will-change:transform;
+  }
+  @keyframes gridDrift{
+    from{transform:translate3d(0,0,0)}
+    to  {transform:translate3d(72px,72px,0)}
+  }
+  /* ④ 呼吸光晕：中心亮度 8s 起伏，整个页面像在"呼吸" */
+  .breathe{position:fixed;inset:0;z-index:-2;pointer-events:none;
+    background:radial-gradient(60% 50% at 50% 45%,
+               rgba(96,165,250,.34), transparent 70%);
+    animation:breathe 8s ease-in-out infinite;
+    will-change:transform,opacity;
+  }
+  @keyframes breathe{
+    0%  {transform:scale(.92);opacity:.42}
+    50% {transform:scale(1.16);opacity:.92}
+    100%{transform:scale(.92);opacity:.42}
+  }
+  /* ⑤ 漂浮光点 ×5：各自独立漂移，营造"有东西在游"的生气 */
+  .orbs{position:fixed;inset:0;z-index:-2;pointer-events:none}
+  .orbs i{position:absolute;display:block;border-radius:50%;
+    will-change:transform,opacity}
+  .orbs i:nth-child(1){width:190px;height:190px;left:12%;top:18%;
+    background:radial-gradient(circle,rgba(56,189,248,0.58) 0%,rgba(56,189,248,0.50) 40%,transparent 70%);
+    animation:orbA 11s ease-in-out infinite}
+  .orbs i:nth-child(2){width:260px;height:260px;left:74%;top:12%;
+    background:radial-gradient(circle,rgba(34,211,238,0.50) 0%,rgba(34,211,238,0.43) 40%,transparent 70%);
+    animation:orbB 17s ease-in-out infinite}
+  .orbs i:nth-child(3){width:160px;height:160px;left:58%;top:72%;
+    background:radial-gradient(circle,rgba(45,212,191,0.52) 0%,rgba(45,212,191,0.45) 40%,transparent 70%);
+    animation:orbC 9.5s ease-in-out infinite}
+  .orbs i:nth-child(4){width:210px;height:210px;left:22%;top:76%;
+    background:radial-gradient(circle,rgba(244,114,182,0.42) 0%,rgba(244,114,182,0.36) 40%,transparent 70%);
+    animation:orbD 13.5s ease-in-out infinite}
+  .orbs i:nth-child(5){width:130px;height:130px;left:48%;top:38%;
+    background:radial-gradient(circle,rgba(52,211,153,0.44) 0%,rgba(52,211,153,0.38) 40%,transparent 70%);
+    animation:orbE 7.5s ease-in-out infinite}
+  @keyframes orbA{
+    0%,100%{transform:translate3d(0,0,0)      scale(1)}
+    33%    {transform:translate3d(90px,-70px,0) scale(1.25)}
+    66%    {transform:translate3d(-60px,50px,0) scale(.85)}
+  }
+  @keyframes orbB{
+    0%,100%{transform:translate3d(0,0,0)        scale(1)}
+    40%    {transform:translate3d(-120px,80px,0) scale(1.3)}
+    70%    {transform:translate3d(60px,120px,0)  scale(.9)}
+  }
+  @keyframes orbC{
+    0%,100%{transform:translate3d(0,0,0)        scale(.9)}
+    35%    {transform:translate3d(-80px,-110px,0) scale(1.35)}
+    75%    {transform:translate3d(110px,-40px,0)  scale(1)}
+  }
+  @keyframes orbD{
+    0%,100%{transform:translate3d(0,0,0)       scale(1.05)}
+    45%    {transform:translate3d(130px,-90px,0) scale(.8)}
+    80%    {transform:translate3d(-40px,-140px,0) scale(1.2)}
+  }
+  /* orbE：最短循环 + 纯位移，和其他几个的"缩放型"形成节奏差 */
+  @keyframes orbE{
+    0%  {transform:translate3d(-30px,20px,0)   scale(.9)}
+    50% {transform:translate3d(-110px,-60px,0) scale(1.3)}
+    100%{transform:translate3d(-30px,20px,0)   scale(.9)}
+  }
+  /* ⑥ 顶部流动渐变条：色相循环，明确表示"系统在运行" */
+  .flowbar{position:fixed;top:0;left:0;right:0;height:3px;z-index:50;
+    pointer-events:none;
+    background:linear-gradient(90deg,
+      #38bdf8,#22d3ee,#5eead4,#7dd3fc,#38bdf8,#22d3ee,#7dd3fc,#38bdf8);
+    background-size:300% 100%;
+    animation:flowBar 5s linear infinite;
+    box-shadow:0 0 10px rgba(59,130,246,.55);
+  }
+  @keyframes flowBar{
+    from{background-position:0% 0}
+    to  {background-position:300% 0}
+  }
+  /* 光标跟随光晕：鼠标互动（叠加在自动流动之上，不是替代） */
+  .cursorGlow{position:fixed;inset:0;z-index:-1;pointer-events:none;opacity:0;
+    background:radial-gradient(360px 360px at var(--mx) var(--my),
+               rgba(56,189,248,.22), transparent 70%);
+    transition:opacity .5s var(--ease-out-quart);   /* 原先这里还有 will-change:background，已删（见上） */
+  }
+  body.pointerFine .cursorGlow{opacity:1}
+  /* 细噪点：仅 3.5% 不透明度，只为消除渐变的塑料感 */
+  body::after{
+    content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;opacity:.42;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)' opacity='.035'/%3E%3C/svg%3E");
+  }
+.card{background:linear-gradient(180deg,rgba(255,255,255,.40) 0%,rgba(252,253,255,.30) 100%);
+      border-color:rgba(255,255,255,.66);
+      box-shadow:var(--sh-2),inset 0 1px 0 rgba(255,255,255,.60);
+      backdrop-filter:blur(12px) saturate(160%);
+      -webkit-backdrop-filter:blur(12px) saturate(160%);
+        transition:box-shadow .24s var(--ease-out-quart),border-color .24s var(--ease-out-quart)}
+  .card:hover{box-shadow:var(--sh-3);border-color:#dae2ee}
+  /* 主按钮：光泽扫过 + 按压下沉 + 松开弹性回弹 */
+  button{background:linear-gradient(180deg,var(--brand-2) 0%,var(--brand) 100%);
          box-shadow:0 1px 2px rgba(37,99,235,.26),0 6px 14px -6px rgba(37,99,235,.42);
-         transition:transform .16s ease,box-shadow .16s ease,filter .16s ease}
-  button:hover:not(:disabled){transform:translateY(-1px);
-         box-shadow:0 2px 4px rgba(37,99,235,.3),0 10px 22px -8px rgba(37,99,235,.5)}
-  button:active:not(:disabled){transform:translateY(0);filter:brightness(.97)}
+         transition:transform .16s var(--ease-out-quart),
+                    box-shadow .16s var(--ease-out-quart),
+                    filter .16s var(--ease-out-quart);
+         position:relative;overflow:hidden;isolation:isolate;
+         transform:translateZ(0)}
+  button::after{                      /* 光泽扫过 */
+    content:"";position:absolute;inset:0;z-index:-1;pointer-events:none;
+    background:linear-gradient(105deg,transparent 30%,rgba(255,255,255,.4) 50%,transparent 70%);
+    transform:translate3d(-115%,0,0);transition:transform .62s var(--ease-out-expo)}
+  button:hover:not(:disabled)::after{transform:translate3d(115%,0,0)}
+  button:hover:not(:disabled){transform:translateY(-2px);
+         box-shadow:0 3px 6px rgba(37,99,235,.3),0 12px 24px -8px rgba(37,99,235,.55)}
+  button:active:not(:disabled){transform:translateY(1px) scale(.97);filter:brightness(.95);
+         box-shadow:0 2px 5px rgba(37,99,235,.32);
+         transition:transform .06s linear,filter .06s linear,box-shadow .06s linear}
+  button:not(:active):not(:disabled){
+         transition:transform .34s var(--ease-spring),
+                    box-shadow .3s var(--ease-out-quart),
+                    filter .2s var(--ease-out-quart)}
+  /* 点击波纹 */
+  button .ripple{position:absolute;border-radius:50%;pointer-events:none;
+         background:radial-gradient(circle,rgba(255,255,255,.55) 0%,rgba(255,255,255,0) 70%);
+         transform:translate(-50%,-50%) scale(0);opacity:.9;
+         animation:rippleOut .52s var(--ease-out-quart) forwards;z-index:-1}
+  @keyframes rippleOut{
+    0%  {transform:translate(-50%,-50%) scale(0);opacity:.9}
+    100%{transform:translate(-50%,-50%) scale(1);opacity:0}
+  }
+  /* 主按钮磁吸（仅非 ghost / 非 fab，位移上限 4px） */
+  button.magnetic:hover:not(:disabled){
+         transform:translate(var(--pull-x,0px),calc(-2px + var(--pull-y,0px)))}
+  button.magnetic:active:not(:disabled){
+         transform:translate(0,1px) scale(.97);
+         filter:brightness(.95);
+         box-shadow:0 0 0 0 rgba(37,99,235,.3),0 2px 5px rgba(37,99,235,.32);
+         transition:transform .06s linear,filter .06s linear,box-shadow .06s linear}
+  /* 成功态：短暂变绿打勾 */
+  button.done{background:linear-gradient(180deg,#34d399 0%,#10b981 100%);
+         box-shadow:0 1px 2px rgba(16,185,129,.3),0 8px 18px -6px rgba(16,185,129,.5);
+         animation:donePop .42s var(--ease-spring)}
+  @keyframes donePop{
+    0%{transform:scale(1)} 45%{transform:scale(1.045)} 100%{transform:scale(1)}
+  }
   button.ghost{background:linear-gradient(180deg,#fff 0%,#fafbfd 100%);
          box-shadow:0 1px 2px rgba(16,24,40,.05)}
   button.ghost:hover:not(:disabled){border-color:#b9c6dc;background:#fff;
-         box-shadow:0 2px 6px rgba(16,24,40,.08)}
-  button.danger{background:linear-gradient(180deg,#ef4444 0%,#dc2626 100%);
+         box-shadow:0 2px 6px rgba(16,24,40,.08);transform:translateY(-2px)}
+  button.ghost::after{background:linear-gradient(105deg,transparent 30%,rgba(37,99,235,.055) 50%,transparent 70%)}
+  button.danger{background:linear-gradient(180deg,#ef4444 0%,var(--err) 100%);
          box-shadow:0 1px 2px rgba(220,38,38,.26),0 6px 14px -6px rgba(220,38,38,.42)}
   .pbar{box-shadow:0 1px 2px rgba(16,24,40,.06) inset}
-  .pfill{background:linear-gradient(90deg,#34d399 0%,#22c55e 100%);
+  .pfill{background:linear-gradient(90deg,#34d399 0%,var(--ok) 100%);
          box-shadow:0 0 8px rgba(34,197,94,.32)}
-  .plat{transition:background .18s ease,color .18s ease,border-color .18s ease,box-shadow .18s ease}
-  .plat.on{background:linear-gradient(180deg,#3b82f6 0%,#2563eb 100%);
+  .plat{transition:background .18s var(--ease-out-quart),color .18s var(--ease-out-quart),
+        border-color .18s var(--ease-out-quart),box-shadow .18s var(--ease-out-quart),
+        transform .18s var(--ease-out-quart)}
+  .plat.on{background:linear-gradient(180deg,var(--brand-2) 0%,var(--brand) 100%);
          box-shadow:0 1px 2px rgba(37,99,235,.25),0 6px 14px -6px rgba(37,99,235,.5)}
+  .plat:not(.on):hover{transform:translateY(-1px);
+         box-shadow:0 4px 12px -4px rgba(16,24,40,.16)}
   .fab{box-shadow:0 4px 12px rgba(37,99,235,.32),0 12px 28px -8px rgba(37,99,235,.48);
-       transition:transform .18s ease,box-shadow .18s ease}
-  .fab:hover{transform:translateY(-2px)}
+       transition:transform .2s var(--ease-out-expo),box-shadow .2s var(--ease-out-expo)}
+  .fab:hover{transform:translateY(-2px) scale(1.045);
+       box-shadow:0 6px 16px rgba(37,99,235,.36),0 18px 36px -10px rgba(37,99,235,.5)}
   .hint{background:linear-gradient(180deg,#f8fafd 0%,#f4f7fb 100%)}
-  @media (prefers-reduced-motion: reduce){
-    button,.card,.plat,.fab{transition:none}
-    button:hover:not(:disabled),button:active:not(:disabled),.fab:hover{transform:none}
-  }
-  /* ---- 视觉增强·第二轮：精致化细节，仍只加外观属性 ---- */
+  /* ---- 视觉增强·第二轮：精致化细节 ---- */
   ::-webkit-scrollbar{width:10px;height:10px}
   ::-webkit-scrollbar-track{background:transparent}
   ::-webkit-scrollbar-thumb{background:rgba(100,116,139,.28);border-radius:999px;
         border:2px solid transparent;background-clip:content-box}
   ::-webkit-scrollbar-thumb:hover{background:rgba(100,116,139,.45);background-clip:content-box}
-  button,.card,.plat{transition-timing-function:cubic-bezier(.22,.61,.36,1)}
-  body{animation:fadeIn .28s cubic-bezier(.22,.61,.36,1)}
+  button,.card,.plat,.task{transition-timing-function:var(--ease-out-quart)}
+  body{animation:fadeIn .34s var(--ease-out-quart)}
   @keyframes fadeIn{from{opacity:0}to{opacity:1}}
   ::selection{background:rgba(37,99,235,.16)}
   .head h1{position:relative;padding-left:12px}
   .head h1::before{content:"";position:absolute;left:0;top:50%;transform:translateY(-50%);
         width:3.5px;height:20px;border-radius:2px;
-        background:linear-gradient(180deg,#60a5fa,#2563eb)}
-  .pfill{position:relative;overflow:hidden}
+        background:linear-gradient(180deg,var(--brand-3),var(--brand))}
+  /* 进度条流光：宽度变化本身也带过渡，进度推进时是"生长"而不是"跳变" */
+  .pfill{position:relative;overflow:hidden;
+        transition:width .7s var(--ease-out-expo)}
   .pfill::after{content:"";position:absolute;inset:0;
         background:linear-gradient(90deg,transparent,rgba(255,255,255,.42),transparent);
-        animation:shine 2.4s cubic-bezier(.22,.61,.36,1) infinite}
+        animation:shine 2.4s var(--ease-out-quart) infinite}
   @keyframes shine{0%{transform:translateX(-100%)}100%{transform:translateX(200%)}}
+  /* 运行中实例的进度条加一层呼吸光晕，一眼看出"在干活" */
+  .card[data-on="1"] .pfill{animation:barBreath 2.6s var(--ease-in-out) infinite}
+  @keyframes barBreath{
+    0%,100%{box-shadow:0 0 6px rgba(34,197,94,.28)}
+    50%    {box-shadow:0 0 14px rgba(34,197,94,.55)}
+  }
   .tag{letter-spacing:.2px}
   .empty{background:linear-gradient(180deg,#fbfcfe 0%,#f6f8fb 100%)}
+  /* ---- 骨架屏：首次加载时先占位，避免"空一阵再蹦出来" ---- */
+  .skel{background:#fff;border:1px solid var(--line);border-radius:13px;
+        padding:16px 16px 14px;box-shadow:var(--sh-2);overflow:hidden}
+  .skel i{display:block;border-radius:6px;
+        background:linear-gradient(90deg,#eef2f7 25%,#e2e8f1 50%,#eef2f7 75%);
+        background-size:220% 100%;animation:shimmer 1.25s linear infinite}
+  .skel i.l1{width:42%;height:13px;margin-bottom:9px}
+  .skel i.l2{width:62%;height:11px;margin-bottom:14px}
+  .skel i.l3{width:34%;height:24px;margin-bottom:10px}
+  .skel i.l4{width:100%;height:8px;border-radius:99px;margin-bottom:12px}
+  .skel i.l5{width:78%;height:11px}
+  @keyframes shimmer{from{background-position:120% 0}to{background-position:-120% 0}}
+  /* 卡片入场：逐个上浮，--i 由 JS 注入；总量封顶避免久等。
+     仅首屏生效（.enter），5 秒一次的差量重绘不会重播动画。 */
+  .grid.enter .card{animation:cardIn .42s var(--ease-out-expo) both;
+        animation-delay:calc(var(--i,0) * 45ms)}
+  @keyframes cardIn{from{opacity:0;transform:translate3d(0,9px,0)}to{opacity:1;transform:none}}
+  /* 顶栏按钮组入场 */
+  .btnrow,.platbar{animation:cardIn .4s var(--ease-out-expo) both}
+  .platbar{animation-delay:20ms}
+  .btnrow{animation-delay:60ms}
   @media (prefers-reduced-motion: reduce){
-    body{animation:none}
+    body,.grid.enter .card,.btnrow,.platbar{animation:none}
+    body::before,.gridflow,.breathe,.orbs i,.sweep,.flowbar{animation:none}
+    .sweep,.orbs{opacity:.35}
+    .flowbar{opacity:.5}
+    .cursorGlow{display:none}
     .pfill::after{animation:none;display:none}
+    .card[data-on="1"] .pfill{animation:none}
+    .skel i{animation:none;background:#eef2f7}
+    button::after{display:none}
+    button .ripple{display:none}
+    button,.card,.plat,.fab,.sw .sl,.sw .sl:before,.pfill{transition:none}
+    button:hover:not(:disabled),button:active:not(:disabled),
+    button.magnetic:hover:not(:disabled),button.magnetic:active:not(:disabled),
+    .fab:hover,.plat:not(.on):hover{transform:none}
+    button.done{animation:none}
   }
+  /* ===== 手机端专项（2026-09-24，第二版重做）=====
+     ⚠️ 第一版两个失误（用户反馈"动效完全没有 / 排在一起太拥挤"）：
+       ① 把 .sweep/.orbs/.flowbar 直接 display:none → 设计语言被砍光。
+          这几层全是 transform/opacity，GPU 合成零重排，手机跑得动。
+          **改为层数不动，只把 filter:blur 半径减半**（唯一吃 GPU 的属性）。
+       ② 只做等比放大，没拉开层级差 → 大控件配小文字，显得闷。
+          **改为：标题更大、卡片留白更宽、行距更松。** */
+  @media (max-width: 640px){
+    body{padding:22px 15px calc(52px + env(safe-area-inset-bottom))}
+    .wrap{max-width:100%}
+    h1,.head h1{font-size:25px;font-weight:650;letter-spacing:.3px}
+    .sub,.head .sub{font-size:13.5px;line-height:1.65;
+                    color:#66707f;margin-bottom:18px}
+    .grid{grid-template-columns:1fr;gap:16px}
+    .card{padding:22px 19px 19px;border-radius:22px;
+          box-shadow:0 1px 2px rgba(15,32,74,.04),
+                     0 16px 40px -18px rgba(15,23,42,.20)}
+    .cno{font-size:17px}
+    .cacc{font-size:12.5px;margin-bottom:12px}
+    .pv .big{font-size:28px}
+    .pv{margin:12px 0 9px}
+    .cur{white-space:normal;overflow:visible;line-height:1.65;margin-top:10px}
+    .hint{font-size:13px;padding:12px 13px;line-height:1.7;border-radius:11px}
+    .log{margin-top:14px;padding-top:13px;font-size:12px;line-height:1.7}
+    button{min-height:50px;padding:14px 18px;font-size:15.5px;border-radius:13px}
+    button.fab{min-height:0;padding:0}
+    .btnrow{gap:11px;margin-bottom:20px}
+    .btnrow button{flex:1 1 calc(50% - 6px)}
+    .acts{gap:11px;margin-top:16px}
+    .acts a{min-height:46px;display:inline-flex;align-items:center;
+            padding:12px 15px;font-size:14px;border-radius:11px;flex:1 1 auto;
+            justify-content:center}
+    .bar{gap:11px;margin-bottom:18px}
+    .fab{right:16px;bottom:calc(20px + env(safe-area-inset-bottom));
+         width:58px;height:58px}
+    .sw{padding:12px 14px;margin:-12px -14px}
+    button:hover:not(:disabled),.fab:hover,.plat:not(.on):hover{transform:none}
+    button:active:not(:disabled),.fab:active{transform:scale(.97);filter:brightness(.95);
+         transition:transform .08s linear,filter .08s linear}
+    /* 背景动效全保留，只降 filter:blur（唯一真正吃 GPU 的属性）
+       ⚠️ 必须用 :nth-child 级别的特异性，基础定义就写在那儿 */
+    body .orbs i:nth-child(n){width:170px;height:170px}
+    body .orbs i:nth-child(2){width:210px;height:210px}
+    .sweep{opacity:.85}
+    .breathe{opacity:.7}
+    .gridflow{opacity:.24}
+    .cursorGlow{display:none}
+    ::-webkit-scrollbar{width:0;height:0}
+
+    /* 🔴 2026-09-28 修「手机端偶尔闪一下 / 区域变黑」。
+       根因链（不是新问题，是老问题复发）：
+         · 2026-09-24 记录过：背景光带 .sweep 扫过时"整个框全部闪"，
+           当时代价是——**降 sweep 的 opacity**（关掉后卡片内帧差 -76%）。
+         · 但紧接着"卡片整体半融入背景"把卡片降到 rgba(.40/.30) **并加了
+           backdrop-filter:blur(12px)** → 等于把光带又请回卡片内部，
+           而且让每张卡都变成一个全屏级合成层。
+         · 手机端一屏 8 张实例卡 = 8 个毛玻璃层，外加 极光/扫光/网格/呼吸/5 个光球
+           ≈ 19 个合成层。中低端 GPU 扛不住 → 图层被回收重建 = **闪一下 / 区域变黑**。
+
+       对策：**不砍动效**（用户明确要流动感），只做两件最划算的：
+         ① 卡片不再透背景 —— 去掉 backdrop-filter + 提高不透明度
+            （光带再也穿不透卡片，同时省掉 8 个合成层）
+         ② 去掉永久 will-change —— 图层常驻显存会导致系统回收重建，
+            交给浏览器按需提升即可。 */
+    .card, .box{
+      backdrop-filter:none !important;
+      -webkit-backdrop-filter:none !important;
+      background:linear-gradient(180deg,rgba(255,255,255,.90) 0%,
+                                         rgba(252,253,255,.84) 100%);
+    }
+    body::before, body .sweep, body .gridflow, body .breathe,
+    body .orbs i{will-change:auto}
+  
+  /* ===== ⑥ 流动感加强（2026-09-24 第三轮 · 用户第二次反馈）=====
+     用户原话：「手机端的流动感还是没有，手机端的屏幕本身比较小，
+               又不用加载那么大的地方，应该小区域的流动加大一点，
+               要不然压根看不出流动感，就像一个死背景」
+
+     根因（我算过账）：
+       桌面参数是按 1440px 宽屏调的，照搬到 390px 屏上，
+       **每秒可见位移 ÷ 屏宽** 被稀释了近 4 倍 →
+         · 光点 orbA：90px/11s = 8.2px/s   （肉眼几乎静止）
+         · 背景网格：72px/6s   = 12px/s    （勉强）
+         · 极光 body::before：blur(48px) 在 390px 屏上把色斑糊成整屏单色，
+           层次被抹平 —— 这是"死背景感"最大的元凶
+       验收标准：**每秒可见位移 ≥ 15px**（比桌面翻倍，因为屏小、参照物近）。
+
+     对策：「小区域、大位移、快周期」三件套 ——
+       位移 → 放到 2.2 倍（光点 90→200px 级）
+       周期 → 压到 0.62 倍（sweep 9→5.5s、grid 6→3.6s、breathe 8→5s）
+       模糊 → 极光 48→26px（恢复层次，同时更省 GPU）
+     ⚠️ 仍然只动 transform / opacity / background-position，
+        不碰 layout，手机 GPU 合成完全扛得住。 */
+
+  /* ① 极光：去糊、加幅、加速（"死背景"第一元凶） */
+  body::before{
+    animation-duration:9s;
+  }
+  @keyframes auroraA_m{
+    0%  {transform:translate3d(-34%,-24%,0) scale(1.06) rotate(-7deg)}
+    25% {transform:translate3d(26%,-10%,0)  scale(1.34) rotate(6deg)}
+    50% {transform:translate3d(-8%,28%,0)   scale(1.18) rotate(-3deg)}
+    75% {transform:translate3d(32%,14%,0)   scale(1.40) rotate(8deg)}
+    100%{transform:translate3d(-34%,-24%,0) scale(1.06) rotate(-7deg)}
+  }
+
+  /* ② 光带：9s → 5.5s，位移 ±38% → ±52%（明显"刷"过去）
+     ⚠️ 2026-09-24 追加：手机端**不再把 opacity 抬到 1**（桌面 .85）。
+        卡片在窄屏上几乎占满整屏，光带越亮 → 卡片内明暗跳变越猛。
+        用户录屏「整个框全部闪」的主犯就是它（关掉后卡片内帧差 -76%）。
+        现在改成 .55 —— 背景里仍能看见光带扫过，卡片下不再打脸。 */
+  body .sweep{
+    animation-duration:5.5s;
+    opacity:.55;
+  }
+  @keyframes sweepMove_m{
+    0%  {transform:translate3d(-52%,0,0) rotate(-10deg);opacity:0}
+    8%  {opacity:.55}
+    50% {opacity:.55}
+    58% {opacity:0}
+    100%{transform:translate3d(52%,0,0)  rotate(-10deg);opacity:0}
+  }
+
+  /* ③ 网格：6s → 3.6s（走一格 72px ⇒ 20px/s，跨过 15px/s 门槛） */
+  body .gridflow{
+    animation-duration:3.6s;
+    background-size:64px 64px;inset:-22%;      /* 屏小，格距也收一点，格数不变才不显空 */
+    opacity:.22;
+  }
+  @keyframes gridDrift_m{
+    from{transform:translate3d(0,0,0)}
+    to  {transform:translate3d(64px,64px,0)}
+  }
+
+  /* ④ 呼吸：8s → 5s，幅度也拉开（.90↔1.22） */
+  body .breathe{
+    animation-duration:5s;
+    opacity:.8;
+  }
+  @keyframes breathe_m{
+    0%  {transform:scale(.90);opacity:.46}
+    50% {transform:scale(1.22);opacity:1}
+    100%{transform:scale(.90);opacity:.46}
+  }
+
+  /* ⑤ 光点：位移 ×2.2、周期压到 0.62 倍
+        —— 这是手机端"有东西在游"的主力 */
+  body .orbs i:nth-child(1){animation-duration:6.8s}
+  body .orbs i:nth-child(2){animation-duration:10.5s}
+  body .orbs i:nth-child(3){animation-duration:5.9s}
+  body .orbs i:nth-child(4){animation-duration:8.4s}
+  body .orbs i:nth-child(5){animation-duration:4.6s}
+  @keyframes orbA_m{
+    0%,100%{transform:translate3d(0,0,0)            scale(1)}
+    33%    {transform:translate3d(190px,-150px,0)   scale(1.4)}
+    66%    {transform:translate3d(-130px,110px,0)   scale(.78)}
+  }
+  @keyframes orbB_m{
+    0%,100%{transform:translate3d(0,0,0)            scale(1)}
+    40%    {transform:translate3d(-230px,160px,0)   scale(1.45)}
+    70%    {transform:translate3d(120px,230px,0)    scale(.82)}
+  }
+  @keyframes orbC_m{
+    0%,100%{transform:translate3d(0,0,0)            scale(.88)}
+    35%    {transform:translate3d(-170px,-230px,0)  scale(1.5)}
+    75%    {transform:translate3d(210px,-90px,0)    scale(1)}
+  }
+  @keyframes orbD_m{
+    0%,100%{transform:translate3d(0,0,0)            scale(1.06)}
+    45%    {transform:translate3d(250px,-180px,0)   scale(.72)}
+    80%    {transform:translate3d(-90px,-270px,0)   scale(1.35)}
+  }
+  @keyframes orbE_m{
+    0%  {transform:translate3d(-60px,40px,0)        scale(.86)}
+    50% {transform:translate3d(-210px,-120px,0)     scale(1.4)}
+    100%{transform:translate3d(-60px,40px,0)        scale(.86)}
+  }
+
+  /* ⑦ 输入框内部流动：手机端略微提速（屏小，慢了看不出）。
+     ⚠️ 聚焦态**不再额外提速** —— 那是「一直在闪」的来源（2026-09-24 修）。 */
+  input{
+    animation-duration:3.4s, 6.5s, 1.7s;
+  }
+
+  /* 🔴 手机端专用 keyframes 绑定
+     @keyframes 是全局作用域，同名会无条件覆盖 → 手机端必须用独立命名，
+     再在这里把元素的 animation-name 指过去，否则会连带改坏桌面端。 */
+  body::before{animation-name:auroraA_m}
+  body .sweep{animation-name:sweepMove_m}
+  body .gridflow{animation-name:gridDrift_m}
+  body .breathe{animation-name:breathe_m}
+  body .orbs i:nth-child(1){animation-name:orbA_m}
+  body .orbs i:nth-child(2){animation-name:orbB_m}
+  body .orbs i:nth-child(3){animation-name:orbC_m}
+  body .orbs i:nth-child(4){animation-name:orbD_m}
+  body .orbs i:nth-child(5){animation-name:orbE_m}
+}
+  @media (max-width: 380px){
+    body{padding:18px 12px calc(46px + env(safe-area-inset-bottom))}
+    h1,.head h1{font-size:22px}
+    .card{padding:19px 15px;border-radius:20px}
+    .btnrow button{flex:1 1 100%}
+  
+  /* 更窄屏（≤380px）：再压一档模糊，位移不变（屏更小反而更要动得明显） */
+}
+
+/* ===== 输入框内部流动光（2026-09-24 第三轮）=====
+   用户要求：「把整个输入栏也加入流动效果，不过颜色比起周围稍微淡一点，
+             然后整体的流动是和后面的同步的」
+
+   两个约束怎么满足：
+   ① 「比周围淡」 —— 周围背景格线 alpha 是 .055，这里只用 .018~.030，
+      约为它的 1/3；而且全部走浅色（白/淡蓝），不抢输入文字。
+   ② 「和后面同步」 —— 周期取背景各层的公约节奏：
+      背景 sweep=9s / gridflow=6s / breathe=8s / flowbar=5s
+      → 输入框用 2.25s(9s÷4) / 4.5s(9s÷2) / 9s 三档，
+        和 sweep 光带同源；方向也一致（都往右下走 + 横向）。
+
+   ⚠️ input 是**替换元素**，::before/::after 完全不生效（已踩过）。
+      所以只能用 background-image 多铺几层渐变 + 动 background-position，
+      这个是纯绘制层，不触发重排，GPU 友好。 */
+
+/* 常态：两层流动斜纹 + 一层横向掠光 */
+input{
+  background-color:#fcfdff;
+  background-image:
+    /* ① 横向掠光（最上层，最显眼）*/
+    linear-gradient(100deg,
+      transparent 32%, rgba(147,197,253,.22) 46%,
+      rgba(255,255,255,.40) 50%, rgba(147,197,253,.22) 54%,
+      transparent 68%),
+    /* ② 斜向细纹（与背景网格同向，向右下爬）*/
+    repeating-linear-gradient(115deg,
+      rgba(96,165,250,.042) 0px, rgba(96,165,250,.042) 1px,
+      transparent 1px, transparent 26px),
+    /* ③ 底晕（最淡，给上面两层"承托"）*/
+    radial-gradient(130% 200% at 10% 50%,
+      rgba(191,219,254,.42), rgba(255,255,255,0) 64%);
+  background-size:
+    900px 100%,
+    26px 26px,
+    150% 100%;
+  background-position:
+    -900px 0,
+    0 0,
+    0 0;
+  background-repeat:no-repeat,repeat,no-repeat;
+  animation:inputFlow 4.5s linear infinite,
+            inputWeave 9s linear infinite,
+            inputPulse 2.25s ease-in-out infinite;
+  background-color:#fcfdff;
+}
+@keyframes inputFlow{      /* 横向掠光：与背景 sweep 同源（9s÷2） */
+  from{background-position:-900px 0,   0 0,      0 0}
+  to  {background-position: 900px 0,   0 0,      0 0}
+}
+@keyframes inputWeave{     /* 斜纹爬行：与背景 gridflow 同向同为线性 */
+  from{background-position:-900px 0,   0 0,      0 0}
+  to  {background-position:-900px 0,  26px 26px, 0 0}
+}
+@keyframes inputPulse{     /* 底晕呼吸：与背景 breathe 同族（8s 的 1/4 弱化版） */
+  0%,100%{background-position:-900px 0, 0 0,   0% 0}
+  50%    {background-position:-900px 0, 0 0, 100% 0}
+}
+/* 聚焦：流动更亮一档（用户正在操作，值得多给一点注意力）*/
+/* 聚焦态：**不再「更亮一档 + 提速」**（2026-09-24 修）
+   那套 3.2s/6.5s/1.8s 提速 + 换亮的背景，是「手机端一直在闪」的真因；
+   现在聚焦只做**静态**变化（底色略提），流动与常态同速同亮度。 */
+input:focus{
+  background-color:rgba(255,255,255,.90);
+}
+/* 禁用态：不动（没什么可等的） */
+input:disabled{animation:none}
+
+
+/* 2026-09-24 第二十轮 GPU 优化（CDP LayerTree 实测）：
+   input/select 的 background 流动动画会让**整个父卡片层**每帧重绘
+   （手机 DPR=3 时 520x810 = 14.5MB/帧）。加 will-change:transform 让它
+   独立成合成层后，重绘范围缩到 input 自身（约 348x50），降低约 12 倍。 */
+input,select,textarea{will-change:transform}
+/* 2026-09-24 第二十轮：移动端去掉 background-attachment:fixed。
+   它会让移动端浏览器在滚动/视口变化时重绘整个背景（桌面无此问题）；
+   页面装饰层本来就是 position:fixed 的独立元素，body 底色不需要 fixed。 */
+@media (max-width:640px){body{background-attachment:scroll}}
+
 </style></head><body>
+<div class="gridflow" aria-hidden="true"></div>
+<div class="breathe" aria-hidden="true"></div>
+<div class="orbs" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div>
+<div class="sweep" aria-hidden="true"></div>
+<div class="cursorGlow" aria-hidden="true"></div>
+<div class="flowbar" aria-hidden="true"></div>
 <div class="wrap">
   <div class="head">
     <h1>多账号刷课控制台</h1>
@@ -1434,7 +2824,11 @@ GW_PAGE = """<!DOCTYPE html>
     <button class="ghost" id="btnLogout">退出登录</button>
   </div>
   <div class="card hide" id="staggerBox" style="margin-bottom:14px"></div>
-  <div class="grid" id="grid"></div>
+  <div class="grid" id="grid">
+    <div class="skel"><i class="l1"></i><i class="l2"></i><i class="l3"></i><i class="l4"></i><i class="l5"></i></div>
+    <div class="skel"><i class="l1"></i><i class="l2"></i><i class="l3"></i><i class="l4"></i><i class="l5"></i></div>
+    <div class="skel"><i class="l1"></i><i class="l2"></i><i class="l3"></i><i class="l4"></i><i class="l5"></i></div>
+  </div>
   <div class="msg" id="msg" role="status" aria-live="polite"></div>
 </div>
 <button class="fab" id="btnAdd" title="新增账号" aria-label="新增账号">+</button>
@@ -1445,6 +2839,75 @@ let overview = null;
 let isAdmin = false;
 let loadTimer = null;      // 自动刷新句柄（保存下来，便于出错时暂停）
 let busy = false;          // 有管理动作在进行（暂停自动刷新，避免打断）
+
+/* ---- 2026-09-24：环境动效与指针反馈 ----
+   只写 CSS 变量 / 加 class，不动既有逻辑与 DOM 结构。
+   触屏（指针为 coarse）时不启用光标光晕与磁吸，省掉无谓开销。 */
+(function(){
+  if (!window.matchMedia('(hover:hover) and (pointer:fine)').matches) return;
+  document.body.classList.add('pointerFine');
+  let raf = 0, px = 0, py = 0;
+  window.addEventListener('pointermove', e => {
+    px = e.clientX; py = e.clientY;
+    if (raf) return;                       // 每帧最多写一次
+    raf = requestAnimationFrame(() => {
+      raf = 0;
+      document.documentElement.style.setProperty('--mx', px + 'px');
+      document.documentElement.style.setProperty('--my', py + 'px');
+    });
+  }, {passive:true});
+})();
+
+/* 点击波纹：从落点扩散一圈光，即时反馈「收到了」 */
+let ptrDown = false;
+document.addEventListener('pointerdown', e => {
+  const b = e.target && e.target.closest && e.target.closest('button');
+  if (!b || b.disabled) return;
+  /* ⚠️ 插入波纹节点会触发布局重算，把 :active 的生效推迟到 200ms 之后（实测）。
+     所以这里只标记状态，DOM 操作延到下一帧。 */
+  ptrDown = true;
+  const cx = e.clientX, cy = e.clientY;
+  requestAnimationFrame(() => {
+    const r = b.getBoundingClientRect();
+    const d = Math.max(r.width, r.height) * 1.8;
+    const s = document.createElement('span');
+    s.className = 'ripple';
+    s.style.width = s.style.height = d + 'px';
+    s.style.left = (cx - r.left) + 'px';
+    s.style.top  = (cy - r.top)  + 'px';
+    b.appendChild(s);
+    setTimeout(() => s.remove(), 560);
+    b.style.setProperty('--pull-x', '0px');
+    b.style.setProperty('--pull-y', '0px');
+  });
+}, {passive:true});
+
+/* 主按钮磁吸：悬停时被鼠标轻微吸引（上限 4px）。
+   只作用于实心主按钮 —— ghost / fab / 切换类按钮保持原位，避免误点。 */
+document.addEventListener('pointerup', () => { ptrDown = false; }, {passive:true});
+document.addEventListener('pointercancel', () => { ptrDown = false; }, {passive:true});
+document.addEventListener('pointermove', e => {
+  if (!document.body.classList.contains('pointerFine')) return;
+  /* 按住不放时不做磁吸，让 :active 的下沉成为唯一反馈 */
+  if (ptrDown || e.buttons & 1) return;
+  const b = e.target && e.target.closest && e.target.closest('button');
+  if (!b || b.disabled || b.classList.contains('ghost') || b.classList.contains('fab')
+      || b.classList.contains('danger') || b.classList.contains('plat')) return;
+  b.classList.add('magnetic');
+  const r = b.getBoundingClientRect();
+  const dx = (e.clientX - (r.left + r.width / 2)) / (r.width / 2);
+  const dy = (e.clientY - (r.top + r.height / 2)) / (r.height / 2);
+  b.style.setProperty('--pull-x', (dx * 4).toFixed(2) + 'px');
+  b.style.setProperty('--pull-y', (dy * 4).toFixed(2) + 'px');
+}, {passive:true});
+
+/* 按钮走完「忙碌→成功」后，短暂变绿打勾再复位（三点式反馈） */
+function flashDone(btn, ms) {
+  if (!btn) return;
+  btn.classList.remove('magnetic');
+  btn.classList.add('done');
+  setTimeout(() => btn.classList.remove('done'), ms || 900);
+}
 
 // ---- 统一反馈：状态行 + Toast ----
 function say(text, kind) {
@@ -1471,14 +2934,27 @@ function setBusy(btn, on) {
 }
 
 function fmtPct(p) {
-  if (!p || !p.total) return 0;
-  return Math.round((p.done || 0) / p.total * 100);
+  // 2026-09-29：优先用平台侧真实完成。p.done 数的是"平台回过 isPassed=true 的任务名"，
+  // 口径是**任务点**，而 p.total 是**章节数** —— 一个章节可有多个任务点，
+  // 所以 p.done 会超过 p.total（实测 158/139 = 114%）。platform 是章节维度，不会超。
+  const pf = (p && p.platform) || {};
+  const _real = pf.total > 0;
+  const d = _real ? pf.done : (p.done || 0);
+  const t = _real ? pf.total : (p.total || 0);
+  if (!t) return 0;
+  return Math.min(100, Math.round(d / t * 100));
 }
 
 function card(it) {
   const on = it.online;
   const p = it.progress || {};
   const pct = fmtPct(p);
+  // 主数字用平台侧真实值，拿不到才退回程序自报（2026-09-29，与实例页同口径）
+  const _pf = p.platform || {};
+  const _real = _pf.total > 0;
+  const pdone = _real ? _pf.done : (p.done || 0);
+  const ptotal = _real ? _pf.total : (p.total || 0);
+  const _gap = (p.done || 0) - (_pf.done || 0);
   const cur = p.current ? (p.current.name + '  ' +
       Math.round((p.current.pos || 0) / (p.current.total || 1) * 100) + '%') : '';
   // 四态：未启动（进程不在）/ 空闲（进程在但没刷课）/ 运行中 / 已暂停
@@ -1520,6 +2996,26 @@ function card(it) {
       + 'data-inst="' + it.n + '"' + (on ? ' checked' : '')
       + '><span class="sl"></span></label>'
     : '';
+  // 🔴 2026-09-29 用户要求：**没在跑 / 已结束**的实例卡片要回归干净。
+  // 原先这类卡片还挂着上次残留的进度数字、进度条、"程序累计完成 N 个任务点"
+  // 和最后一条日志，看着跟还在跑一样（用户原话："3和5这种没有在跑的结束的，
+  // 就不要一直像这样展示。结束就结束了，回归正常就行"）。
+  // ⚠️ 不含"已暂停"：暂停说明任务还在、只是被按下暂停键，进度必须保留。
+  // 文案用中性的"暂无进行中的任务"：实测有的空闲实例其实**从没跑过**
+  // （acc4 张旭：选过课但日志里 0 条"任务完成"），写"已结束"会误导。
+  // "刷到哪了"这类信息放到**实例页**上显示（`#lastTaskTag`）。
+  const idle = on && !it.running && !it.paused;
+  const body = idle
+    ? '<div class="cur">' + (on ? '暂无进行中的任务' : '—') + '</div>'
+    : '<div class="pv"><span class="big">' + pdone
+      + '<i>/' + ptotal + '</i></span>'
+      + '<span class="tag">' + pct + '%</span></div>'
+      + '<div class="pbar"><div class="pfill" style="width:' + pct + '%"></div></div>'
+      + (_real
+          ? '<div class="hint">程序累计完成 ' + (p.done || 0) + ' 个任务点（任务点 ≠ 章节，不可直接相减）</div>'
+          : '')
+      + '<div class="cur">' + esc(cur || (on ? '暂无进行中的任务' : '—')) + '</div>'
+      + '<div class="log">' + esc(it.last_log || '暂无日志') + '</div>';
   // data-on 是"服务端说的状态"，只用于差量签名（checked 属性会被用户改，
   // 不能拿它当签名依据，否则手动切换后永远判定为"没变化"）
   return '<div class="card' + (it.risk ? ' riskcard' : '') + '" data-on="'
@@ -1527,14 +3023,9 @@ function card(it) {
     + '<div class="chead"><span class="cno">实例 ' + it.n + '</span>' + tag
     + '<span class="sp"></span><span class="cport">:' + it.port + '</span></div>'
     + '<div class="cacc">' + esc(acc) + '</div>'
-    + '<div class="pv"><span class="big">' + (p.done || 0)
-    + '<i>/' + (p.total || 0) + '</i></span>'
-    + '<span class="tag">' + pct + '%</span></div>'
-    + '<div class="pbar"><div class="pfill" style="width:' + pct + '%"></div></div>'
-    + '<div class="cur">' + esc(cur || (on ? '暂无进行中的任务' : '—')) + '</div>'
+    + body
     + hint
     + risk
-    + '<div class="log">' + esc(it.last_log || '暂无日志') + '</div>'
     + '<div class="acts"><a href="/acc/' + it.n + '/">打开该实例 →</a>'
     + sw + '</div></div>';
 }
@@ -1555,12 +3046,23 @@ async function load(silent) {
     // ⚠️ 但开关的 checked 必须每次都同步 —— innerHTML 里的 checked 只是
     // 「初始值」，用户手动拨过之后 DOM 的 checked 与实际状态会脱节，
     // 而差量重绘恰恰会跳过这次同步（实测导致开关视觉与真实状态不一致）。
-    const html = list.length ? list.map(card).join('')
-      : '<div class="empty">还没有实例。<br>点右下角的 <b>+</b> 新增第一个账号。</div>';
-    if (grid.dataset.sig !== html) {
-      grid.dataset.sig = html;
-      grid.innerHTML = html;
+  const html = list.length ? list.map(card).join('')
+    : '<div class="empty">还没有实例。<br>点右下角的 <b>+</b> 新增第一个账号。</div>';
+  if (grid.dataset.sig !== html) {
+    // 首次渲染走入场动画；之后差量重绘直接落位，避免每 5 秒重播一次
+    const first = grid.dataset.sig === undefined;
+    grid.dataset.sig = html;
+    grid.innerHTML = html;
+    grid.querySelectorAll('.card').forEach((el, i) => {
+      el.style.setProperty('--i', Math.min(i, 8));
+    });
+    if (first) {
+      grid.classList.add('enter');
+      // 入场播完就摘掉标记：否则后续 innerHTML 替换出的新卡片会再次命中动画，
+      // 在慢速重绘/切回标签页时表现为「卡片闪一下再出现」。
+      setTimeout(() => grid.classList.remove('enter'), 900);
     }
+  }
     // 无条件把每个开关同步到服务端的真实状态
     list.forEach(it => {
       const cb = grid.querySelector('.sw input[data-inst="' + it.n + '"]');
@@ -1647,7 +3149,7 @@ function bindSwitches() {
 $('btnRefresh').onclick = () => {
   const b = $('btnRefresh');
   setBusy(b, true);
-  load().finally(() => setBusy(b, false));
+  load().finally(() => { setBusy(b, false); flashDone(b, 700); });
 };
 $('btnAdd').onclick = async () => {
   if (!confirm('新增一个账号实例？\\n\\n会创建一个新的空白实例，'
@@ -1661,6 +3163,7 @@ $('btnAdd').onclick = async () => {
     if (r.ok) {
       say(r.msg + ' 建好后请到它的页面登录账号。', 'ok');
       toast(r.msg || '已创建', 'ok');
+      flashDone(b);
       setTimeout(() => load(true), 3000);
     } else {
       say(r.msg || '创建失败', 'err');
@@ -1700,7 +3203,7 @@ $('btnStagger').onclick = async () => {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({gap: 1200})}).then(r => r.json());
     say(r.msg || (r.ok ? '已开始' : '启动失败'), r.ok ? 'ok' : 'err');
-    if (r.ok) toast(r.msg || '调度已开始', 'ok');
+    if (r.ok) { toast(r.msg || '调度已开始', 'ok'); flashDone(b); }
   } catch (e) {
     say('请求失败: ' + e, 'err');
     toast('下发调度失败', 'err');

@@ -66,6 +66,9 @@ TIKU_DB = os.path.join(ROOT, "tikuAdapter", "tiku.db")
 # 题型判定要跟 api/answer.py 的 TikuAdapter._query 完全一致，否则 hash 对不上：
 #   single→0  multiple→1  completion→2  judgement→3  其它(含听力)→4
 import re
+# 🔴 2026-09-28：题库矫正（清洗 UI 污染 + 同题冲突仲裁）
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from api import tiku_fix                                              # noqa: E402
 _LISTEN_RE = re.compile(r"听力|\.mp3\b|Questions\s+\d+\s+to\s+\d+", re.I)
 _JUDGE_RE = re.compile(r"判断题")
 _FILL_RE = re.compile(r"填空题")
@@ -148,9 +151,13 @@ def collect(paths, _p=print):
             k = k.strip()
             opts = str(v.get("options") or "").strip()
             at = str(v.get("verified_at") or "")
+            # 🔴 2026-09-28：带上 wrong（该题干历史上被判错的答案）。
+            #    题库矫正（api/tiku_fix.py）用它做"库里这个答案是不是错的"仲裁。
+            wrong = list(v.get("wrong") or [])
             rec = out.get(k)
             if rec is None:
-                out[k] = {"answer": str(ans).strip(), "options": opts, "_at": at}
+                out[k] = {"answer": str(ans).strip(), "options": opts,
+                          "_at": at, "wrong": wrong}
             else:
                 # ② 冲突取新：verified_at 更新者胜；无时间戳视为最旧
                 newer = (at > rec.get("_at", "")) if (at or rec.get("_at")) else False
@@ -158,10 +165,16 @@ def collect(paths, _p=print):
                     # 保留已补到的 options（旧记录可能没有）
                     if not opts and rec.get("options"):
                         opts = rec["options"]
-                    out[k] = {"answer": str(ans).strip(), "options": opts, "_at": at}
+                    out[k] = {"answer": str(ans).strip(), "options": opts,
+                              "_at": at, "wrong": wrong}
                 elif opts and not rec.get("options"):
                     # 补上别处存到的选项
                     rec["options"] = opts
+                # wrong 取并集：判错证据来自哪个实例都算数，越多越安全
+                rec_w = rec.setdefault("wrong", [])
+                for w in wrong:
+                    if w not in rec_w:
+                        rec_w.append(w)
     for r in out.values():
         r.pop("_at", None)
     if suspect:
@@ -312,6 +325,8 @@ def sync(dry_run: bool = False, accs: str = "", quiet: bool = False):
     _p("题库现有 %d 条" % len(exist))
 
     add, skip, noopt = [], 0, []
+    meta = {}          # 🔴 2026-09-28：{题干: {"wrong": [被判错的答案文本]}}，
+                       #    供题库矫正（api/tiku_fix.decide）仲裁用
     # 2026-09-15 【统计细分】noopt 以前是个混装桶，光看数字（130+ 条）会误以为
     # 回灌出了故障。实际绝大多数是**历史遗留**：2026-09-14 之前 learned.py 根本
     # 不落 options 字段（见 api/learned.py:206 注释），这些老记录答案再对也没有
@@ -321,9 +336,14 @@ def sync(dry_run: bool = False, accs: str = "", quiet: bool = False):
     noopt_legacy = 0        # 记录里压根没有 options 字段/为空 → 历史数据
     noopt_orphan = 0        # 有 options 字段但解析不出选项 → 可疑，需查
     for q, rec in sorted(learned.items()):
-        if q in exist:
+        # 🔴 2026-09-28：**不再在这里提前 continue**。
+        #    原先"库里已有 → 直接跳过"写在最前面，这些题就永远走不到下面的
+        #    meta 收集 → 题库矫正阶段拿到的集合恒为空（真机踩到：加了矫正却
+        #    一直不输出任何统计）。改为"标记 + 继续算答案"，最后再决定
+        #    是新增还是仅矫正。
+        _already = q in exist
+        if _already:
             skip += 1
-            continue
         t = qtype_of(q)
         # 2026-09-14 【重要修正】听力题必须用空选项回灌，别被"题组带选项"迷惑：
         #   听力题(type=4)：程序发来的 q_info['options'] 会把每组小题的 A/B/C/D
@@ -363,6 +383,23 @@ def sync(dry_run: bool = False, accs: str = "", quiet: bool = False):
         if t in (0, 1) and not ans_text:
             noopt.append(q)
             continue
+        # 🔴 2026-09-28：入库前先清洗 UI 污染（"已选择/已选/已作答/已答"）。
+        #    源头已在 api/homework.py:582 修掉，这里是第二道闸门 ——
+        #    任何绕过该处的来源（旧备份恢复、别的抓取路径）都不会再污染全局库。
+        ans_text = tiku_fix.clean_answer(ans_text)
+        if not ans_text:
+            noopt.append(q)
+            continue
+        # 🔴 2026-09-28：矫正元数据必须**无条件收集**（含库里已有的题）。
+        #    answer = 本轮学到的答案文本；wrong = 该题干被判错过的答案（转文本）。
+        _w = rec.get("wrong") or []
+        meta[q] = {
+            "answer": ans_text,
+            "wrong": [letters_to_text(w, opts, t) for w in _w
+                      if letters_to_text(w, opts, t)],
+        }
+        if _already:
+            continue              # 库里已有 → 不新增，交给后续矫正阶段
         add.append((q, t, ans_text, opts))
 
     _p("-" * 70)
@@ -398,10 +435,11 @@ def sync(dry_run: bool = False, accs: str = "", quiet: bool = False):
         _stat["msg"] = "dry-run"
         return _stat
     if not add:
-        _p("\n无需新增。")
-        con.close()
-        _stat["msg"] = "无需新增"
-        return _stat
+        # 🔴 2026-09-28：**不再提前返回**。题库跑满后 add 恒为空，而"已经躺在
+        #    库里的错答案 / UI 污染"恰恰最需要矫正 —— 提前返回会让矫正永远不执行
+        #    （真机踩到：加了矫正却一直没输出，就是卡在这里）。
+        #    改为继续走完：备份 → 矫正 → 提交（插入循环自然空转）。
+        _p("\n本轮无新增题目，继续执行题库矫正。")
 
     ts = time.strftime("%Y%m%d_%H%M%S")
 
@@ -485,8 +523,42 @@ def sync(dry_run: bool = False, accs: str = "", quiet: bool = False):
              ans_json, 0, tiku_hash(q, opts, t, 0), "", ""))
         return True
 
+    def _reconcile(q, new_ans, wrong, stat, bucket):
+        """库里已有该题干 → 逐行仲裁（不新增行，只可能改 answer）。
+
+        · clean    → 库里是 UI 污染（"已选择"），清洗后与新答案一致 → UPDATE
+        · update   → 库里答案在学习库 wrong 列表里（平台判过错）→ 用新答案覆盖
+        · conflict → 无强证据 → **不改**，记入待核对清单
+        """
+        cur.execute("SELECT id, answer FROM tiku WHERE question=?", (q,))
+        for rid, raw in cur.fetchall():
+            try:
+                old = json.loads(raw)
+            except Exception:
+                old = raw
+            act, why = tiku_fix.decide(old, new_ans, wrong)
+            if act == "clean":
+                cur.execute("UPDATE tiku SET answer=? WHERE id=?",
+                            (json.dumps(tiku_fix.clean_answer(old),
+                                        ensure_ascii=False), rid))
+                stat["clean"] += 1
+                _p("  ✧ 清洗 id=%s：%s → %s"
+                   % (rid, old, tiku_fix.clean_answer(old)))
+            elif act == "update":
+                cur.execute("UPDATE tiku SET answer=? WHERE id=?",
+                            (json.dumps(new_ans, ensure_ascii=False), rid))
+                stat["update"] += 1
+                _p("  ↻ 矫正 id=%s：%s → %s（%s）" % (rid, old, new_ans, why))
+            elif act == "conflict":
+                stat["conflict"] += 1
+                bucket.append({"id": rid, "question": q, "in_db": old,
+                               "learned": new_ans, "reason": why})
+
     for q, t, ans, opts in add:
         ans_list = ans if isinstance(ans, list) else [ans]
+        # ⚠️ 矫正**不在这里**做：题库已满时 add 为空、这个循环压根不执行，
+        #    而"已经躺在库里的错答案"恰恰最需要矫正。统一放到写入段之后的
+        #    独立矫正阶段（遍历 meta ∩ exist2）。
         try:
             ok = _insert(q, t, ans_list, opts)
             if not ok:
@@ -517,6 +589,46 @@ def sync(dry_run: bool = False, accs: str = "", quiet: bool = False):
             except sqlite3.IntegrityError:
                 pass
 
+    # ---- 🔴 2026-09-28 全库污染清洗（不依赖学习库，纯文本修复）----
+    # 为什么必须独立：库里那批 `地动仪已选择` / `核糖核酸已选择` 是早期抓取
+    # bug 留下的（源头已在 api/homework.py:582 修掉），但它们在**当前学习库里
+    # 没有对应记录**（题干形态对不上），所以靠上面的矫正阶段永远碰不到。
+    # 这里直接扫全库 answer，把 UI 状态词后缀洗掉 —— 纯文本修复，零语义风险。
+    cur.execute("SELECT id, answer FROM tiku")
+    fixed_pollute = 0
+    for rid, raw in cur.fetchall():
+        try:
+            old = json.loads(raw)
+        except Exception:
+            continue
+        if tiku_fix.is_polluted(old):
+            newv = tiku_fix.clean_answer(old)
+            cur.execute("UPDATE tiku SET answer=? WHERE id=?",
+                        (json.dumps(newv, ensure_ascii=False), rid))
+            fixed_pollute += 1
+            _p("  ✧ 清洗污染 id=%s：%s → %s" % (rid, old, newv))
+    if fixed_pollute:
+        _p("全库污染清洗：%d 条" % fixed_pollute)
+
+    # ---- 🔴 2026-09-28 题库矫正阶段（独立于"本轮有无新增"）----
+    # 为什么必须独立：题库跑满后 add 恒为空，若挂在插入循环里就永远不执行；
+    # 而"已经躺在库里的错答案 / UI 污染"恰恰是最该清理的那批。
+    # 数据源 = meta（本轮学到答案的题干）∩ exist2（写前库里已有的题干）。
+    fix_stat = {"clean": 0, "update": 0, "conflict": 0}
+    fix_conflicts = []
+    _fix_n = 0
+    for q, info in meta.items():
+        if q not in exist2:
+            continue            # 本轮新插入的，无需矫正
+        _fix_n += 1
+        # ⚠️ 必须归一成 list：多选答案本身就是 list，直接 `[ans]` 会包成
+        #    嵌套列表 `[['A','B']]`，既误报冲突、又可能在覆盖时写坏库里数据。
+        _ans = info["answer"]
+        _reconcile(q, _ans if isinstance(_ans, list) else [_ans],
+                   info.get("wrong") or [], fix_stat, fix_conflicts)
+    if _fix_n:
+        _p("矫正：扫描 %d 条已存在题干" % _fix_n)
+
     try:
         con.commit()
     except sqlite3.OperationalError as e:
@@ -534,9 +646,48 @@ def sync(dry_run: bool = False, accs: str = "", quiet: bool = False):
     # 实测热写入一条新题、不重启，接口立刻就能查到（answerIndex/answerKey 均正确）。
     # TikuAdapter 每次查询都实时读 SQLite，不是启动时加载到内存。
     _p("（无需重启：TikuAdapter 每次查询实时读库，新记录立即可用）")
+
+    # ---- 🔴 2026-09-28 矫正阶段结果 ----
+    if fix_stat["clean"] or fix_stat["update"] or fix_stat["conflict"]:
+        _p("-" * 70)
+        _p("题库矫正：清洗污染 %d 条 ｜ 更正错答案 %d 条 ｜ 待人工核对 %d 条"
+           % (fix_stat["clean"], fix_stat["update"], fix_stat["conflict"]))
+    if fix_conflicts:
+        cp = os.path.join(DATA, "tiku_conflicts.json")
+        try:
+            prev = []
+            if os.path.exists(cp):
+                prev = json.load(io.open(cp, encoding="utf-8")) or []
+            seen = {(str(c.get("question")), str(c.get("in_db")),
+                     str(c.get("learned"))) for c in prev}
+            added_c = 0
+            for c in fix_conflicts:
+                key = (str(c.get("question")), str(c.get("in_db")),
+                       str(c.get("learned")))
+                if key in seen:
+                    continue
+                c["first_seen"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                prev.append(c)
+                seen.add(key)
+                added_c += 1
+            json.dump(prev, io.open(cp, "w", encoding="utf-8"),
+                      ensure_ascii=False, indent=1)
+            if added_c:
+                _p("待核对清单已更新（新增 %d 条）→ %s" % (added_c, cp))
+        except Exception as e:
+            _p("待核对清单写入失败：%s" % e)
+
     _stat.update(added=ins, bad=_bad_n,
+                 fixed_pollute=fixed_pollute,
+                 fixed_clean=fix_stat["clean"],
+                 fixed_update=fix_stat["update"],
+                 conflicts=fix_stat["conflict"],
                  msg="新增 %d 条，题库共 %d 条" % (ins, total)
-                     + ("（剔除 %d 条字母式答案）" % _bad_n if _bad_n else ""))
+                     + ("（剔除 %d 条字母式答案）" % _bad_n if _bad_n else "")
+                     + ("（清洗 %d / 更正 %d / 待核对 %d）"
+                        % (fix_stat["clean"], fix_stat["update"],
+                           fix_stat["conflict"])
+                        if any(fix_stat.values()) else ""))
     return _stat
 
 

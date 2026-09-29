@@ -466,6 +466,10 @@ class JobProcessor:
                             self.task_queue.task_done()
                         except Exception:
                             break
+                    # ⚠️ retry_queue 也必须清（2026-09-24 修，风控失效的真凶之三）：
+                    # 只清 task_queue 不够 —— retry_thread 会把 retry_queue 里的
+                    # 任务搬回主队列，等于熔断后队列又被灌满，worker 继续领活撞 403。
+                    self._retry_queue_drain()
                     break
                 if pending <= 0 and vpending <= 0:
                     break
@@ -498,6 +502,14 @@ class JobProcessor:
                 task = self.task_queue.get()
             except ShutDown:
                 logger.info("Queue shut down")
+                return
+
+            # 领到任务后再确认一次熔断标志（2026-09-24 补）：
+            # 从 get() 返回到这里存在时间窗口 —— 别的 worker 可能刚刚触发熔断，
+            # 此时手上这个任务不该再执行（执行 = 又一轮 403）。
+            if self._tripped:
+                self.task_queue.task_done()
+                self._finish_task()
                 return
 
             # 任务点处理必须整体兜底：任何未被捕获的异常（含 requests 超时、
@@ -636,8 +648,17 @@ class JobProcessor:
                 self.task_queue.task_done()
                 self._finish_task()
             elif result == StudyResult.FORBIDDEN:
-                # 403：交回主流程按普通失败重试（触发会话恢复/重播），不在此处收尾
-                self.retry_queue.put(task)
+                # 403：交回主流程按普通失败重试（触发会话恢复/重播），不在此处收尾。
+                #
+                # ⚠️ 但熔断后绝不能塞回（2026-09-24 修，风控失效的真凶之二）：
+                # 403 本身就是熔断信号，塞回 retry_queue 等于"熔断了还接着撞"。
+                # 实测这条路径与 retry_thread 的不检查叠加，让熔断后仍多打 4 轮 403。
+                if self._tripped:
+                    logger.warning("已熔断，丢弃该任务不再重试: {}", title)
+                    self.task_queue.task_done()
+                    self._finish_task()
+                else:
+                    self.retry_queue.put(task)
             else:  # ERROR / 其他
                 task.tries += 1
                 if task.tries >= self.max_tries:
@@ -657,9 +678,22 @@ class JobProcessor:
 
     @log_error
     def retry_thread(self):
+        """重试搬运线程：把 retry_queue 里的任务搬回 task_queue。
+
+        ⚠️ 必须检查 self._tripped（2026-09-24 修，风控失效的真凶之一）：
+        原来这里无条件搬运，熔断置位后仍把 403 失败的任务搬回主队列，
+        导致"已熔断"之后 worker 又从队列里领到活、继续去撞同一个 403。
+        实测 acc2 熔断 #1（11:28:42）后，11:29:34 / 11:30:34 又刷了同一个视频两遍，
+        2 分 20 秒内凑满熔断 #2 —— 熔断机制形同虚设，这本是可以避免的。
+        """
         try:
             while True:
                 task = self.retry_queue.get()
+                if self._tripped:
+                    # 已熔断：任务直接作废，不再搬回队列（也不再触发任何请求）
+                    self._finish_task()
+                    self._retry_queue_drain()
+                    continue
                 self.task_queue.put(task)
                 # task_done is not called when a task failed and needs to be retried so if is reinserted into the queue,
                 # the task num will increase by one and become more than the real task number
@@ -667,6 +701,15 @@ class JobProcessor:
                 time.sleep(self.retry_interval)
         except ShutDown:
             pass
+
+    def _retry_queue_drain(self):
+        """清空重试队列（熔断时调用），防止残留任务在熔断后被搬运回主队列。"""
+        while not self.retry_queue.empty():
+            try:
+                self.retry_queue.get_nowait()
+                self._finish_task()
+            except Exception:
+                break
 
 
 def process_chapter(chaoxing: Chaoxing, course: dict[str, Any], point: dict[str, Any], speed: float,
