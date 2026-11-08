@@ -80,4 +80,17 @@ def _should_log_file() -> bool:
 if _should_log_file():
     # delay=True：日志文件延迟到首条记录才创建，且不长期hold句柄，
     # 降低与其它进程/轮转发生 Windows 句柄冲突的概率。
-    logger.add(_log_file(), rotation="10 MB", level="TRACE", delay=True)
+    #
+    # 🔴 2026-10-08 加 retention + compression
+    #   （何同学："监测一下学习通那边的，看一看这么长的日志有没有暴露什么问题"）
+    #   原配置**只轮转、从不清理** ⇒ 实测 22.3 天累积 **2.23 GB / 247 个文件**
+    #   （acc1 单账号 55 个轮转文件、526 MB），按当前速率约 **102 MB/天**、
+    #   一年约 37 GB。而日志正文里 **TRACE 占 41.7% + HTML 续行占 30.7%**，
+    #   WARNING/ERROR 合计只有 **1.1%** —— 越是膨胀，越难排查（本次就曾把
+    #   "被 TRACE 淹没"误判成"实例卡住"）。
+    #   现改为：保留 7 天（足够回溯近期问题）+ 轮转文件 zip 压缩
+    #   （日志正文重复度高，压缩率可观）。
+    #   ⚠️ 7 天是折中值：既控总量又不丢排查窗口；需要更早的日志把数字调大即可，
+    #      已存在的旧文件不会被追溯删除（retention 只在轮转时清理）。
+    logger.add(_log_file(), rotation="10 MB", retention="7 days",
+               compression="zip", level="TRACE", delay=True)

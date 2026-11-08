@@ -31,9 +31,15 @@ def check_single(answer):
     if not text:
         return False
 
-    # 单选答案文本中常见逗号（中英文）是句内标点，不应据此判定为多选。
+    # 单选答案文本中常见逗号（中英文）、顿号是句内标点，不应据此判定为多选。
+    # 顿号在并列式选项/答案文本中极常见（如"坚持独立负责、不参与国际组织的活动"），
+    # 若视为分隔符会误杀正确答案；"A、B"式多选答案即使漏过，下游匹配失败也会兜底随机。
     # 仅在出现明显“多段答案”分隔符时，才判定为非单选。
-    strong_delimiters = ["\n", "|", "#", "\t", "\r", "、"]
+    #
+    # 🔴 2026-10-08 移植上游 PR #631（open，2026-09-28）：
+    #   原 `strong_delimiters` 含 `、`，会把含顿号的**单选**答案误判为多选 ⇒
+    #   转入多选分支 ⇒ 正确答案被丢弃、改为随机作答。移除 `、`。
+    strong_delimiters = ["\n", "|", "#", "\t", "\r"]
     for sep in strong_delimiters:
         parts = [p.strip() for p in text.split(sep) if p.strip()]
         if len(parts) > 1:

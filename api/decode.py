@@ -15,6 +15,25 @@ from api.font_decoder import FontDecoder
 from api.logger import logger
 
 
+# ---------------------------------------------------------------------------
+# 🔴 2026-10-07 移植上游 PR #630（ieduer, 2026-09-27）的正则常量
+#    仅为「新增」用途，不改变任何既有解析分支的行为。
+# ---------------------------------------------------------------------------
+
+# 课程页顶部的任务点总进度，例如：
+#   已完成任务点: <span style="color:#00B368">74</span>/74
+# 纯文本形式「已完成任务点：3 / 10」也能匹配。
+_JOB_PROGRESS_RE = re.compile(
+    r"已完成任务点\s*[:：]\s*(?:<[^>]*>\s*)*(\d+)\s*(?:<[^>]*>\s*)*/\s*(\d+)")
+
+# 任务点页面里 mArg 被真正填充（后面跟 `{`）—— 该 num 存在对应标签页。
+_MARG_RE = re.compile(r"mArg\s*=\s*\{")
+
+# num 超出标签页数量时，页面模板里的 mArg **未被填充**（`mArg = $mArg`）。
+# 这是比「连续 N 次取不到卡」更精确的「到头」判据（上游 PR #630 方案）。
+_NO_CARD_RE = re.compile(r"mArg\s*=\s*\$mArg\b")
+
+
 def decode_course_list(html_text: str) -> List[Dict[str, str]]:
     """
     解析课程列表页面，提取课程信息
@@ -82,87 +101,133 @@ def decode_course_folder(html_text: str) -> List[Dict[str, str]]:
 def decode_course_point(html_text: str) -> Dict[str, Any]:
     """
     解析章节列表页面，提取章节点信息
-    
+
     Args:
         html_text: 章节列表页面的HTML内容
-        
+
     Returns:
-        章节信息字典，包含是否锁定状态和章节点列表
+        章节信息字典，包含是否锁定状态、章节点列表，
+        以及页面顶部「已完成任务点: 完成数/总数」（jobProgress，页面无此信息时为 None）
+
+    🔴 2026-10-07 移植上游 PR #630（ieduer）：新增 `jobProgress`。
+       这是**平台自己算的权威口径**，直接从课程页 HTML 正则提取，
+       不需要 playwright 打开浏览器 —— 比 `has_finished` 逐节点计数可信，
+       也比 playwright 方案快且稳。
+
+       实测（acc10 生态文明建设）：`jobProgress = {done:74, total:74}`，
+       与节点级黄点口径（0 黄点）完全吻合；而 API 口径曾误报过。
     """
     logger.trace("开始解码章节列表...")
     soup = BeautifulSoup(html_text, "lxml")
     course_point = {
         "hasLocked": False,  # 用于判断该课程任务是否是需要解锁
         "points": [],
+        "jobProgress": None,  # 👈 新增：页面顶部「已完成任务点 X/Y」
     }
 
-    for chapter_unit in soup.find_all("div", class_="chapter_unit"):
-        points = _extract_points_from_chapter(chapter_unit)
-        # 检查是否有锁定内容
-        for point in points:
-            if point.get("need_unlock", False):
-                course_point["hasLocked"] = True
+    # 👇 移植 PR #630：课程页顶部的任务点总进度（权威口径）
+    m_prog = _JOB_PROGRESS_RE.search(html_text)
+    if m_prog:
+        try:
+            _d, _t = int(m_prog.group(1)), int(m_prog.group(2))
+            if 0 <= _d <= _t:
+                course_point["jobProgress"] = {"done": _d, "total": _t}
+        except (TypeError, ValueError):
+            pass
 
-        course_point["points"].extend(points)
+    # 🔴 2026-10-03（第三处漏刷根因）：原实现只扫
+    #   `div.chapter_unit` → `li` → `li.div`，
+    #   但平台对**深层嵌套（第 7 级）**的节点会把 `<div class="chapter_item">`
+    #   直接放进 `<ul>`（**不在任何 `<li>` 内**）⇒ 这些节点被**整个漏解析**，
+    #   程序压根不知道它们存在 ⇒ 永远不刷 ⇒ 平台一直显示黄点。
+    #
+    #   实测（acc2 安全人机工程 266313880）：
+    #     · 真实 HTML 里 `div.chapter_item` 共 **124** 个，老逻辑只解析出 **123**
+    #     · 漏的正是「能力与安全生产的关系」(id=1258439571)，
+    #       平台给它标的是「**2个待完成任务点**」
+    #     · 该课程平台口径「已完成任务点 150/168」，差的 18 个 = 15 个未完成节点
+    #       （12 个 yi=1 + 3 个 yi=2），其中就含这个被漏掉的节点
+    #
+    #   改为直接遍历所有 `div.chapter_item[id^=cur]`（保持文档顺序），不再依赖 li。
+    seen = set()
+    for div in soup.find_all("div", class_="chapter_item"):
+        m = re.findall(r"^cur(\d{1,20})$", div.attrs.get("id") or "")
+        if not m or m[0] in seen:
+            continue
+        seen.add(m[0])
+        point = _parse_point_div(div)
+        if point is None:
+            continue
+        if point.get("need_unlock", False):
+            course_point["hasLocked"] = True
+        course_point["points"].append(point)
 
     return course_point
+
+
+def _parse_point_div(point) -> Optional[Dict[str, Any]]:
+    """从单个 `div.chapter_item` 解析出节点信息。"""
+    try:
+        point_id = re.findall(r"^cur(\d{1,20})$", point.attrs["id"])[0]
+    except (KeyError, IndexError, TypeError):
+        return None
+
+    title_el = point.select_one("a.clicktitle")
+    point_title = title_el.text.replace("\n", "").strip() if title_el else ""
+
+    # 提取任务数量
+    job_count = 1  # 默认为1
+    need_unlock = False
+    jc_el = point.select_one("input.knowledgeJobCount")
+    tips_el = point.select_one("span.bntHoverTips")
+    if jc_el:
+        job_count = jc_el.attrs["value"]
+    elif tips_el and "解锁" in tips_el.text:
+        need_unlock = True
+
+    # 判断是否已完成
+    is_finished = bool(tips_el and "已完成" in tips_el.text)
+
+    return {
+        "id": point_id,
+        "title": point_title,
+        "jobCount": job_count,
+        "has_finished": is_finished,
+        "need_unlock": need_unlock,
+    }
 
 
 def _extract_points_from_chapter(chapter_unit) -> List[Dict[str, Any]]:
     """
     从章节单元中提取章节点信息
-    
-    Args:
-        chapter_unit: BeautifulSoup对象，表示一个章节单元
-        
-    Returns:
-        章节点信息列表
+
+    ⚠️ 2026-10-03：本函数**已不是主路径**（`decode_course_point` 改为直接遍历
+    所有 `div.chapter_item`，因为平台会把深层节点裸放在 `<ul>` 里，不在 `li` 内）。
+    这里保留只是兼容旧调用，逻辑统一委托给 `_parse_point_div`。
     """
     point_list = []
-    raw_points = chapter_unit.find_all("li")
-
-    for raw_point in raw_points:
+    for raw_point in chapter_unit.find_all("li"):
         point = raw_point.div
-        if "id" not in point.attrs:
+        if point is None or "id" not in point.attrs:
             continue
-
-        point_id = re.findall(r"^cur(\d{1,20})$", point.attrs["id"])[0]
-        point_title = point.select_one("a.clicktitle").text.replace("\n", "").strip()
-
-        # 提取任务数量
-        job_count = 1  # 默认为1
-        need_unlock = False
-        if point.select_one("input.knowledgeJobCount"):
-            job_count = point.select_one("input.knowledgeJobCount").attrs["value"]
-        elif point.select_one("span.bntHoverTips") and "解锁" in point.select_one("span.bntHoverTips").text:
-            need_unlock = True
-
-        # 判断是否已完成
-        is_finished = False
-        if point.select_one("span.bntHoverTips") and "已完成" in point.select_one("span.bntHoverTips").text:
-            is_finished = True
-
-        point_detail = {
-            "id": point_id,
-            "title": point_title,
-            "jobCount": job_count,
-            "has_finished": is_finished,
-            "need_unlock": need_unlock
-        }
-        point_list.append(point_detail)
-
+        detail = _parse_point_div(point)
+        if detail:
+            point_list.append(detail)
     return point_list
 
 
-def decode_course_card(html_text: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+def decode_course_card(html_text: str,
+                       keep_passed_task: bool = False) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
     解析任务点列表页面，提取任务点信息
-    
+
     Args:
         html_text: 任务点列表页面的HTML内容
-        
+        keep_passed_task: 放行「isPassed=true 且 job=True」的真任务点（见 get_job_list）
+
     Returns:
-        任务点列表和任务信息的元组
+        任务点列表和任务信息的元组；
+        该 num **没有对应标签页**时，任务信息为 `{"noCard": True}`（移植上游 PR #630）
     """
     logger.trace("开始解码任务点列表...")
 
@@ -173,12 +238,21 @@ def decode_course_card(html_text: str) -> Tuple[List[Dict[str, Any]], Dict[str, 
     # 提取mArg参数
     temp = re.findall(r"mArg=\{(.*?)\};", html_text.replace(" ", ""))
     if not temp:
+        # 🔴 2026-10-07 移植上游 PR #630（ieduer）：
+        #   请求的 num **超出该章节的标签页数量**时，页面模板里的 mArg 不会被填充
+        #   （HTML 里留着 `mArg = $mArg`）。据此可**单次**判定"页签到头"，
+        #   比"连续 N 次取不到原始卡"更精确、更早停。
+        #   ⚠️ 纯新增字段：原有调用方不看 noCard 时行为完全不变。
+        if _NO_CARD_RE.search(html_text):
+            return [], {"noCard": True}
         return [], {}
 
     # 解析JSON数据
     cards_data = json.loads("{" + temp[0] + "}")
 
     if not cards_data:
+        if _NO_CARD_RE.search(html_text):
+            return [], {"noCard": True}
         return [], {}
 
     # 提取任务信息
@@ -186,7 +260,13 @@ def decode_course_card(html_text: str) -> Tuple[List[Dict[str, Any]], Dict[str, 
 
     # 处理所有附件任务
     cards = cards_data.get("attachments", [])
-    job_list = _process_attachment_cards(cards)
+    job_list = _process_attachment_cards(cards, keep_passed_task=keep_passed_task)
+
+    # 🔴 2026-10-03：暴露**原始卡片数**给调用方。`get_job_list` 要靠它判断
+    #   "这一页是不是真的没有内容" —— 不能看 job_list：已完成的卡
+    #   (isPassed=True) 会被 `_process_attachment_cards` 正常过滤掉，
+    #   "过滤后为空" ≠ "页面无卡"，两者混用会导致分页提前退出（见 base.py 说明）。
+    job_info["raw_cards"] = len(cards)
 
     return job_list, job_info
 
@@ -217,30 +297,77 @@ def _extract_job_info(cards_data: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _process_attachment_cards(cards: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _job_id(card: Dict[str, Any]) -> str:
+    """任务 ID：**新版卡片把它放在 `property._jobid`**，老版才在顶层 `jobid`。
+
+    🔴 2026-10-04 实测（acc4 复核报告"存在任务点但无可执行任务"的 18 个节点）：
+      · `video` 卡：顶层无 `jobid`，`property._jobid = 1643085307957198`
+      · `read`  卡：顶层无 `jobid`，`property._jobid = read-218073146`
+      · `vote`  卡：顶层无 `jobid`，`property._jobid = 1643103724147499`
+    只取顶层会让这些任务的 jobid 变成空串 → 后续上报没有 ID 可用。
+    """
+    return str(card.get("jobid") or (card.get("property") or {}).get("_jobid") or "")
+
+
+def _process_attachment_cards(cards: List[Dict[str, Any]],
+                              keep_passed_task: bool = False) -> List[Dict[str, Any]]:
     """
     处理所有附件任务卡片，强化直播任务识别逻辑
-    
+
     Args:
-        cards: 附件任务卡片列表
-        
-    Returns:
-        处理后的任务列表
+        cards: 附件卡片列表
+        keep_passed_task: 为 True 时，**放行「isPassed=true 且 job=True」的真任务点**。
+            见 `get_job_list` 的说明 —— 节点被平台标为未完成时，卡上的 isPassed 不可信。
     """
     job_list = []
+    # 📌 2026-10-04 19:5x 试验结论（保留备查）：
+    #   曾在此计算「本节点卡片是否全部 isPassed=true」，并对这类 job 打
+    #   `forced_redo` 标记，让 `base.study_video` 跳过「瞬间完成」、改为
+    #   重置进度真实重播 —— 目的是修 acc4 劳动教育那 11 个「平台标未完成、
+    #   卡内却全部 isPassed=true」的黄点。
+    #   **实测无效**：11 个节点全部真实重播且"任务完成"，平台 `has_finished`
+    #   一个都没变。连同 isdrag=4×20 次、isdrag=3 满进度在內，
+    #   共 3 种上报姿势全部无效 ⇒ 属**平台侧数据不一致**
+    #   （页面汇总 41/41 已满，平台自己也不算它们缺）。
+    #   ⇒ 已回退，不再对这类节点做特殊处理。
 
     for index, card in enumerate(cards):
         # 跳过已通过的任务
         if card.get("isPassed", False):
-            continue
+            # 🔴 2026-10-03（何同学："不要没完成全部就结束了"）：
+            #   节点已被平台标为「未完成」时，卡上的 `isPassed=true` **不可信** ——
+            #   实测 acc2 安全人机工程 15 个节点：节点内的卡全部 `isPassed=true`、
+            #   播放进度 90~100%，但平台仍标「N个待完成任务点」（页面口径 151/168），
+            #   程序据此整章跳过 ⇒ 这些节点**永远刷不掉**。
+            #
+            # 🔴 2026-10-04 补（同一坑的第二层）：原来的放行条件写成
+            #   `keep_passed_task and card.get("job")` —— 要求卡上有 `job`。
+            #   但实测 acc1「舞台人生 / 人文地理(上)」那 51 个未完成节点全是
+            #     `type=video, job=None, isPassed=True, property._jobid=1556...`
+            #   （顶层 job / jobid 都没有）⇒ 只按 `job` 判会把它们**继续挡在外面**，
+            #   节点永远刷不掉。改为：**卡上有真实任务 ID 就放行**
+            #   （`jobid` 或 `property._jobid` 任一存在）。
+            _real_id = card.get("jobid") or (card.get("property") or {}).get("_jobid")
+            if not (keep_passed_task and _real_id):
+                continue
 
-        # 处理无job字段的特殊任务
+        # 处理无 job 字段的卡片
+        # 🔴 2026-10-04 真机取证后**改回**"识别不出 read 就继续走 type 分支"：
+        #   10-03 曾以"影响面为 0"为由回退过一次，但那次抽样的 60 个节点**只覆盖了
+        #   `video/workid` 两类**，恰好漏掉了下面这些 —— 它们全是 `job=None`：
+        #     · `大学生劳动教育 7.1.1 [大国工匠]顾秋亮`  type=video  job=None（正常视频！）
+        #     · `大学生劳动教育 9.1 调查问卷`           type=vote   job=None
+        #     · `舞台人生 9.1 阅读` / `植物导读 11.1 阅读` / `英语四级 5.1 拓展学习`
+        #                                              type=read   job=None
+        #   这些节点的 `jobCount=1`、平台标「未完成」，卡也确有内容 ——
+        #   ⇒ **`job` 字段不是可靠的任务点判据**，可靠的是 `property._jobid`。
+        #   继续丢弃它们的后果：节点永远刷不掉，且日志只剩"存在任务点但无可执行任务"。
         if card.get("job") is None:
-            # 尝试识别阅读任务
             read_job = _process_read_task(card)
             if read_job:
                 job_list.append(read_job)
-            continue
+                continue
+            # 识别不出 read：**继续往下走 type 分支**，不再丢弃
 
         # 一开始就把超星api的屎山处理掉，不要用一个屎山行为掩盖另一个屎山 (指根据otherInfo中是否有courseId决定url拼接方式😂)
         # 清理otherInfo字段中的无效参数，这里优化了一下(保留了作者原来的注释TAT）
@@ -284,6 +411,14 @@ def _process_attachment_cards(cards: List[Dict[str, Any]]) -> List[Dict[str, Any
             work_job = _process_work_task(card)
             if work_job:
                 job_list.append(work_job)
+        elif card_type == "vote":
+            # 🔴 2026-10-04：调查问卷（`type=vote` / `module=insertvote`）。
+            #   实测它**确实是任务点**（有 `property._jobid=1643103724147499`，
+            #   节点 `jobCount=1`），但项目**没有提交问卷的实现**。
+            #   这里只识别并如实记日志 —— **不假装完成**（与"没做完不许报成功"一致）。
+            logger.info("识别到调查问卷任务 jobid=%s title=%s"
+                        " —— 暂无自动作答实现，跳过（节点会保持未完成）"
+                        % (_job_id(card), (card.get("property") or {}).get("title", "")))
         else:
             logger.warning(f"Unknown card type: {card_type}")
             logger.warning(card)
@@ -297,7 +432,7 @@ def _process_live_task(card: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         property_data = card.get("property", {})
         return {
             "type": "live",
-            "jobid": card.get("jobid", str(card.get("id", ""))),  # 兼容不同格式的任务ID
+            "jobid": _job_id(card) or str(card.get("id", "")),  # 兼容不同格式的任务ID
             "name": property_data.get("title", property_data.get("name", "未知直播")),
             "otherinfo": card.get("otherInfo", ""),
             "property": property_data,  # 保留完整属性用于后续处理
@@ -314,15 +449,20 @@ def _process_live_task(card: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 def _process_read_task(card: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """处理阅读类型任务"""
-    if not (card.get("type") == "read" and not card.get("property", {}).get("read", False)):
+    """处理阅读类型任务。
+
+    🔴 2026-10-04：原条件要求 `not property.read` —— 但真机取证的阅读任务卡
+    **恰恰是 `property.read = true`**（`module=insertreadV2`，`_jobid=read-218073146`），
+    于是全被 `return None` 丢掉。现只按 `type == "read"` 判定。
+    """
+    if card.get("type") != "read":
         return None
 
     return {
         "title": card.get("property", {}).get("title", ""),
         "type": "read",
         "id": card.get("property", {}).get("id", ""),
-        "jobid": card.get("jobid", ""),
+        "jobid": _job_id(card),
         "jtoken": card.get("jtoken", ""),
         "mid": card.get("mid", ""),
         "otherinfo": card.get("otherInfo", ""),
@@ -336,7 +476,7 @@ def _process_video_task(card: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     try:
         return {
             "type": "video",
-            "jobid": card.get("jobid", ""),
+            "jobid": _job_id(card),
             "name": card.get("property", {}).get("name", ""),
             "otherinfo": card.get("otherInfo", ""),
             "mid": card["mid"],  # 必须字段，如果不存在会抛出异常
@@ -357,7 +497,7 @@ def _process_document_task(card: Dict[str, Any]) -> Dict[str, Any]:
     """处理文档类型任务"""
     return {
         "type": "document",
-        "jobid": card.get("jobid", ""),
+        "jobid": _job_id(card),
         "otherinfo": card.get("otherInfo", ""),
         "jtoken": card.get("jtoken", ""),
         "mid": card.get("mid", ""),
@@ -371,7 +511,7 @@ def _process_work_task(card: Dict[str, Any]) -> Dict[str, Any]:
     """处理作业类型任务"""
     return {
         "type": "workid",
-        "jobid": card.get("jobid", ""),
+        "jobid": _job_id(card),
         "otherinfo": card.get("otherInfo", ""),
         "mid": card.get("mid", ""),
         "enc": card.get("enc", ""),

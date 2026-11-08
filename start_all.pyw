@@ -59,6 +59,72 @@ def existing_count() -> int:
     return max(3, max(names) if names else 0)
 
 
+def start_tiku() -> bool:
+    """拉起题库适配器（独立 Go 程序，端口 8060）。
+
+    为什么要在这里再兜一道：桌面启动器 `超星刷课.vbs` 也会尝试拉起它，
+    但那边是 `sh.Run ... , 0, False` —— **发完就走，不校验结果、不记日志**。
+    实测出现过"vbs 判断通过、但 8060 实际没起来"的情况，结果整批答题
+    退化成纯 AI（正确率降、额度空烧），事后只能靠端口探测才发现。
+    这里补上**轮询确认 + 落日志**：起不来时至少留得下证据，并弹窗告知。
+    """
+    port = int(os.environ.get("CK_TIKU_PORT") or 8060)
+    if port_alive(port):
+        print(f"题库适配器已在运行（{port}）")
+        return True
+    exe_dir = os.path.join(os.path.dirname(BASE), "tikuAdapter")
+    exe = os.path.join(exe_dir, "tikuAdapter.exe")
+    if not os.path.exists(exe):
+        print("未找到题库适配器 tikuAdapter.exe，跳过")
+        return False
+    log = os.path.join(exe_dir, "run.log")
+    try:
+        with open(log, "ab") as f:
+            f.write(("\n===== %s start =====\n"
+                     % time.strftime("%Y-%m-%d %H:%M:%S")).encode("utf-8"))
+            subprocess.Popen(
+                [exe], cwd=exe_dir, stdout=f, stderr=f,
+                # ⚠️ 只用 CREATE_NO_WINDOW：DETACHED_PROCESS 会让控制台程序
+                # （tikuAdapter.exe 是 Go 控制台程序）新建一个**可见的空白窗口**。
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                close_fds=True)
+    except Exception as e:
+        print(f"题库适配器启动失败：{e}")
+        return False
+    # 冷启动（尤其刚开机）可能较慢，给 20 秒
+    for _ in range(40):
+        if port_alive(port):
+            print(f"题库适配器已就绪（{port}）")
+            return True
+        time.sleep(0.5)
+    print(f"题库适配器启动超时（{port}）")
+    return False
+
+
+def start_tiku_guard() -> None:
+    """拉起题库守护（常驻，8060 掉线自动拉起）。
+
+    何同学 2026-10-02 明确要求：「纯 AI 的肯定不行，必须要有题库」。
+    8060 若**中途**静默挂掉，答题会退化成纯 AI 且页面上看不出异常，
+    所以需要常驻守护兜底 —— `start_tiku()` 只负责"启动这一次"，
+    管不了"之后又掉了"。守护自身做单例，重复调用无害。
+    """
+    script = os.path.join(BASE, "_tiku_guard.py")
+    if not os.path.exists(script):
+        print("未找到题库守护脚本，跳过")
+        return
+    try:
+        subprocess.Popen(
+            [sys.executable, script], cwd=BASE,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                          | getattr(subprocess, "DETACHED_PROCESS", 0),
+            close_fds=True)
+        print("题库守护已启动（8060 掉线会自动拉起）")
+    except Exception as e:
+        print(f"题库守护启动失败：{e}")
+
+
 def start_weiban() -> bool:
     """拉起安全微伴控制台（**独立进程**，端口 5011）。
 
@@ -104,6 +170,11 @@ def main():
     if env_count and env_count.isdigit():
         count = max(count, int(env_count))
     print(f"将启动 {count} 个实例")
+    # 题库适配器必须最先就绪：实例起来后立刻会答题，8060 不在线会让整批题
+    # 退化成纯 AI。桌面启动器虽也尝试拉起它，但那一步不校验结果，这里兜底。
+    tiku_ok = start_tiku()
+    # 题库守护：只管"之后又掉了"的情况（start_tiku 只负责这一次）
+    start_tiku_guard()
     # 安全微伴与学习通完全独立，先把它拉起来（起不来也不影响下面的流程）
     start_weiban()
     sys.argv = ["start_multi.py", str(count)]
@@ -135,6 +206,16 @@ def main():
                f"可以手动打开：{url}\n"
                f"若仍打不开，多半是端口被占用，请重启电脑后再试。",
                True)
+
+    # 4) 题库兜底仍失败时必须让用户知道 —— 否则答题会静默退化成纯 AI
+    if not tiku_ok and not port_alive(int(os.environ.get("CK_TIKU_PORT") or 8060)):
+        notify("题库适配器未就绪",
+               "实例已启动，但题库适配器（8060）没起来。\n\n"
+               "此时答题会退化成纯 AI：正确率下降、AI 额度消耗加快。\n\n"
+               "可手动双击：\n"
+               "    tikuAdapter\\hidden_start.vbs\n"
+               "然后刷新控制台页面。\n\n"
+               "（排查线索见 tikuAdapter\\run.log）", True)
 
 
 if __name__ == "__main__":

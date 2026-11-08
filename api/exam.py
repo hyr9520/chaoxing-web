@@ -94,7 +94,8 @@ import secrets
 import logging
 from math import floor
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlencode
+from urllib.parse import urlencode, unquote
+import html as _html
 
 from bs4 import BeautifulSoup
 
@@ -117,6 +118,145 @@ API_EXAM_START = "https://mooc1-api.chaoxing.com/exam-ans/exam/phone/start"
 API_EXAM_ANSWER_SHEET = "https://mooc1-api.chaoxing.com/exam-ans/exam/phone/loadAnswerStatic"
 API_EXAM_SUBMIT = "https://mooc1.chaoxing.com/exam-ans/exam/test/reVersionSubmitTestNew"
 PAGE_EXAM_LIST_PHONE = "https://mooc1-api.chaoxing.com/exam/phone/task-list"
+
+# ── 重做 / 查看答案（2026-11-07 新增，真机验证）─────────────────────
+PAGE_EXAM_RETEST = "https://mooc1.chaoxing.com/exam-ans/exam/test/reVersionReTest"
+PAGE_EXAM_LOOK = "https://mooc1.chaoxing.com/exam-ans/exam/test/look"
+PAGE_PAPER_DETAIL = ("https://mooc1.chaoxing.com/exam-ans/exam/test/"
+                     "reVersionPaperMarkContentNew")
+PAGE_MYCOURSE_TRANSFER = "https://mooc1.chaoxing.com/exam-ans/mycourse/transfer"
+
+
+def set_retest(session, course: Dict[str, Any], exam: Dict[str, Any]) -> Dict[str, Any]:
+    """设置重考（等价页面上那个「重考」按钮）。
+
+    链路来自 `stu-exam-list.js::toSetReTest`（2026-11-07 反解 + 真机验证）：
+        GET /exam/test/reVersionReTest?courseId=&classId=&tId={paperId}&id={relationId}&p=1&tag=1
+        → {"msg":"重考成功" | "已是待解答状态！", "status":true}
+
+    注意 `id` 用的是 **testUserRelationId**（考试列表里的 relation_id），
+    不是 exam_id —— 传错会返回 status:false。
+    """
+    cid = str(course.get("courseId") or "")
+    cls = str(course.get("clazzId") or course.get("classId") or "")
+    pid = str(exam.get("test_paper_id") or exam.get("paper_id")
+              or exam.get("exam_id") or "")
+    rid = str(exam.get("test_user_relation_id") or exam.get("relation_id") or "")
+    if not (cid and cls and pid and rid):
+        return {"ok": False,
+                "msg": f"缺少参数 courseId={cid} classId={cls} "
+                       f"paperId={pid} relationId={rid}"}
+    try:
+        r = session.get(PAGE_EXAM_RETEST, timeout=25,
+                        params={"courseId": cid, "classId": cls, "tId": pid,
+                                "id": rid, "p": 1, "tag": 1})
+        data = json.loads(r.text) if r.text.strip().startswith("{") else {}
+    except Exception as e:                                       # noqa: BLE001
+        return {"ok": False, "msg": f"请求失败：{type(e).__name__}: {e}"}
+    return {"ok": bool(data.get("status")),
+            "msg": data.get("msg") or f"HTTP {r.status_code}", "raw": data}
+
+
+def parse_answer_page(body: str) -> List[Dict[str, Any]]:
+    """解析「试卷详情」HTML → [{title,type,options,right,mine}]。
+
+    页面结构（2026-11-06 真机）：
+      <div class="questionLi" data="{qid}">
+        <h3 class="mark_name">1. <span>(单选题, 0.5 分)</span>
+            <span class="qtContent">题干</span></h3>
+        <ul class="mark_letter qtDetail"><li>A. 选项</li>...</ul>
+        <div class="mark_key"> 我的答案:<span class="stuAnswerContent">D</span>
+                               正确答案:<span class="rightAnswerContent">D</span>
+
+    ⚠️ B1/B2/C 型题（共用备选答案）的 `rightAnswerContent` 在平台上**本来就是空的**
+       （老师没设标准答案）⇒ 这里如实返回空串，**不猜**。
+    """
+    out: List[Dict[str, Any]] = []
+    blocks = re.split(r'<div class="marBom60 questionLi[^"]*"[^>]*data="(\d+)"', body)
+    for i in range(1, len(blocks) - 1, 2):
+        seg = blocks[i + 1]
+        m_type = re.search(r"\((单选题|多选题|判断题|填空题|简答题|名词解释|论述题|计算题)"
+                           r"[,，]\s*([\d.]+)\s*分\)", seg)
+        qtype = m_type.group(1) if m_type else ""
+        m_q = re.search(r'class="qtContent">([\s\S]*?)</span>', seg)
+        title = _clean_text(m_q.group(1)) if m_q else ""
+        if not title:
+            continue
+        opts: List[Dict[str, str]] = []
+        m_list = re.search(r'class="mark_letter[^"]*"[^>]*>([\s\S]*?)</ul>', seg)
+        if m_list:
+            for li in re.findall(r"<li[^>]*>([\s\S]*?)</li>", m_list.group(1)):
+                t = _clean_text(li)
+                if not t:
+                    continue
+                lm = re.match(r"^([A-Z])[.、\s]\s*(.+)$", t)
+                opts.append({"letter": lm.group(1), "text": lm.group(2).strip()}
+                            if lm else {"letter": "", "text": t})
+        m_r = re.search(r'class="rightAnswerContent"[^>]*>([\s\S]*?)</span>', seg)
+        m_m = re.search(r'class="stuAnswerContent"[^>]*>([\s\S]*?)</span>', seg)
+        out.append({
+            "title": title, "type": qtype, "options": opts,
+            "right": _clean_text(m_r.group(1)) if m_r else "",
+            "mine": _clean_text(m_m.group(1)) if m_m else "",
+        })
+    return out
+
+
+def _clean_text(s: str) -> str:
+    """去标签 + 实体还原 + 空白压缩（页面里 <br>/&nbsp; 很多）。"""
+    s = re.sub(r"<[^>]+>", "", s or "")
+    s = _html.unescape(s).replace("\xa0", " ")
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def fetch_exam_answer_page(session, course: Dict[str, Any],
+                           exam: Dict[str, Any]) -> Dict[str, Any]:
+    """取「试卷详情」页 HTML（含每题**正确答案**）。
+
+    ⚠️ **安全边界**：只有平台**允许查看答案**时才有东西可提取。
+       不允许查看的考试，这一步拿到的会是空壳页 ⇒ 直接返回 ok=False，
+       **绝不做任何猜测或反推**。
+
+    链路（2026-11-06 真机验证，三步缺一不可）：
+      1) `/exam/test/look?...&examId=&examAnswerId={relationId}&cpi=` → 交卷成功页
+      2) 从该页取「查看试卷详情」的 `refer` 参数（指向 reVersionPaperMarkContentNew）
+      3) **必须**走 `/mycourse/transfer?refer=<urlencoded>`；
+         直连 refer 目标只有 803 字节壳页，走 transfer 才拿到 777KB 完整页。
+
+    Returns: {"ok": bool, "html": str, "msg": str, "question_count": int}
+    """
+    cid = str(course.get("courseId") or "")
+    cls = str(course.get("clazzId") or course.get("classId") or "")
+    cpi = str(course.get("cpi") or "")
+    eid = str(exam.get("test_paper_id") or exam.get("paper_id")
+              or exam.get("exam_id") or "")
+    rid = str(exam.get("test_user_relation_id") or exam.get("relation_id") or "")
+    if not (cid and cls and eid and rid):
+        return {"ok": False, "html": "", "msg": "缺少 courseId/classId/examId/relationId",
+                "question_count": 0}
+    try:
+        # ① 交卷成功页
+        r1 = session.get(PAGE_EXAM_LOOK, timeout=25,
+                         params={"courseId": cid, "classId": cls, "examId": eid,
+                                 "examAnswerId": rid, "cpi": cpi})
+        page = r1.text
+        m = re.search(r'refer=([^"&\']*reVersionPaperMarkContentNew[^"\']*)', page)
+        if not m:
+            return {"ok": False, "html": "", "question_count": 0,
+                    "msg": "该考试不提供答案查看（页面无「查看试卷详情」入口）"}
+        refer = unquote(_html.unescape(m.group(1)))
+        # ② 走 transfer
+        r2 = session.get(PAGE_MYCOURSE_TRANSFER, timeout=30, params={
+            "moocId": cid, "clazzid": cls, "ut": "s", "refer": refer})
+        body = r2.text
+    except Exception as e:                                       # noqa: BLE001
+        return {"ok": False, "html": "", "question_count": 0,
+                "msg": f"请求失败：{type(e).__name__}: {e}"}
+    cnt = body.count('class="rightAnswerContent"')
+    if cnt == 0:
+        return {"ok": False, "html": "", "question_count": 0,
+                "msg": "答案页未包含正确答案（可能不允许查看或已过期）"}
+    return {"ok": True, "html": body, "msg": "", "question_count": cnt}
 
 # 手机端 UA（超星 App）——考试链路必须带，否则被判 PC 环境拒答
 UA_MOBILE = ("Mozilla/5.0 (Linux; Android 13; 2206122SC Build/TKQ1.220829.002; wv) "
@@ -205,6 +345,25 @@ def _is_too_early(msg: str) -> bool:
     """平台是否以「还没到最短答题时间」为由拒绝交卷。"""
     s = str(msg or "")
     return any(h in s for h in _MIN_SUBMIT_HINTS)
+
+
+def _norm_options(options: Any) -> List[Dict[str, str]]:
+    """把考试题的 options 归一化成 `[{letter, text}]`（2026-10-12）。
+
+    为什么需要：平台返回的是 `list[dict]`（`{"letter","value","text"}`），
+    直接落盘会让核对脚本面对两套结构。归一后固定为字母 + 文本两列，
+    判断题无选项，返回空列表。
+    """
+    out: List[Dict[str, str]] = []
+    for o in options or []:
+        if isinstance(o, dict):
+            letter = str(o.get("letter") or o.get("key") or "").strip()
+            text = str(o.get("text") or o.get("value") or "").strip()
+        else:
+            letter, text = str(o).strip(), ""
+        if letter or text:
+            out.append({"letter": letter, "text": text})
+    return out
 
 
 def _parse_wait_seconds(msg: str) -> int:
@@ -490,6 +649,131 @@ def fetch_exam_cover(session, course: Dict[str, Any], exam_id, enc_task,
     }
 
 
+# ── 开考前「要求探测」（2026-10-12）─────────────────────────────────
+# 何同学诉求：开考前先看清这场考试有什么要求（人脸 / 人机验证 / 考试码 /
+# 能不能进 / 时间窗口），别等开考了才发现做不了。
+#
+# 🔴 关键约束：本函数**只 GET 封面页**，绝不调 start_exam / 不暂存 / 不提交
+#    ⇒ **不消耗作答机会**，可以反复调用。
+#
+# ⚠️ 已知边界（务必如实告知，别让界面骗人）：
+#   · 「考试限时」「最短答题时间」「是否允许中途离开」这三项**封面页拿不到**，
+#     平台只在**进入考场后的答题页**（form#submitTest 的 remainTime / encRemainTime）
+#     才给出。所以预检只能标"进考场后可见"。
+#   · 「离开作答页面」计数是**浏览器端行为检测**（监听听 visibilitychange /
+#     focus-blur 后上报），本程序走协议模拟、不执行 JS ⇒ **不会产生离开记录**。
+#     平台侧唯一会替考生自动交卷的时机是**考试截止时间到点**。
+_EXAM_TIME_RE = re.compile(r"(20\d\d-\d\d-\d\d \d\d:\d\d)")
+# 封面页拿不到、必须进考场才可见的项 —— 如实列出，别让界面撒谎
+_PRECHECK_UNKNOWN = [
+    "考试限时（剩余时间）", "最短答题时间（不满 N 分钟不许交卷）",
+    "允许的重做次数", "防作弊开关（切屏/抓拍/仅限 App）",
+]
+
+
+def precheck_exam(session, course: Dict[str, Any], exam_id, enc_task,
+                  user_id: str = "") -> Dict[str, Any]:
+    """开考前只读探测一场考试的要求。**不消耗作答机会**。
+
+    Returns:
+        {title, can_enter, state, reason, start_time, end_time,
+         face_need, captcha_need, exam_code_need, exam_answer_id,
+         limits[], unknown[], cover_url}
+    """
+    params = {
+        "redo": 1, "taskrefId": exam_id,
+        "courseId": course.get("courseId") or "",
+        "classId": course.get("clazzId") or course.get("classId") or "",
+        "userId": user_id, "role": "", "source": 0,
+        "enc_task": enc_task, "cpi": course.get("cpi") or "",
+        "vx": 0, "examsignal": 1,
+    }
+    out: Dict[str, Any] = {
+        "title": "", "can_enter": False, "state": "", "reason": "",
+        "start_time": "", "end_time": "", "student": "",
+        "face_need": None, "captcha_need": None, "exam_code_need": None,
+        "exam_answer_id": "", "limits": [], "unknown": list(_PRECHECK_UNKNOWN),
+        "cover_url": PAGE_EXAM_COVER + "?" + urlencode(params),
+    }
+    try:
+        resp = session.get(PAGE_EXAM_COVER, params=params, timeout=30,
+                           allow_redirects=False, headers=mobile_headers(user_id))
+    except Exception as e:                                           # noqa: BLE001
+        out.update(state="error", reason=f"封面页请求失败：{type(e).__name__}: {e}")
+        return out
+
+    if resp.status_code == 302:
+        loc = resp.headers.get("Location", "")
+        if "/exam-ans/exam/phone/look" in loc:
+            out.update(state="submitted", can_enter=False,
+                       reason="已提交过（本场没有剩余作答机会）")
+        else:
+            out.update(state="redirect", can_enter=False,
+                       reason=f"被重定向到：{loc[:120]}")
+        return out
+    if resp.status_code != 200:
+        out.update(state="http_%d" % resp.status_code,
+                   reason=f"封面页 HTTP {resp.status_code}")
+        return out
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    def _inp(i: str) -> str:
+        n = soup.select_one(f"input#{i}")
+        return (n.get("value", "") if n is not None else "") or ""
+
+    # 分支 A：「考试尚未开始 / 已结束」这类提示页
+    h2 = soup.select_one("h2.color6.fs36.textCenter.marBom60.line64")
+    if h2 is not None:
+        msg = h2.get_text(" ", strip=True)
+        out.update(state=msg, reason=msg)
+        for p in soup.select("div.result_gray_div p"):
+            t = p.get_text(" ", strip=True)
+            if t.startswith("姓名"):
+                out["student"] = t.split("：", 1)[-1].strip()
+            elif "开始时间" in t:
+                out["start_time"] = t.split("：", 1)[-1].strip()
+            elif "截止时间" in t:
+                out["end_time"] = t.split("：", 1)[-1].strip()
+        if "尚未开始" in msg:
+            out["limits"].append(
+                f"未到开考时间（{out['start_time'] or '见页面'} 开始），现在进不去")
+        else:
+            out["limits"].append(msg)
+        return out
+
+    # 分支 B：正常封面页 = 现在就能进
+    title_node = soup.select_one("span.overHidden2")
+    out.update(
+        title=title_node.get_text(" ", strip=True) if title_node else "",
+        can_enter=True, state="ready", reason="可以进入",
+        exam_answer_id=_inp("testUserRelationId"),
+    )
+    out["face_need"] = bool(_inp("faceRecognitionCompare"))
+    out["captcha_need"] = _inp("captchaCheck") == "1"
+    out["exam_code_need"] = _inp("needcode") == "1"
+
+    # 能探到的显式限制
+    if out["face_need"]:
+        out["limits"].append("需要**人脸识别** —— 本程序不处理，会跳过该考试")
+    if out["captcha_need"]:
+        out["limits"].append("需要**人机验证（滑块）** —— 程序会尝试自动通过；"
+                             "失败则跳过，且不消耗作答机会")
+    if out["exam_code_need"]:
+        out["limits"].append("需要**考试码** —— 开考时必须把老师给的码填进来")
+
+    # 页面里若出现时间字样，顺手抓出来（不同发布方式字段位置不一）
+    txt = resp.text
+    if not out["start_time"]:
+        m = _EXAM_TIME_RE.search(txt)
+        if m:
+            out["start_time"] = m.group(1)
+
+    # 注：若走到这里说明封面页是"可进入"形态，人脸/滑块/考试码已按真实值填好；
+    #     「未开考」分支在更早 return，那三项保持 None ⇒ 界面显示"未知"而不是"否"。
+    return out
+
+
 def start_exam(session, course: Dict[str, Any], exam: Dict[str, Any],
                exam_answer_id: str, code: str = "", user_id: str = "",
                captcha_validate: str = "") -> str:
@@ -627,8 +911,35 @@ def build_answer_form(question: Dict[str, Any], answer) -> Dict[str, Any]:
             form[f"answer{qid}{i}"] = v
             blank_num += f"{i},"
         form[f"blankNum{qid}"] = blank_num
+    elif qtype in (QT_SHORT, QT_NOUN, QT_ESSAY, QT_CALC, QT_OTHER, QT_ENTRY):
+        # 🔴 2026-11-07（何同学实测免疫学）：主观题原先直接 `raise` ⇒ 该题提交被
+        #   平台拒绝 ⇒ 连错 3 题触发「提交通道异常，提前终止」⇒ **整卷未提交**
+        #   （实测作业1 答到 203/222 卡死，submitted=false，分数不更新）。
+        #   超星主观题用文本域 `answer{qid}` 提交，给占位内容即可保住整卷；
+        #   主观题本就要老师判分，占位不影响客观题得分。
+        form[f"answer{qid}"] = (str(answer or "").strip()
+                                or "略（要点见课堂笔记）")
+    elif qtype in (20, 21, 22):
+        # 🔴 2026-11-07：题型 20/21/22 = B1/B2/C 型题（**共用备选答案**）。
+        #   实测免疫学作业1：这 4 个题组在答案页里 `rightAnswerContent` **是空的**
+        #   （老师没设标准答案），程序既拿不到答案、提交时又被 raise 拒绝
+        #   ⇒ 连拒 3 次触发"提交通道异常"⇒ **整卷 220 题全白答、未提交**。
+        #   这里按单选提交：有答案就用，没有就取第一个选项（5 选 1，期望 0.2 分），
+        #   目的是**保住整卷**，不让 4 道题毁掉另外 218 道。
+        form[f"answer{qid}"] = _as_choice(answer, question) or (
+            ((question.get("options") or [{}])[0] or {}).get("value")
+            or ((question.get("options") or [{}])[0] or {}).get("letter")
+            or "A")
     else:
-        raise ExamError(f"暂不支持的题型：{qtype}")
+        # 🔴 2026-11-07：**未知题型不许再抛错**。
+        #   本轮已经两次栽在同一个坑上（题型4、题型20 各让整卷 220 题白答）：
+        #   只要 `raise`，该题提交就被拒，连拒 3 次 ⇒ 整卷未提交、分数不更新。
+        #   超星题型码远不止 0~9/20~22（10 连线、11 排序、15 完形、18 阅读…），
+        #   以后必然还会遇到。所以这里改成**兜底文本提交**：宁可这一题 0 分，
+        #   也不能让它毁掉整卷。
+        logger.warning("未知题型 %s（题 %s）→ 按文本兜底提交，避免整卷失败",
+                       qtype, qid)
+        form[f"answer{qid}"] = str(answer or "").strip() or "略"
     return form
 
 
@@ -1052,6 +1363,14 @@ def parse_exam_list(html_text: str) -> List[Dict[str, Any]]:
         _t2 = re.sub(r"剩余\s*\d+\s*小时?\s*\d*\s*分?钟?", "", txt)
         sm = re.search(r"(\d+(?:\.\d+)?)\s*分(?!钟)", _t2)
         node["score"] = sm.group(1) if sm else ""
+        # 🔴 2026-11-07：是否可重做。列表页里可重做的考试带「重考」按钮，
+        #   不可重做的没有这个字样。次数只有交卷页才显示（"允许重考 N 次，
+        #   已重考 M 次"），列表页拿不到，所以这里只给布尔标记。
+        node["can_retest"] = ("重考" in txt)
+        rm = re.search(r"允许重考\s*(\d+)\s*次.*?已重考\s*(\d+)\s*次", txt)
+        if rm:
+            node["retest_allowed"] = int(rm.group(1))
+            node["retest_used"] = int(rm.group(2))
         out.append(node)
 
     if out:
@@ -1233,8 +1552,8 @@ def _try_solve_slide_captcha(session, cover_url: str) -> str:
 
 def run_exam(session, course: Dict[str, Any], exam: Dict[str, Any],
              answer_fn, *, user_id: str = "", code: str = "",
-             max_questions: int = 300, auto_submit: bool = True,
-             on_progress=None) -> Dict[str, Any]:
+             max_questions: int = 300, auto_submit: bool = False,
+             on_progress=None, _dump_fh=None) -> Dict[str, Any]:
     """完整跑一场考试：封面 → 开始 → 逐题取题作答并暂存 → 交卷。
 
     🔴 链路照搬 guowang23333/CxKitty（手机端协议），逐题用 `start=index` 翻页，
@@ -1242,11 +1561,16 @@ def run_exam(session, course: Dict[str, Any], exam: Dict[str, Any],
 
     Args:
         answer_fn: 回调，入参题目 dict，返回答案（None 表示没答案，跳过该题）
-        auto_submit: True=答完直接交卷；False=只暂存不交卷（审核提交）
+        auto_submit: True=答完直接交卷；False=只暂存不交卷（审核提交）。
+                     ⚠️ 缺省 **False**（2026-10-12）：考试机会只有一次，
+                     默认只暂存草稿，由用户自己在学习通核对后交卷。
+        _dump_fh: 题目落盘文件句柄（由 `run_exam_with_dump` 传入）。
+                  **本函数不负责关闭**，避免 18 处 return 漏关。
     Returns:
         {"ok": bool, "total": n, "answered": n, "skipped": n,
          "submitted": bool, "msg": str, "questions": [...]}
     """
+    dump_fh = _dump_fh
     exam_id = exam.get("exam_id") or exam.get("test_paper_id") or ""
     enc_task = exam.get("enc_task") or ""
     if not exam_id or not enc_task:
@@ -1388,6 +1712,24 @@ def run_exam(session, course: Dict[str, Any], exam: Dict[str, Any],
                     on_progress(questions_done + 1, q)
                 except Exception:
                     pass
+            # 🔴 2026-10-12：逐题落盘「题干 + 完整选项 + 程序最终答案」。
+            #   为什么必须有：考试正确率此前**无法核算** —— 日志里只有程序选的
+            #   字母，没有选项全文，想逐题核对就得"再进一次考场抓题页"，
+            #   而反复 start 未交卷会被平台限制（10-12 已实证被卡死）。
+            #   ⇒ 趁**本次已在考场内**把题面留下，是唯一零额外风险的取数时机。
+            #   逐题追加写 JSONL：中途被限流/重启也不丢已完成部分。
+            if dump_fh:
+                try:
+                    dump_fh.write(json.dumps({
+                        "no": questions_done + 1,
+                        "type": q.get("type"),
+                        "title": q.get("title"),
+                        "options": _norm_options(q.get("options")),
+                        "answer": ans,
+                    }, ensure_ascii=False) + "\n")
+                    dump_fh.flush()
+                except Exception:
+                    pass
             questions_done += 1
             time.sleep(random.uniform(0.8, 1.6))
     except ExamSubmitted as e:
@@ -1453,6 +1795,79 @@ def run_exam(session, course: Dict[str, Any], exam: Dict[str, Any],
                     + (f"｜为凑最短答题时间等待 {waited:.0f}s" if waited else "")),
             "total": total, "answered": answered, "skipped": skipped,
             "submitted": True}
+
+
+_LAST_PROGRESS: Dict[str, Any] = {"done": 0, "total": 0, "title": ""}
+
+
+def get_exam_progress() -> Dict[str, Any]:
+    """本场考试的实时进度（给 web_ui 的 `/api/exam/status` 显示用）。
+
+    🔴 2026-10-13（何同学实测反馈）：考试进行中，界面**只显示刷课进度**
+    （如 `56/56 100%`），完全看不出考试跑到第几题 ⇒ 无法判断"到底有没有在跑"。
+    而 `run_exam` 本来就有 `on_progress(done, q)` 回调（每题调一次），
+    只是调用方（`api/base.py` / `_launch_exam_only`）都没传 ⇒ 白有。
+    ⇒ 这里统一兜一个实现，调用方**无需任何改动**。
+    """
+    return dict(_LAST_PROGRESS)
+
+
+def run_exam_with_dump(*args, dump_path: str = "", **kwargs):
+    """`run_exam` + 逐题落盘「题干 + 完整选项 + 程序最终答案」（2026-10-12）。
+
+    为什么需要（真实动机）：
+      考试正确率此前**无法核算** —— 日志里只有程序选的字母，没有选项全文；
+      要逐题核对只能"再进一次考场抓题页"，而反复 `start` 未交卷会被平台
+      限制（2026-10-12 已实证被卡死：任务 running 但日志停更）。
+      ⇒ 趁**本次已在考场内**把题面留下，是唯一零额外风险的取数时机。
+
+    与 `run_exam` 完全同源：只是多传一个文件句柄，**不改任何作答/提交行为**。
+    落盘失败也不抛异常 —— 它是旁路，绝不能影响考试。
+    """
+    fh = None
+    if dump_path:
+        try:
+            os.makedirs(os.path.dirname(dump_path) or ".", exist_ok=True)
+            fh = open(dump_path, "w", encoding="utf-8")
+        except OSError:
+            logger.warning("题目落盘失败（不影响作答）：%s", dump_path)
+    # 每场开始重置进度（一场一场连跑时不能串场）
+    _LAST_PROGRESS.update({"done": 0, "total": 0, "title": ""})
+    _user_cb = kwargs.get("on_progress")
+
+    def _track(done, q=None):
+        try:
+            d = int(done)
+            _LAST_PROGRESS["done"] = d
+            if d > _LAST_PROGRESS["total"]:
+                _LAST_PROGRESS["total"] = d
+            _LAST_PROGRESS["title"] = str((q or {}).get("title") or "")[:40]
+        except Exception:                                        # noqa: BLE001
+            pass
+        if _user_cb:
+            try:
+                _user_cb(done, q)
+            except Exception:                                    # noqa: BLE001
+                pass
+
+    kwargs["on_progress"] = _track
+    try:
+        _res = run_exam(*args, _dump_fh=fh, **kwargs)
+        # 跑完后用真实总数校正（total/answered 只有结束时才拿得到）
+        try:
+            _LAST_PROGRESS["total"] = int(
+                _res.get("total") or _LAST_PROGRESS["total"] or 0)
+            _LAST_PROGRESS["done"] = int(
+                _res.get("answered") or _LAST_PROGRESS["done"] or 0)
+        except Exception:                                        # noqa: BLE001
+            pass
+        return _res
+    finally:
+        if fh is not None:
+            try:
+                fh.close()
+            except OSError:
+                pass
 
 
 def scan_exams_all(session, courses: List[Dict[str, Any]],

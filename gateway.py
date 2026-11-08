@@ -27,6 +27,7 @@ import time
 
 import requests
 from flask import (Flask, Response, g, jsonify, redirect, request, session)
+from loguru import logger
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DATA_ROOT = os.path.join(os.path.dirname(BASE), "chaoxing_data")
@@ -52,9 +53,24 @@ VIEWER_OK = ("/", "/api/overview", "/api/status", "/api/logs",
              "/api/courses", "/api/ping", "/api/whoami")
 # 反代时不透传的 hop-by-hop 头
 _SKIP_HEADERS = {"host", "content-length", "connection", "keep-alive",
-                 "transfer-encoding", "upgrade", "accept-encoding"}
+                 "transfer-encoding", "upgrade", "accept-encoding",
+                 # 🔴 2026-10-03：下游不该看到"上游浏览器的跨站身份"。
+                 #    实例侧新增了 CSRF 闸门（`web_ui._is_cross_site`），若把
+                 #    浏览器的 Origin/Sec-Fetch-* 原样透传，经网关的正常访问
+                 #    会被误判成跨站而 403 —— 网关反代的正确做法就是把它们摘掉。
+                 "origin", "referer", "sec-fetch-site", "sec-fetch-mode",
+                 "sec-fetch-dest", "sec-fetch-user"}
 _SKIP_RESP_HEADERS = {"content-encoding", "content-length", "transfer-encoding",
                       "connection", "keep-alive"}
+
+# 反代允许的 HTTP 方法（2026-09-30 修）。
+# 🔴 原先两条反代路由只写了 ["GET", "POST"] —— Flask 的 methods 是**白名单**，
+#    没列出的方法在**网关这一层**就被挡下返回 405，根本到不了下游进程。
+#    后果：用户在微伴控制台点「移除账号」永远失败（弹窗确认后毫无反应，
+#    因为前端当时还静默忽略错误）。实例页同理，任何 DELETE/PUT 也进不去。
+#    下游处理器用的是 requests.request(request.method, ...)，方法本身是透传的，
+#    所以只要在入口把方法声明放开即可。
+_PROXY_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
 
 app = Flask(__name__)
 app.json.ensure_ascii = False
@@ -161,11 +177,19 @@ def instances() -> list:
     out = []
     if not os.path.isdir(DATA_ROOT):
         return out
-    for name in sorted(os.listdir(DATA_ROOT)):
-        m = re.fullmatch(r"acc(\d+)", name)
-        if not m:
+    # 🔴 必须按 acc 后面的**数字**排序，不能按字符串 —— 否则 sorted() 得到的是
+    #    字典序（acc1, acc10, acc11, acc2, …），界面上新加的实例会插到前面去。
+    for name in sorted((x for x in os.listdir(DATA_ROOT)
+                        if re.fullmatch(r"acc(\d+)", x)),
+                       key=lambda x: int(x[3:])):
+        n = int(name[3:])
+        # 🔴 2026-10-03（第三方审计 P0-4）：acc12 **永不启用** —— 它的端口 5011
+        #    被"安全微伴"占用。此处原先会把 acc12 当真实例列出来
+        #    （`_INSTANCE_MARKERS` 含 ui_config.json），于是
+        #    `/api/instance/12/stop` 与 `/api/stop_all` 会对着 5011
+        #    `taskkill /F` —— **误杀微伴**（微伴也有 /api/shutdown，会真的被关掉）。
+        if n == 12:
             continue
-        n = int(m.group(1))
         d = os.path.join(DATA_ROOT, name)
         if not _is_real_instance(d):
             continue
@@ -213,13 +237,22 @@ def all_profiles() -> list:
 # 若所有实例都没有 AI 配置，再退回 config.ini 的 [tiku] 段（key/endpoint/model）。
 _TIKU_DEFAULTS = {
     "tiku_type": "adapter",
+    # 2026-09-29：实测有答案的三个源 —— local（本地库）+ buguake + icodef；
+    # wanneng/tikuhai 40 题 0 命中（缺付费 Token）已删。详见 web_ui.py 的 TIKU_USE。
+    # icodef 的限流 Token 由 web_ui._ensure_use_local 从 config.ini 自动补。
     "adapter_url": ("http://127.0.0.1:8060/adapter-service/search"
-                    "?use=local,icodef,buguake,wanneng,tikuhai"),
+                    "?use=local,buguake,icodef"),
     "token": "",
     "ai_fallback": True,
     "auto_submit": True,
+    # 🔴 2026-10-12（何同学要求）：考试提交**默认关** —— 考试只有一次机会，
+    #    默认只暂存草稿不交卷；要自动交卷由用户在界面上勾「自动提交考试」。
+    #    与作业的 `auto_submit` 是**两个独立键**，互不影响。
+    "exam_auto_submit": False,
     "cover_rate": 0.9,
-    "speed": 2,
+    # 🔴 2026-10-03：由 2 改 1。这里给"新建/批量设置实例"填默认参数，
+    #    填 2 会让新实例一上来就跑 2 倍速（全项目策略是 1，防平台回溯）。
+    "speed": 1,
     "jobs": 1,
 }
 _AI_FIELDS = ("ai_endpoint", "ai_key", "ai_model")
@@ -504,10 +537,19 @@ def do_auth_weiban():
         return jsonify(ok=False,
                        msg="该账号还没加入。请让管理员先在「安全微伴」页把它添加进来")
     if acct.get("tenant") and acct["tenant"] != tenant:
-        return jsonify(ok=False,
-                       msg=f"学校全称与登记的不一致，应为：{acct['tenant']}")
-    if acct.get("password") and password and acct["password"] != password:
-        return jsonify(ok=False, msg="密码不正确")
+        # 🔴 2026-10-03：**不要回显正确校名**。原写法把 `acct['tenant']` 直接写进
+        #    错误信息里，等于给爆破者免费提供答案（先试探出校名再撞学号）。
+        return jsonify(ok=False, msg="学校全称与登记的不一致")
+    # 🔴 2026-10-03 修漏洞：原判据是
+    #        if acct.get("password") and password and acct["password"] != password:
+    #    三个条件**同时为真**才校验 —— 于是 **密码留空 = 直接跳过校验**，
+    #    只要知道学号 + 校名即可登录微伴（该入口经 frpc 暴露在公网）。
+    #    改为：**只要登记了密码，就必须提供且正确**。
+    #    注意：清单里 `password` 为空的账号（自动加入的那批）保持原行为，
+    #    不强制密码 —— 否则会把现有账号挡在门外（是否收紧由用户决定）。
+    if acct.get("password"):
+        if not password or acct["password"] != password:
+            return jsonify(ok=False, msg="密码不正确")
 
     wb_dir = os.path.join(DATA_ROOT, "weiban")
     try:
@@ -780,9 +822,15 @@ MAX_INSTANCES = 20
 
 
 def _port_listeners(port: int) -> list:
-    """监听指定端口的 PID 列表（中文系统 netstat 输出是 GBK）。"""
+    """监听指定端口的 PID 列表（中文系统 netstat 输出是 GBK）。
+
+    ⚠️ 2026-10-08：加 `CREATE_NO_WINDOW`（避免拉起控制台宿主）。
+    系统工具偶发启动失败（如 `NETSTAT.EXE 0xc0000142`）已有 try/except 兜住。
+    """
     try:
-        raw = subprocess.run(["netstat", "-ano"], capture_output=True).stdout
+        raw = subprocess.run(
+            ["netstat", "-ano"], capture_output=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
     except Exception:
         return []
     text = raw.decode("gbk", errors="ignore")
@@ -822,6 +870,29 @@ def api_instance_start(n):
 
     threading.Thread(target=_spawn, daemon=True).start()
     return jsonify(ok=True, msg=f"正在启动实例 {n}…")
+
+
+@app.post("/api/instance/<int:n>/clear")
+def api_instance_clear(n):
+    """🔴 2026-10-01 新增（何同学要求）：**清空该实例的账号信息**。
+
+    转发到实例的 `/api/clear_account` —— 那里会清内存登录态 + 磁盘 ui_config.json
+    里的 profiles / last_params / last_pick / resume，让实例回到"全新未配置"。
+    任务运行中会被实例拒绝（返回 ok=False），避免边跑边清。
+    """
+    denied = _admin_only("清空账号信息")
+    if denied:
+        return denied
+    if not any(it["n"] == n for it in instances()):
+        return jsonify(ok=False, msg=f"没有 acc{n} 这个实例")
+    port = _instance_port(n)
+    if not _port_listeners(port):
+        return jsonify(ok=False, msg=f"实例 {n} 没在运行，无法清空（可先启动）")
+    try:
+        r = requests.post(f"http://127.0.0.1:{port}/api/clear_account", timeout=20)
+        return jsonify(**(r.json() or {"ok": False, "msg": f"HTTP {r.status_code}"}))
+    except Exception as e:
+        return jsonify(ok=False, msg=f"实例 {n} 不可达：{e}")
 
 
 @app.post("/api/instance/<int:n>/stop")
@@ -919,13 +990,43 @@ def api_stop_all():
     def _bye():
         time.sleep(1.5)          # 留时间让响应回到浏览器
         its = instances()
+
+        # 🔴 2026-10-04 优雅停止：先**暂停**再退出。
+        #   原实现直接打 /api/shutdown → 0.8s 后 os._exit(0)：正在播的那一章
+        #   进度会丢，且实例侧会 `_clear_resume()` 清掉续跑依据 → 下次开机
+        #   不会自动续刷。现在改成与手动"逐个 pause → 停进程"等价：
+        #     ① 对所有实例发 pause（秒级生效，最多等 45s）；
+        #     ② 再 /api/shutdown?keep_resume=1 停进程，**保留 resume**。
+        #   效果：关机后开机双击启动器即可自动接着刷。
+        for it in its:
+            try:
+                requests.post(f"http://127.0.0.1:{it['port']}/api/pause", timeout=5)
+            except Exception:
+                pass
+        deadline = time.time() + 45
+        while time.time() < deadline:
+            busy = False
+            for it in its:
+                try:
+                    r = requests.get(f"http://127.0.0.1:{it['port']}/api/status",
+                                     timeout=3)
+                    if r.json().get("running"):
+                        busy = True
+                        break
+                except Exception:
+                    pass          # 拿不到状态视为已停（进程可能正好在退）
+            if not busy:
+                break
+            time.sleep(1)
+
         for idx, it in enumerate(its):
             port = it["port"]
             # 2026-09-15：只有"停止全部"才连题库一起关，且放在最后一个实例上
             # 关（避免先关的实例把题库杀了、后面实例的收尾逻辑受影响）。
-            allq = "?all=1" if idx == len(its) - 1 else ""
+            # 2026-10-04：补 keep_resume=1 —— 保住续跑依据（优雅停止）。
+            qs = "keep_resume=1" + ("&all=1" if idx == len(its) - 1 else "")
             try:
-                requests.post(f"http://127.0.0.1:{port}/api/shutdown{allq}",
+                requests.post(f"http://127.0.0.1:{port}/api/shutdown?{qs}",
                               timeout=3)
             except Exception:
                 pass
@@ -933,6 +1034,15 @@ def api_stop_all():
             for pid in _port_listeners(port):
                 subprocess.run(["taskkill", "/F", "/PID", str(pid)],
                                capture_output=True)
+        # 🔴 2026-10-03：**显式**停止安全微伴（5011）。
+        #    原先它只是"顺带"被停掉的 —— acc12 的端口正好是 5011，
+        #    所以上面那个循环打到 5011 上，`taskkill` 把微伴杀了。
+        #    `instances()` 现在已经跳过 acc12（防它误杀微伴），
+        #    若不补这一句，"停止全部"就会漏掉微伴、留下一个孤儿进程。
+        #    微伴控制台没有 /api/shutdown 路由（已确认），只能按端口杀。
+        for pid in _port_listeners(WB_PORT):
+            subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                           capture_output=True)
         os._exit(0)
 
     threading.Thread(target=_bye, daemon=True).start()
@@ -1007,12 +1117,39 @@ def _sync_worker():
 
 # ---------------- 反向代理 ----------------
 
+def _stamp_gateway_identity(headers: dict) -> None:
+    """把网关已认证的身份转告下游实例（就地修改 headers）。
+
+    🔴 2026-10-08 修（何同学反馈"账号密码登录后仍显示全套操作按钮"）：
+
+    **根因**：`_SKIP_HEADERS` 会剔除 `host`，`requests` 随即自动补上
+    `Host: 127.0.0.1:{端口}` ⇒ 实例侧 `_is_local_request()` 判为 True ⇒
+    `_auth_gate` 直接 `g.role = ROLE_ADMIN, "本机"`（本机判定**优先于 session**）
+    ⇒ 实例的 `/api/whoami` 对**任何**经网关的请求都回 `role=admin, local=true`：
+      · 前端**不删操作按钮**、不加 `ro-mode`、不显示"只有查看权限"提示条（界面误导）
+      · 实例侧 `_viewer_guard` 也随之失效
+        （**真实拦截仍由网关 `_user_allowed` 兜住** —— 实测 `api/pause` 等
+          不在允许列表的写操作经网关一律 403，故无实际越权）
+
+    **修法**：显式告知"经网关转发 + 网关已认证的角色 + 原始请求是否本机"。
+    实例的 `_auth_gate` / `_is_local_request()` 据此走正确的分支。
+
+    ⚠️ 安全性：这几个头**可被能直连实例端口者伪造**。但实例只绑
+    `127.0.0.1`（外部不可达），而本机程序**现状本就是 admin**（`_is_local_request`
+    直接授予），伪造不会获得更多权限；浏览器跨站请求另有 `_is_cross_site()` 拦截。
+    """
+    headers["X-CK-Via-Gateway"] = "1"
+    headers["X-CK-Role"] = str(_role() or "")
+    headers["X-CK-Local"] = "1" if _is_local_request() else "0"
+
+
 def _forward(n: int, sub: str):
     port = INSTANCE_BASE_PORT + n - 1
     url = f"http://127.0.0.1:{port}/{sub}"
     headers = {k: v for k, v in request.headers.items()
                if k.lower() not in _SKIP_HEADERS}
     headers["X-Base-Path"] = f"/acc/{n}"      # 让实例知道自己的前缀
+    _stamp_gateway_identity(headers)
     try:
         resp = requests.request(
             request.method, url, params=request.args,
@@ -1031,8 +1168,8 @@ def _forward(n: int, sub: str):
     return out
 
 
-@app.route("/acc/<int:n>/", defaults={"sub": ""}, methods=["GET", "POST"])
-@app.route("/acc/<int:n>/<path:sub>", methods=["GET", "POST"])
+@app.route("/acc/<int:n>/", defaults={"sub": ""}, methods=_PROXY_METHODS)
+@app.route("/acc/<int:n>/<path:sub>", methods=_PROXY_METHODS)
 def proxy(n, sub):
     if not any(it["n"] == n for it in instances()):
         return Response("没有这个实例", status=404,
@@ -1057,6 +1194,7 @@ def _forward_wb(sub: str):
     headers = {k: v for k, v in request.headers.items()
                if k.lower() not in _SKIP_HEADERS}
     headers["X-Base-Path"] = "/wb"
+    _stamp_gateway_identity(headers)          # 同实例转发：转告已认证身份
     # 把"当前是哪种身份"告诉微伴控制台（跨进程，它读不到网关的 session）：
     #   X-WB-Isolation=1 → 是微伴账号进来的：只能操作自己那个账号，
     #                      且页面上不该出现"学习通"入口
@@ -1069,7 +1207,13 @@ def _forward_wb(sub: str):
             request.method, url, params=request.args,
             data=request.get_data(), headers=headers, cookies=request.cookies,
             allow_redirects=False, timeout=120)
-    except Exception:
+    except Exception as _e:
+        # 🔴 2026-10-16：原先这里**静默吞异常**，页面只显示 502，
+        #   完全看不出是"微伴没起"还是"转发本身报错"（实测微伴直连 5011
+        #   返回 200，经网关却 502 ⇒ 根因在转发，不在微伴）。
+        #   ⇒ 必须把异常类型与内容打出来，否则这类问题无法定位。
+        logger.warning("微伴转发失败 %s %s → %s: %s",
+                       request.method, url, type(_e).__name__, _e)
         return Response(
             "安全微伴控制台未启动（端口 %d）。请在项目根目录运行："
             "python weiban/web_ui.py" % WB_PORT,
@@ -1084,8 +1228,8 @@ def _forward_wb(sub: str):
     return out
 
 
-@app.route("/wb/", defaults={"sub": ""}, methods=["GET", "POST"])
-@app.route("/wb/<path:sub>", methods=["GET", "POST"])
+@app.route("/wb/", defaults={"sub": ""}, methods=_PROXY_METHODS)
+@app.route("/wb/<path:sub>", methods=_PROXY_METHODS)
 def proxy_wb(sub):
     # 普通用户（只读口令 / 账号）可以进微伴控制台做"查看 + 暂停"；
     # 微伴账号只能看自己的（由 _forward_wb 注入身份头，控制台端再校验一次）。
@@ -2154,6 +2298,10 @@ GW_PAGE = """<!DOCTYPE html>
   .sw:hover .sl:before{box-shadow:0 2px 6px rgba(16,24,40,.34)}
   .sw input:disabled + .sl{opacity:.5;cursor:default}
   .sw input:focus-visible + .sl{outline:2px solid #2563eb;outline-offset:3px}
+  /* 2026-10-01：「清空账号信息」按钮，视觉上与「打开该实例」区分（危险动作用暖色） */
+  .acts .clracc{padding:6px 12px;border:1px solid #f0c4c4;border-radius:8px;
+    background:#fff6f6;color:#c0392b;cursor:pointer;font:inherit}
+  .acts .clracc:hover{background:#ffe9e9;border-color:#e7a1a1}
   .acts .sw{margin-left:auto}
   /* 关着的实例：滑块加一圈淡蓝，明确"这里可以点开" */
   .card[data-on="0"] .sw .sl{background:#cbd5e1;box-shadow:0 0 0 3px rgba(37,99,235,.055)}
@@ -3027,7 +3175,25 @@ function card(it) {
     + hint
     + risk
     + '<div class="acts"><a href="/acc/' + it.n + '/">打开该实例 →</a>'
+    + (acc ? '<button type="button" class="clracc" onclick="clearInst(' + it.n
+            + ')" title="清空该实例的账号信息（登录态 + 保存的档案）">清空</button>' : '')
     + sw + '</div></div>';
+}
+
+// 2026-10-01：清空某实例的账号信息（需二次确认，防误点）
+async function clearInst(n) {
+  // ⚠️ 换行必须写成转义形式 —— 本文件整段 JS 位于 Python 三引号字符串里，
+  //    直接写裸换行转义会被 Python 先解释成真实换行，导致 JS 字符串/注释断行、
+  //    报 SyntaxError，整个 script 块全废、页面卡在加载中。
+  if (!confirm('确定清空「实例 ' + n + '」的账号信息？\\n\\n会清除：登录态、已保存的账号密码档案、选课记忆。\\n题库/AI 等公共配置保留。')) return;
+  try {
+    const r = await fetch('/api/instance/' + n + '/clear', {method: 'POST'})
+      .then(r => r.json());
+    alert(r.ok ? ('实例 ' + n + '：' + (r.msg || '已清空')) : ('失败：' + (r.msg || '未知错误')));
+  } catch (e) {
+    alert('请求失败：' + e);
+  }
+  load(true);
 }
 
 async function load(silent) {
@@ -3177,11 +3343,11 @@ $('btnAdd').onclick = async () => {
   }
 };
 $('btnStopAll').onclick = async () => {
-  if (!confirm('停止所有服务？\\n\\n所有实例的刷课会被中断（已上报进度不丢），'
-      + '网关也会一起关闭。下次需要重新双击桌面图标启动。')) return;
+  if (!confirm('停止所有服务？\\n\\n会先优雅暂停所有实例（保存当前进度），再关闭网关。'
+      + '\\n\\n下次双击桌面图标重新启动后，会自动接着刷（续跑依据已保留）。')) return;
   const b = $('btnStopAll');
   setBusy(b, true); busy = true;
-  say('正在停止全部服务…', 'busy');
+  say('正在停止全部服务…（先暂存在跑的实例，约需几秒到 45 秒）', 'busy');
   try {
     await fetch('/api/stop_all', {method: 'POST'});
   } catch (e) {}
@@ -3190,7 +3356,7 @@ $('btnStopAll').onclick = async () => {
     '<div class="wrap" style="padding-top:80px;text-align:center">'
     + '<h1>服务已停止</h1>'
     + '<div class="sub">所有实例与网关都已关闭，可以关闭此页面了。<br>'
-    + '需要时双击桌面的「超星刷课」重新启动。</div></div>';
+    + '续刷进度已保留 —— 双击桌面的「超星刷课」重新启动后会自动接着刷。</div></div>';
 };
 $('btnStagger').onclick = async () => {
   if (!confirm('错峰启动：按 20 分钟间隔，依次让各实例用「上次的选课」开跑。\\n\\n'

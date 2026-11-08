@@ -151,11 +151,21 @@ class LearnedAnswers:
                     if ans and cur.get(key) != ans:
                         cur[key] = ans
                         changed += 1
-                elif mark == "cuo":
-                    # 该小问这次被平台判错 -> 撤销之前的"已验证"记录。
-                    # 2026-09-11 审查发现：此前只增不减，一旦某个小问曾判对、
-                    # 后来又判错，旧值会被永久固定在那个位置，越错越稳。
-                    # bandui / unknown 属于"不确定"，按用户规则不动（宁缺勿滥）。
+                elif mark in ("cuo", "bandui"):
+                    # 该小问这次没被判"对" -> 撤销之前的"已验证"记录。
+                    #
+                    # 2026-09-29 修 bug（今日实测 40 例）：此前只认 `cuo`，
+                    # `bandui`（部分对）按"不确定，宁缺勿滥，不动"处理。
+                    # 后果是**死循环**：多选题只答一个选项时平台判 bandui，
+                    # 而库里更早那次的 sub_verified 被原样保留 →
+                    # `_apply_verified_subs()` 又把它填回答案对应位 →
+                    # 提交同一个半对答案 → 再判 bandui → 无限循环。
+                    # 实测形态高度一致：last_mark=bandui、verified=None、
+                    # sub_verified={'0':'A'}、wrong=['A']、revoked_reason=bandui。
+                    #
+                    # 半对 == 该小问**没有被平台确认为正确**，与 cuo 同等对待：
+                    # 都要撤下。多小问题组的"多轮积累"不受影响 —— 那是靠
+                    # 各小问**分别判 dui** 累积的，与小问判 bandui 无关。
                     if key in cur:
                         cur.pop(key)
                         changed += 1
@@ -175,6 +185,20 @@ class LearnedAnswers:
             rec = self._load().get(title) or {}
             v = rec.get("sub_verified")
             return {str(k): str(x) for k, x in v.items()} if isinstance(v, dict) else {}
+
+    def get_partials(self, title: str) -> list:
+        """该题历史「部分正确」的作答记录 [{"ans","score","at"}]，新的在前。
+
+        2026-09-29 新增：供 AI 提示词使用 —— 多选题判 bandui 时，
+        说明所选组合里**至少含一个正确选项**，据此让模型"补全"而非重新猜。
+        """
+        title = normalize_title(title)
+        if not title:
+            return []
+        with _LOCK:
+            rec = self._load().get(title) or {}
+            v = rec.get("partials")
+        return [dict(x) for x in v if isinstance(x, dict)] if isinstance(v, list) else []
 
     # ---------- 读 ----------
     def get_verified(self, title: str) -> str:
@@ -249,11 +273,29 @@ class LearnedAnswers:
                     rec["verified_at"] = _now()
                 # 已答对：从错误列表移除同值
                 rec["wrong"] = [w for w in (rec.get("wrong") or []) if w != my_answer]
+                # 已全对 -> 「部分正确线索」已完成使命，清掉（2026-09-29）
+                rec.pop("partials", None)
             elif mark in ("cuo", "bandui") and my_answer:
                 wl = [w for w in (rec.get("wrong") or []) if w != my_answer]
                 wl.insert(0, my_answer)
                 rec["wrong"] = wl[:5]          # 最多留 5 条
                 rec["wrong_at"] = _now()
+                if mark == "bandui":
+                    # 🔴 2026-09-29 新增（用户要求）：「部分正确」线索。
+                    #
+                    # 多选题最容易卡在这里 —— 平台判 bandui 时**不会告诉你**
+                    # 哪个选项对，但"得了部分分"这件事本身就有信息量：
+                    # 选中的选项里**至少有一个是正确的**，只是组合不完整。
+                    # 把 (答案, 得分) 记下来，下次作答时喂给 AI 当线索，
+                    # 让它"在已有基础上补全"，而不是每次从零瞎猜。
+                    #
+                    # 与 wrong 的关系：wrong 记的是"这个组合整体不通过"，
+                    # partials 记的是"这个组合里有对的东西" —— 两者不冲突，
+                    # 提示词里会分开表述。全对后（mark=dui）自动清空。
+                    ps = [p for p in (rec.get("partials") or [])
+                          if str((p or {}).get("ans") or "") != my_answer]
+                    ps.insert(0, {"ans": my_answer, "score": score, "at": _now()})
+                    rec["partials"] = ps[:6]
                 # 2026-09-15 修 bug：判错时必须撤销已失效的 verified。
                 # 此前只增不减 —— 一道题先判对、后续再判错时，旧的 verified
                 # 会被永久保留，而 query()/query_all() 都**优先返回 verified**

@@ -117,8 +117,12 @@ class CxCaptcha:
         random_t = randint(0, 2147483647)
 
         self._throttle()
-        res = self.s.get(api, params={'t': random_t})
-        if res.status_code == 200 and res.headers['Content-Type'] == 'image/png':
+        # 🔴 2026-10-03（第三方审计 B-17）：原实现**没有 timeout** —— 服务端半开
+        #    连接会把这个线程永久挂住；而调用点在视频上报主路径上，单点卡死等于
+        #    整个 worker 停摆。补 (连接, 读取) 超时。
+        res = self.s.get(api, params={'t': random_t}, timeout=(5, 15))
+        # `headers['Content-Type']` 无 `.get` → 缺失即 KeyError（被上层吞成 False）
+        if res.status_code == 200 and res.headers.get('Content-Type', '') == 'image/png':
             return res.content
         else:
             # 提供的Cookies或UA存在问题，导致未能正常获取验证码内容
@@ -140,7 +144,7 @@ class CxCaptcha:
             'app': 0
         }
         self._throttle()
-        res = self.s.get(api, params=params)
+        res = self.s.get(api, params=params, timeout=(5, 15))
         if res.status_code == 302:
             return True
         else:

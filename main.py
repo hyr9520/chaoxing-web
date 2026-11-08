@@ -2,6 +2,8 @@
 import argparse
 import configparser
 import enum
+import os
+import random
 import socket
 import sys
 import threading
@@ -280,6 +282,55 @@ def init_chaoxing(common_config, tiku_config, config_path=None):
     return chaoxing
 
 
+# ══════════════════════════════════════════════════════════════════════
+# 🔴 2026-10-02 P2：任务之间加「拟人静置」
+#
+# 背景（当日外部调研结论，多方印证）：
+#   平台对"行为节奏"建模，「视频播完立刻进下一节」「提交后立即跳转下一节」
+#   是自动化脚本的典型特征。社区规避指南普遍给出的节奏建议是
+#   「视频播完后等 10 秒再进入下一节」「点提交后静置 8 秒以上再跳转」，
+#   并且强调**间隔必须随机** —— 固定间隔本身也是可识别特征
+#   （TrueSight 分析报告：「过于均匀或过于规律的间隔会被识别为自动化脚本」）。
+#
+# 为什么不改 `speed` / `jobs` 就够了：那两个管的是"单次上报的时长"与"并发章节数"，
+# 而节奏特征藏在**任务与任务之间的空隙**里 —— 我们的代码里原本是 0 空隙。
+#
+# 安全性设计（确保不影响原程序）：
+#   1. 任何异常都吞掉 —— 绝不影响刷课主流程与返回值；
+#   2. 开关：环境变量 `CX_HUMAN_PAUSE=0` 可一键关闭（默认开启）；
+#   3. 上限 ≤8s，远低于看门狗的僵死阈值(900s)，不会误触发"任务僵死"；
+#   4. 暂停信号最多延迟一个静置周期（≤8s）后照常抛 PauseInterrupt —— 与
+#      原本"点暂停后当前请求结束即生效"的量级一致；
+#   5. 已完成章节直接 return，不进入静置 —— 不浪费任何时间。
+# ══════════════════════════════════════════════════════════════════════
+_HUMAN_PAUSE_ON = os.environ.get("CX_HUMAN_PAUSE", "1").strip().lower() \
+    not in ("0", "false", "no", "off")
+
+
+def _human_pause(lo: float, hi: float, why: str = "") -> None:
+    """章节/任务点之间的随机静置（拟人化）。失败时静默跳过。"""
+    if not _HUMAN_PAUSE_ON:
+        return
+    try:
+        delay = random.uniform(lo, hi)
+    except Exception:                                     # noqa: BLE001
+        delay = lo
+    if not delay or delay <= 0:
+        return
+    try:
+        logger.debug(f"拟人静置 {delay:.1f}s {why}")
+        time.sleep(delay)
+    except Exception as e:                                # noqa: BLE001
+        logger.debug(f"拟人静置异常（忽略）: {e}")
+
+
+# 章节之间的静置区间（秒）。单门课几十个章节，总增量约 2~4 分钟，
+# 相对视频总时长可忽略。
+HUMAN_PAUSE_CHAPTER = (2.0, 6.0)
+# 同一章节内相邻任务点之间的静置区间（秒）
+HUMAN_PAUSE_JOB = (3.0, 8.0)
+
+
 def process_job(chaoxing: Chaoxing, course: dict, job: dict, job_info: dict, speed: float,
                 only_kinds: set | None = None) -> StudyResult:
     """处理单个任务点。
@@ -341,7 +392,20 @@ def process_job(chaoxing: Chaoxing, course: dict, job: dict, job_info: dict, spe
     # 测验任务
     elif job["type"] == "workid":
         logger.trace(f"识别到章节检测任务, 任务章节: {course['title']}")
-        return chaoxing.study_work(course, job, job_info)
+        try:
+            return chaoxing.study_work(course, job, job_info)
+        finally:
+            # 🔴 2026-10-01：`work_feedback`（上一轮错题反馈）只应作用于**本次**章节检测。
+            #    它是有效功能（把错题+错答案喂给 AI，提高重做正确率，多选题尤其明显），
+            #    但**用完必须清**，否则会残留到后续任务 —— 尤其是紧接着的作业链路，
+            #    那份旧反馈会被塞进无关题目的 AI 提示词里。
+            #    `study_work` 内部有多个 return 点（全对 / 不可重做 / 重试耗尽 …），
+            #    逐个加清理容易漏；在**唯一的生产调用点**收口最稳（`main.py` 这处，
+            #    其余调用都在测试脚本里）。
+            try:
+                chaoxing.tiku.set_work_feedback(None)
+            except Exception as e:                                 # noqa: BLE001
+                logger.debug(f"清理章节检测错误反馈失败（忽略）：{e}")
     # 阅读任务
     elif job["type"] == "read":
         logger.trace(f"识别到阅读任务, 任务章节: {course['title']}")
@@ -723,6 +787,42 @@ def process_chapter(chaoxing: Chaoxing, course: dict[str, Any], point: dict[str,
     # 随机等待，避免请求过快
     chaoxing.rate_limiter.limit_rate(random_time=True, random_min=0, random_max=0.2)
 
+    # 🔴 2026-10-02 P2：进入未完成章节前先随机静置（拟人化，见 _human_pause 说明）。
+    #    放在 `has_finished` 早退之后 —— 已完成章节直接跳过，不浪费时间。
+    _human_pause(*HUMAN_PAUSE_CHAPTER, why="(章节间)")
+
+    # 🔴🔴 2026-10-04：**章节访问上报（setlog）** —— 「黄点」的根治手段。
+    #   背景（何同学发现"打开课程能看到好几个没刷的"）：
+    #     节点被平台标未完成（目录黄点、`has_finished=false`），但节点内的卡
+    #     却**全部 `isPassed=true`**。acc4 劳动教育有 11 个这样的节点。
+    #   试过、全部无效的 3 种姿势：
+    #     · `isdrag=4` 拖拽瞬间完成 ×20 次
+    #     · `isdrag=3` 满进度上报
+    #     · 重置进度**真实重播**（11 个节点全播完并"任务完成"）→ `has_finished` 一个不变
+    #   **有效的那一个**：用浏览器打开该节点页面 → 节点立刻变绿
+    #     （7.1.1、7.1.2 实测；再用 API 复现 7.1.3「视频」与 8.1「阅读」各一次即变绿）
+    #   抓包定位到页面 JS 发的两个请求：
+    #     ① GET `mooc-ans/mycourse/studentstudyAjax?...chapterId={节点id}`
+    #        → 返回的 HTML 里含一段 `<script src=".../log/setlog?...">`
+    #     ② GET `fystat-ans.chaoxing.com/log/setlog?personid=&courseId=&classId=&encode=&chapterId=`
+    #        （`encode` 由服务端生成，**与章节无关**，同一课程内通用）
+    #   ⇒ 「这类节点要的是**章节访问**，不是任务点上报」。纯 API 刷课从来不打开
+    #     章节页，所以这些节点永远刷不掉 —— 这就是"界面/API 说做了、平台仍黄点"
+    #     的真正成因。项目的 `_access_chapter_for_count` + `_extract_and_send_setlog`
+    #     本来就实现了这两个请求，只是没接进刷课流程。
+    #   ⚠️ 位置：`has_finished` 早退之后 —— 已完成章节不再浪费这 2 个请求。
+    #   ⚠️ 失败不阻塞刷课（它只是"补标记"，主流程照走）。
+    try:
+        chaoxing.rate_limiter.limit_rate(random_time=True, random_min=0, random_max=0.2)
+        _html = chaoxing._access_chapter_for_count(course, point)
+        if _html:
+            chaoxing._extract_and_send_setlog(_html)
+            logger.info(f"章节访问上报(setlog)完成 -> {point['title']}")
+        else:
+            logger.warning(f"章节访问上报无响应 -> {point['title']}")
+    except Exception as _e:                                          # noqa: BLE001
+        logger.warning(f"章节访问上报失败（不阻塞刷课）: {_e}")
+
     # 获取当前章节的所有任务点
     job_info = None
     jobs, job_info = chaoxing.get_job_list(course, point)
@@ -731,14 +831,26 @@ def process_chapter(chaoxing: Chaoxing, course: dict[str, Any], point: dict[str,
     if job_info.get("notOpen", False):
         return ChapterResult.NOT_OPEN
 
-    # 已经默认处理空任务，此处不需要判断
+    # 🔴 2026-10-03（何同学："不要每次没读取到全部的、没完成全部的就结束了"）
+    #   读不到任务点 ≠ 该章节没有任务点。
+    #   `get_job_list` 在「页面上确实有卡、却解析不出任何可执行任务」时会打
+    #   `blocked` 标记（并且**不再**上报"空页面完成"这个假成功）。
+    #   此处必须判 ERROR 交重试 —— 绝不能默认 SUCCESS，否则界面会显示"已完成"，
+    #   而平台侧的任务点一个都没达成（这就是"界面与平台不一致"的根源）。
+    #   重试到 `max_tries`(5) 后进 failed_tasks，会被**如实**记为失败。
     if not jobs:
-        pass
+        if job_info.get("blocked"):
+            logger.error(f"章节「{point['title']}」存在任务点但无可执行任务 —— 判定为未完成")
+            return ChapterResult.ERROR
+        return ChapterResult.SUCCESS
 
     job_results: list[StudyResult] = []
-    for job in jobs:
+    for idx, job in enumerate(jobs):
         result = process_job(chaoxing, course, job, job_info, speed, only_kinds)
         job_results.append(result)
+        # 🔴 2026-10-02 P2：相邻任务点之间也静置（最后一个之后不白等）
+        if idx < len(jobs) - 1:
+            _human_pause(*HUMAN_PAUSE_JOB, why="(任务点间)")
 
     # 有视频在等平台判定：章节未完结但也不算失败，交后台等待线程收尾
     if any(r == StudyResult.PENDING for r in job_results):

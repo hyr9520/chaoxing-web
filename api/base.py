@@ -89,6 +89,13 @@ class SessionManager:
         return cls._instance
 
     def __init__(self):
+        # ⚠️ 2026-10-03：曾尝试给这里加"只初始化一次"的守卫（第三方审计 B-08
+        #    指出每次 `cls()` 都会重建 Session），但**已回退**：
+        #    原行为"每次重建"同时意味着"每次只加载磁盘 cookie"，
+        #    是**多账号切换时清干净旧 cookie 的隐式保证**。
+        #    改成复用后，`cookies.update()` 只覆盖同名、不会删掉多余项，
+        #    切换账号会残留上一个账号的 `_uid` → 有真实的串号风险。
+        #    收益（连接复用）远小于该风险，故保持原样不动。
         self._session = requests.Session()
         self._session.mount("https://", HTTPAdapter(max_retries=10))
         self._session.mount("http://", HTTPAdapter(max_retries=10))
@@ -546,6 +553,143 @@ def random_answer(options: str, q_type: str) -> str:
     return answer
 
 
+def _random_exam_answer(q: dict, q_type: str) -> str:
+    """考试题随机兜底（何同学要求：**考试链路不能空着**）。
+
+    与 `random_answer()` 的区别 —— 考试题的 `options` 是 **list[dict]**
+    （`{"letter", "value", "text"}`，见 `api/exam.py` 的解析；且平台会把选项
+    乱序，`letter` ≠ `value`），而 `random_answer()` 是按字符串
+    `split("\\n")` 取首字母的 —— 直接把 list 传进去会 AttributeError。
+
+    所以这里直接按**显示字母**随机取，返回值交给 `exam.build_answer_form`
+    的 `_as_choice()` 映射成真实提交值 ⇒ 平台乱序也不会错位。
+
+    返回空串表示"确实无选项可随机"（调用方据此决定是否算跳过）。
+    """
+    letters: list = []
+    opts = q.get("options")
+    if isinstance(opts, (list, tuple)):
+        for o in opts:
+            if isinstance(o, dict):
+                L = str(o.get("letter") or "").strip().upper()
+                if L and L not in letters:
+                    letters.append(L)
+    elif isinstance(opts, str) and opts.strip():
+        for m in re.finditer(r"(?m)^\s*([A-Za-z])[\.、:：]?\s", opts):
+            L = m.group(1).upper()
+            if L not in letters:
+                letters.append(L)
+
+    if not letters:
+        # 填空 / 简答 / 未知题型没有选项可随机 → 复用占位词（与 random_answer 一致），
+        # 至少避免"平台侧完全未作答"。
+        if q_type in ("completion", "shortanswer", "unknown"):
+            ans = random.choice(["略", "无", "待补充"])
+            logger.info(f"随机兜底（{q_type} 占位）-> {ans}")
+            return ans
+        return ""
+
+    if q_type == "judgement":
+        ans = random.choice(["true", "false"])
+    elif q_type == "multiple" and len(letters) > 1:
+        ans = "".join(sorted(random.sample(letters, min(2, len(letters)))))
+    else:
+        ans = random.choice(letters)
+    logger.info(f"随机兜底（{q_type}，{len(letters)} 个选项）-> {ans}")
+    return ans
+
+
+_TRUE_WORDS = ("true", "t", "对", "正确", "是", "√", "1", "yes", "y", "ri")
+_FALSE_WORDS = ("false", "f", "错", "错误", "否", "×", "0", "no", "n", "wr")
+
+
+def _norm_true(x) -> bool:
+    """判断题答案归一化成 True/False —— 只用于"库 vs AI 是否一致"的比较。
+
+    ⚠️ 与 `api/exam.py:_as_judge` 的区别：那个识别不了时**默认 true**（提交用，
+       偏保守地给个合法值）；这里识别不了**一律 False**（比较用，宁可判"不一致"
+       也不要误判成"一致"从而跳过核对）。
+    """
+    s = str(x or "").strip().lower()
+    if s in _TRUE_WORDS:
+        return True
+    if s in _FALSE_WORDS:
+        return False
+    if len(s) <= 8:                     # 只对短文本做包含判断，避免长句误伤
+        if "正确" in s or "对" in s:
+            return True
+        if "错误" in s or "错" in s:
+            return False
+    return False
+
+
+def _judge_from_text(text: str) -> str:
+    """从**任意文本**里提取判断题答案，返回 `正确`/`错误`；提取不出返回 ""。
+
+    与 `_norm_true` 的区别（必须分清）：
+      · `_norm_true` 识别不了时返回 **False** —— 用于"库 vs AI 比较"，
+        宁可判"不一致"也不要漏掉复核。
+      · 本函数识别不了时返回 **""** —— 用于**提交前格式闸门**，
+        宁可交回原值让人看出来，也不能凭空造一个判断值。
+
+    实测事故（2026-10-12 acc2 第 71 题）：AI 对判断题返回了
+    `这是人类航天史上的里程碑` —— 这是**解释**不是答案。
+    旧逻辑直接 return，于是平台收到非法值。
+    """
+    s = str(text or "").strip().lower()
+    if not s:
+        return ""
+    # 判断题的 A/B 约定：A=正确、B=错误（与考试页选项一致）。
+    # ⚠️ 必须**先于**词表查 —— `_TRUE_WORDS`/`_FALSE_WORDS` 里没有 a/b。
+    if s in ("a", "t"):
+        return "正确"
+    if s in ("b", "f"):
+        return "错误"
+    if s in _TRUE_WORDS:
+        return "正确"
+    if s in _FALSE_WORDS:
+        return "错误"
+    # 否定式**必须先于**肯定式判断，否则「不正确」会被 "正确" 命中成"正确"
+    if any(k in s for k in ("不正确", "不对", "并非", "不是", "没有", "错误")):
+        return "错误"
+    if any(k in s for k in ("正确", "是对的", "没错", "成立")):
+        return "正确"
+    return ""
+
+
+def _vote_raw(tiku, q: dict, n: int = 2) -> list:
+    """连续调 n 次 `force_retry`（每次**内部换槽位** ⇒ 不同模型），返回原始答案列表。
+
+    这是所有"多模型投票"的公共底座（判断题、多选题共用），避免重复实现。
+
+    实现要点：
+      · 必须对**同一个 provider 连续调 n 次**，不能"每个 provider 各取一票"：
+        `force_retry` 每次都会 `_next_key()` 切到下一个槽位 ⇒ 拿到不同模型。
+        （自测抓到：按 provider 循环时只有 1 个 provider，只得到 1 票。）
+      · 任一票拿不到就**提前返回已有票数**，不阻塞主流程。
+    """
+    out = []
+    providers = getattr(tiku, "providers", None) or [tiku]
+    ai = next((p for p in providers
+               if callable(getattr(p, "force_retry", None))), None)
+    if ai is None:
+        return out
+    for _ in range(n):
+        try:
+            a = ai.force_retry(q)
+        except Exception:                                        # noqa: BLE001
+            break
+        if not (a and str(a).strip()):
+            break
+        out.append(a)
+    return out
+
+
+def _judge_vote(tiku, q: dict, n: int = 2) -> list:
+    """判断题：返回 `['正确'/'错误', ...]`（基于 `_vote_raw` 归一）。"""
+    return ["正确" if _norm_true(a) else "错误" for a in _vote_raw(tiku, q, n)]
+
+
 def _ai_last_resort(tiku, q: dict) -> str:
     """**随机蒙之前的最后一道**：让 AI 换个模型再答一次（2026-09-29 新增）。
 
@@ -567,10 +711,62 @@ def _ai_last_resort(tiku, q: dict) -> str:
             if callable(fn):
                 ans = fn(q)
                 if ans and str(ans).strip():
-                    return str(ans).strip()
+                    return _map_rescue_answer(str(ans).strip(), q)
     except Exception as e:                                     # noqa: BLE001
         logger.debug(f"随机前 AI 重答失败（忽略，照常随机）：{e}")
     return ""
+
+
+def _map_rescue_answer(ans: str, q: dict) -> str:
+    """把 AI「救援答案」从**选项内容**映射回**选项字母**（2026-09-30 修）。
+
+    为什么必须有这一步 —— 4.3「下列不属于国内探方编码的是」实证：
+    `force_retry` 换模型重答**成功**，返回 `'a\\nI\\nα'`，但那正是 AI 按提示词
+    设计要求输出的「选项内容」；而**救援分支在 `if not res:` 里，完全跳过了
+    主流程的"内容→字母"映射**，于是原样填进表单 →
+    `check_submittable('a\\nI\\nα', 'multiple')` 判 False → 整题被判"不可提交"
+    → 覆盖率跌破阈值 → 只暂存不提交（用户看到的就是"这一节像没做"）。
+
+    返回：映射成功 → 字母串；映射不出且原格式不合法 → 空串（让上层走随机，
+    至少保证提交格式合法）；其余情况原样返回。
+    """
+    t = q.get("type")
+    if t not in ("single", "multiple"):
+        return ans
+    opts = q.get("options") or ""
+    # 🔴 2026-10-12 真机事故（acc2《机器的征途》第 50 题）：**这里必须先 coerce**。
+    #   `map_multiple_answer` 内部有 `_coerce_options_str`（能把 list[dict] 转成
+    #   "A. xxx\nB. xxx"），但**本行的校验没有** —— 直接把 `list[dict]` 喂给
+    #   `multi_cut`（它按 HTML/文本解析）⇒ 解析出 `["'", '[', '{']` 这种垃圾
+    #   ⇒ `_valid` 全废 ⇒ 映射结果被判"含非法选项字母"而**丢弃**
+    #   ⇒ 原样返回 `NMD`（选项内容）→ 平台判 0 分。
+    #   与 2026-09-27 那次是同一个病的另一处漏网（那次只修了 map_* 内部）。
+    opts_str = _coerce_options_str(opts)
+    try:
+        mapped = (map_multiple_answer(ans, opts_str) if t == "multiple"
+                  else map_single_answer(ans, opts_str))
+        # ⚠ 映射结果必须"每个字母都落在本题选项字母集里"才算可信。
+        #   实测（4.3 的单字符选项 `A a / B I / C α / D T1`）map_multiple_answer
+        #   会吐出 `'ACI'` —— 而 'I' 根本不是本题的选项字母，属误映射。
+        #   这种情况宁可弃用、走随机（随机出来的格式一定合法）。
+        if mapped:
+            _valid = {o[:1].upper() for o in (multi_cut(opts_str, "") or [])
+                      if o[:1].strip()}
+            if not _valid or all(c in _valid for c in mapped):
+                logger.info(f"救援答案已映射为选项字母：{ans[:40]!r} -> {mapped!r}")
+                return mapped
+            logger.warning(
+                f"救援答案映射结果 {mapped!r} 含非法选项字母"
+                f"（本题合法 {sorted(_valid)}），弃用改走随机")
+        # 映射不出来：若原答案格式对平台就不合法（如多选题带着内容串），
+        # 交上去必然解析不了 —— 返回空串，交由上层随机（格式一定合法）。
+        if not check_submittable(ans, t):
+            logger.warning(
+                f"救援答案无法映射为选项字母，改走随机兜底：{ans[:40]!r}")
+            return ""
+    except Exception as e:                                     # noqa: BLE001
+        logger.debug(f"救援答案映射异常（原样返回）：{e}")
+    return ans
 
 
 def _parse_work_record_list(html_text: str) -> list[tuple[int, float]]:
@@ -586,6 +782,13 @@ def _parse_work_record_list(html_text: str) -> list[tuple[int, float]]:
     records = []
     times_list = re.findall(r'viewNum">第(\d+)次', html_text)
     scores = re.findall(r'viewScore">([\d.]+)分', html_text)
+    # 🔴 2026-10-08 移植上游 PR #626（2026-09-28 已合并）：
+    #   次数/成绩数量不齐时，`zip` 会**静默错位**（把第 N 次的成绩配到第 M 次上），
+    #   导致后续"分数捷径"判断拿到错误的历史最高分。页面改版或部分成绩未出时即触发。
+    #   兜底：数量不齐时成绩全部按 0 处理 —— 放弃分数捷径，仅做逐题比对（更保守）。
+    if len(times_list) != len(scores):
+        logger.warning(f"作答记录次数/成绩数量不匹配({len(times_list)}/{len(scores)})，成绩按0处理")
+        scores = ['0'] * len(times_list)
     for t, s in zip(times_list, scores):
         try:
             records.append((int(t), float(s)))
@@ -602,7 +805,9 @@ def _parse_work_record_detail(html_text: str) -> list[dict]:
         html_text: record-detail 页面 HTML
 
     Returns:
-        每题信息列表：{id, title, type_label, my_answer, correct_answer}
+        每题信息列表：{id, title, type_label, my_answer, correct_answer, parse_ok}
+        parse_ok=False 表示"我的答案/正确答案"至少一个未能从页面提取出来
+        （页面结构变体），调用方**不得**据此判定对错（否则两侧同为 '' 会被误判"全对"）。
     """
     questions = []
     # 兼容两种详情页结构：class 在前（"TiMu ... singleQuesId"）或 data 在前
@@ -628,21 +833,91 @@ def _parse_work_record_detail(html_text: str) -> list[dict]:
             title = ""
         title = re.sub(r'\s+', ' ', title).strip()
 
-        # 我的答案
-        mam = re.search(r'我的答案：</span>\s*<div class="fl answerCon">\s*(.*?)\s*</div>', qb, re.S)
-        my_answer = re.sub(r'<[^>]+>', '', mam.group(1)).strip() if mam else ''
+        # 我的答案/正确答案：多模式匹配，兼容属性顺序变化与额外 class 的页面变体
+        #
+        # 🔴 2026-10-08 移植上游 PR #626（2026-09-28 已合并）：
+        #   原为**单模式** `我的答案：</span><div class="fl answerCon">`。
+        #   页面变体（class 带额外后缀、换成 span 承载）时两个字段**同时**提取失败 ⇒
+        #   两侧都是空串 ⇒ 调用方逐题比对时 `'' == ''` ⇒ **误判"全部正确"**
+        #   —— 这是"0 分也当通过"的假成功路径。
+        #   改为多模式 + `parse_ok` 标记，把"没解析出来"与"解析出来是空"区分开。
+        _ans_patterns = [
+            r'{label}[:：]</span>\s*<div class="fl answerCon">\s*(.*?)\s*</div>',
+            r'{label}[:：]\s*</span>\s*<div[^>]*class="[^"]*answerCon[^"]*"[^>]*>\s*(.*?)\s*</div>',
+            r'{label}[:：]\s*</span>\s*<span[^>]*>\s*(.*?)\s*</span>',
+        ]
 
-        # 正确答案
-        cam = re.search(r'正确答案：</span>\s*<div class="fl answerCon">\s*(.*?)\s*</div>', qb, re.S)
-        correct_answer = re.sub(r'<[^>]+>', '', cam.group(1)).strip() if cam else ''
+        def _extract_answer(label):
+            """返回提取到的答案文本；**未匹配到返回 None**（与"匹配到但为空"区分）。"""
+            for _pat in _ans_patterns:
+                _m = re.search(_pat.format(label=label), qb, re.S)
+                if _m:
+                    return re.sub(r'<[^>]+>', '', _m.group(1)).strip()
+            return None
+
+        my_raw = _extract_answer('我的答案')
+        correct_raw = _extract_answer('正确答案')
 
         questions.append({
             "id": qid,
             "title": title,
             "type_label": type_label,
-            "my_answer": my_answer,
-            "correct_answer": correct_answer,
+            "my_answer": my_raw or '',
+            "correct_answer": correct_raw or '',
+            # 两侧都提取到才算可信；任一为 None ⇒ 该题不参与对错判定
+            "parse_ok": my_raw is not None and correct_raw is not None,
         })
+    # 🔴🔴 2026-10-08 **修复本项目丢失的返回值**（上游一直有 `return questions`）：
+    #   本项目该函数从 2026-10-03（更早的备份同样）起**缺少本行** ⇒ 函数恒返回 None ⇒
+    #   所有调用方都拿不到数据：
+    #     · `_verify_submit_accepted`（提交后自检）→ 恒判"解析为空，跳过自检"
+    #       ⇒ **「答案是否真被平台接收」这道保护形同虚设**（本项目自己注释里
+    #         明确说"接口成功 ≠ 答案被接收"，这道检查正是为此而设）。
+    #     · `_check_work_result` 主路线 → 恒走"回退到题目页作答块解析"分支。
+    #   注意：返回空列表 `[]`（页面确实无题目）与返回 `None` 都会让调用方走
+    #   `if not detail` 分支，行为一致；只有**页面确实解析出题目**时才会改变走向。
+    return questions
+
+
+# 🔴 2026-10-08 移植上游 PR #626（2026-09-28 已合并）：答案文本归一化。
+#
+#   背景：`_check_work_result` 的老结构详情页路径用 `my_answer != correct_answer`
+#   逐题比对。但两处文本常因**纯格式差异**不等，导致"实际全对却判定有错" ⇒
+#   触发**无谓重做**（重做会重新提交，增加请求量与风控暴露；对"仅允许作答一次"
+#   的课程还可能直接失败）。
+#
+#   实测差异形态：
+#     · 判断题：页面写"对"，答案是"true"/"T"/"√"/"正确"
+#     · 选项：页面写"A."，答案写"A"
+#     · 标点：全角"、"vs 半角","、句末多余标点
+#
+#   归一化是**确定性**的：两侧同格式必然相等；跨格式差异（字母 vs 选项全文）
+#   不在此处理，交由调用方的满分/分数兜底。
+_JUDGE_TRUE_SET = {'TRUE', 'T', '1', '对', '正确', '√', '是', 'YES', 'Y'}
+_JUDGE_FALSE_SET = {'FALSE', 'F', '0', '错', '错误', '×', 'X', '否', 'NO', 'N',
+                    '不对', '不正确'}
+
+
+def normalize_answer_text(ans) -> str:
+    """作答详情答案归一化：消除 对/错 与 true/false、全半角标点等格式差异。"""
+    s = re.sub(r'\s+', '', str(ans or '')).upper()
+    if s in _JUDGE_TRUE_SET:
+        return 'TRUE'
+    if s in _JUDGE_FALSE_SET:
+        return 'FALSE'
+    if re.fullmatch(r'[A-Z0-9]+', s):
+        return s
+    # 形如 "A." / "A、" / "A:" / "A)" 的**单个选项字母**：归一化为字母本身。
+    #   上游原实现会先删掉 "A." 前缀得到**空串** ⇒ 与 "A" 不相等 ⇒ 误判为错。
+    #   本项目详情页常见 "A"、"A."、"A、" 混用，故补这条（只命中"字母+一个标点"）。
+    m_opt = re.fullmatch(r'([A-Z])[.、:：?？)）]', s)
+    if m_opt:
+        return m_opt.group(1)
+    # 去掉开头的选项字母前缀（"A." "A、" "A:" "A)" "A？" "A）"）
+    s = re.sub(r'^[A-Z][.、:：)?）]', '', s)
+    # 去掉句中/句末标点（全半角）
+    s = re.sub(r'[，。、！？；：,.!?;:()（）\[\]【】"“”‘’\-_/\\|]', '', s)
+    return s
 
 
 def _parse_answer_blocks(html_text: str) -> list[dict]:
@@ -849,7 +1124,12 @@ class Chaoxing:
         if login_with_cookies:
             logger.info("Logging in with cookies")
             SessionManager.update_cookies()
-            logger.debug(f"Logged in with cookies: {SessionManager.get_instance()._session.cookies}")
+            # 🔴 2026-10-03（第三方审计 B-10）：原样打印 cookies 会把 `_uid`/`fid`/`_d`
+            #    等登录票据写进 chaoxing.log（该 sink 是 TRACE 级、10MB 轮转）
+            #    —— 日志文件即账号凭证。只打印 cookie **名**，不打印值。
+            logger.debug("Logged in with cookies: %s"
+                         % ", ".join(sorted(SessionManager.get_instance()
+                                            ._session.cookies.keys())))
             if not self._validate_cookie_session():
                 logger.warning("Cookie 登录校验失败，尝试使用账号密码重新登录")
                 if self.account and self.account.username and self.account.password:
@@ -878,7 +1158,12 @@ class Chaoxing:
             "independentId": 0,
         }
         logger.trace("正在尝试登录...")
-        resp = _session.post(_url, headers=gc.HEADERS, data=_data)
+        # 🔴 2026-10-01 修：补 timeout。这是全项目**唯一**漏掉超时的关键请求，
+        #    而且它被类级 `_login_lock` 包着（见 relogin_if_needed）——
+        #    一旦服务端建连后不回包（半开连接/丢包/限速），该线程会永久阻塞在
+        #    socket recv 上，**所有** 后续 worker 全部卡在这把锁上 → 整个实例停摆。
+        resp = _session.post(_url, headers=gc.HEADERS, data=_data,
+                             timeout=(5, 20))   # (连接, 读取)
         if resp and resp.json()["status"] == True:
             save_cookies(_session)
             SessionManager.update_cookies()
@@ -1070,7 +1355,11 @@ class Chaoxing:
 
     def get_job_list(self, course: dict, point: dict) -> tuple[list[dict], dict]:
         _session = SessionManager.get_session()
-        self.rate_limiter.limit_rate()
+        # 🔴 2026-10-02 P1：开启随机抖动。原为固定 0.5s 间隔 —— 外部调研显示
+        #   「过于均匀/规律的请求间隔会被判定为自动化脚本」（TrueSight 分析报告），
+        #   而 `RateLimiter` 本身就支持随机抖动，只是这里没开。0~0.5s 的抖动
+        #   不影响吞吐（原本就有 0.5s 基础间隔），只消除"机械规律"这个特征。
+        self.rate_limiter.limit_rate(random_time=True, random_max=0.5)
         job_list = []
         job_info = {}
 
@@ -1090,15 +1379,62 @@ class Chaoxing:
             "mooc2": 1
         }
 
-        # 学习界面任务卡片数（2026-09-13 性能优化）：
-        # 超星用 num 参数分页返回章节内的任务点卡片，原实现**固定试 0~6 共 7 次
-        # 请求/章节** —— 实测 27 章的课程就是 189 次请求，这是"读得慢"的主因。
-        # 绝大多数章节只有 1 个卡片，因此改为**连续 2 次返回空就停**：
-        #   · 单卡片章节：num=0 命中 → num=1 空 → num=2 空 → 停（3 次，省 57%）
-        #   · 多卡片章节：逐次累加，直到连续 2 次为空（语义与原来一致，不丢任务点）
-        # 保留"累加所有非空结果"，所以行为等价，只是不再无谓地试到最后。
+        # 🔴 2026-10-03（审核后定稿）：分页探测
+        #
+        #   坑 A —— **判"该页无内容"不能看解码后的任务列表**。
+        #     已完成的卡会被 `_process_attachment_cards` 按 isPassed 正常过滤掉，
+        #     "过滤后为空" ≠ "页面无卡"。旧的 `_empty_streak` 正是这么算的，
+        #     于是会**提前 break**，后面的页再也不被请求。
+        #     ⇒ 现在**不做提前退出**（num 范围已经很窄，多试几次成本可忽略）。
+        #
+        #   坑 B —— **同一张卡可能被多个 num 重复返回**，必须去重，
+        #     否则同一个视频会被重复处理/播放。
+        #
+        #   ⚠️ 关于 num 的取值范围（**实测结论，别再猜**）：
+        #     对 acc2 安全人机的节点逐一试过 num=0..24：
+        #       · **只有 `0` 和 `1` 有卡**，`2` 及以上全部返回 0 张
+        #       · 非数字（`a`/`b`/`f`）被服务端当作 `0`，返回与 num=0 相同的内容
+        #     ⇒ 用 `"012"` 即可覆盖（0/1 有效 + 1 次冗余探测）。
+        #       曾经写成 `"0123456789abcdef"`（误以为 num 是十六进制），
+        #       那会把每章节的请求数从 ~2-3 次放大到 **16 次**，
+        #       在批量刷课场景下是无谓的**请求量放大**（风控隐患），故收窄。
+        #       —— 收窄后每章节请求数与改动前基本持平甚至更少。
+        # 🔴 2026-10-03（何同学："一定要保持界面展示的真实性" +
+        #   "不要每次没读取到全部的就结束了"）：本方法有两条**不能撒谎**的约束：
+        #     1) 节点被平台标为「未完成」时，卡上的 `isPassed=true` 不可信
+        #        ⇒ 放行 `job=True` 的真任务点让它**重做**（见 `_process_attachment_cards`）
+        #     2) `job_list` 为空时**不能无条件**上报"空页面完成" ——
+        #        那会让界面显示已完成、而平台侧永远黄点。
+        _force_redo = not point.get("has_finished", False)
+        _seen_jobs = set()
+        _raw_total = 0          # 本次请求到的**原始卡片总数**（含已完成/附属卡）
+
+        # 🔴🔴 2026-10-07 何同学定案：**`num` 是「节点内页签序号」，必须自适应扫完所有页签**。
+        #
+        #   背景（acc10《生态文明建设》28 个黄点，跨账号复现，与账号无关）：
+        #     一个节点可含**多个页签**（tab），每个页签一个 cardid，`num=0,1,2,...` 依次取：
+        #       0=学前任务(常空) / 1=学习视频(video) / 2=课件资料(document)
+        #       / 3=**课后小测(workid, job=true 真任务点)** / 4=拓展学习(插入图书附属卡)
+        #     旧代码硬编码 `for _possible_num in "012"` —— **只扫 3 个页签**，
+        #     于是 28 个「5 页签」节点的 `num=3 课后小测` **从未被请求、从未被做**
+        #     ⇒ 节点永远黄点（实测：已完成节点全是 1~2 页签；28 个未完成节点全是 5 页签）。
+        #   何同学原话：「它应该是把所有卡片全部列出来，而不是只固定读取卡片」
+        #                「这种多张卡片的，需要把全部卡片都过一遍才会变绿。
+        #                  但是一般也只用看视频和做章节测验，其他的只需要过一遍就行」
+        #
+        #   实现：从 num=0 起**连续向后探测**，直到**连续 `_EMPTY_STREAK_STOP` 次**取不到
+        #   任何原始卡为止（页签是连续的，遇到空即到头；连续判空是为了容忍中间偶发空页签）。
+        #   · 页签 ≤3 的节点：请求数与旧实现相同（num=0/1/2 后即停）
+        #   · 5 页签节点：多 2~3 个请求（num=3 有卡、num=4 有卡、num=5 空）
+        #   · 上限 `_NUM_MAX` 兜底，防御服务端异常时无限循环
+        #
+        #   附：`num` 与页签的对应关系是**实测**结论 —— 非数字入参（`a`/`b`）被服务端
+        #       当作 `0`，返回与 num=0 相同内容；故只递增数字。
+        _NUM_MAX = 10              # 页签序号上限（防御性兜底）
+        _EMPTY_STREAK_STOP = 2     # 连续 N 次取不到原始卡即判定"到头"
         _empty_streak = 0
-        for _possible_num in "0123456":
+        for _num_i in range(_NUM_MAX):
+            _possible_num = str(_num_i)
 
             logger.trace("开始读取章节所有任务点...")
 
@@ -1109,25 +1445,51 @@ class Chaoxing:
                 logger.error(_resp.text[:500])
                 return [], {}
 
-            _job_list, _job_info = decode_course_card(_resp.text)
+            _job_list, _job_info = decode_course_card(_resp.text,
+                                                      keep_passed_task=_force_redo)
             if _job_info.get("notOpen", False):
                 # 直接返回, 节省一次请求
                 logger.info("该章节未开放")
                 return [], _job_info
 
-            job_list += _job_list
+            # 🔴 2026-10-07 移植上游 PR #630：`noCard` = 该 num 没有对应标签页
+            #   （页面里 `mArg = $mArg` 未被填充）⇒ 页签到头，**立即**停止探测。
+            #   这是**加速**判据：更早知道"没有了"，少发请求。
+            #   ⚠️ 保守加法：即便 noCard 判据失效（上游语义变化），
+            #      下面的 `_empty_streak` 兜底仍然照常工作 ⇒ 不会漏扫页签。
+            if _job_info.get("noCard", False):
+                logger.trace(f"num={_possible_num} 无对应标签页(noCard)，停止探测")
+                break
+
+            _raw = _job_info.get("raw_cards", 0)
+            _raw_total += _raw
+            for _j in _job_list:
+                _key = (_j.get("type"), str(_j.get("jobid") or _j.get("mid") or ""))
+                if _key in _seen_jobs:
+                    continue
+                _seen_jobs.add(_key)
+                job_list.append(_j)
             job_info.update(_job_info)
 
-            if _job_list:
-                _empty_streak = 0
-            else:
+            # 自适应收尾：该页签无原始卡 → 累加空计数；有卡则清零
+            if _raw <= 0:
                 _empty_streak += 1
-                if _empty_streak >= 2:
-                    logger.trace(f"连续 2 次无任务点(num={_possible_num})，停止探测")
+                if _empty_streak >= _EMPTY_STREAK_STOP:
                     break
+            else:
+                _empty_streak = 0
 
         if not job_list:
-            self.study_emptypage(course, point)
+            if _raw_total > 0:
+                # 页面上**确实有卡**，却解析不出任何可执行任务 ⇒ 异常。
+                # 绝不能上报"空页面完成"（那是**假成功**：界面会显示已完成，
+                # 而平台侧的任务点一个都没达成）。打 blocked 标记交上层判定的。
+                logger.error(f"章节「{point.get('title')}」取到 {_raw_total} 张原始卡片，"
+                             f"但没有任何可执行任务 —— 不上报完成，交上层处理")
+                job_info["blocked"] = True
+            else:
+                # 页面上确实一张卡都没有（纯目录/标题节点）⇒ 才允许上报空页面完成
+                self.study_emptypage(course, point)
 
         # 🔴 2026-09-29 截断（同 get_course_point）：本方法**每刷一个章节任务点
         # 都会调用**，原样打印整页 HTML → 日志被彻底淹没，排查"卡住"时看不到
@@ -1407,6 +1769,14 @@ class Chaoxing:
         # playingTime 推到 duration，服务器比对真实耗时与进度增量会发现严重不匹配，
         # 判定为拖拽作弊，isPassed 迟迟不给 true（实测 4.1/4.2 要干等 5-10 分钟）。
         passed = False
+        # ⛔ 2026-10-04 19:5x 实测记录：`forced_redo`（对该类节点走"重置进度、
+        #   真实重播"）**试过、无效** —— acc4 劳动教育 11 个黄点节点全部真实重播
+        #   并"任务完成"，平台 `has_finished` **一个都没变**（仍 11 个）。
+        #   同批还试过 isdrag=4 瞬间完成 20 次、isdrag=3 满进度上报，全都无效。
+        #   结论：这类节点（平台标未完成、卡内却全 `isPassed=true`）属**平台侧
+        #   数据不一致** —— 页面汇总已 41/41 满，平台自己也不把它们算作缺口，
+        #   程序无法通过学习行为消除，留着重播只会白耗时间。
+        #   ⇒ 保持原实现（瞬间完成），不再走重播。
         if play_time > 0:
             passed, state = self.video_progress_log(_session, _course, _job, _job_info, _dtoken, duration, duration,
                                                     _type, headers=headers, _isdrag=4)
@@ -1577,8 +1947,27 @@ class Chaoxing:
             return StudyResult.SUCCESS
 
     def study_work(self, _course, _job, _job_info) -> StudyResult:
-        if self.tiku.DISABLE or not self.tiku:
-            return StudyResult.SUCCESS
+        # 🔴 2026-10-04（何同学要求：界面必须真实反映平台完成度，不能"没做完就报成功"）：
+        #   原实现 `return StudyResult.SUCCESS` —— 题库不可用时**一个字符都没提交，
+        #   却按"成功"计**，上层据此认为该章节已完成 ⇒ 界面显示完成、平台仍是黄点。
+        #
+        #   真机证据（acc10 / 习近平经济思想概论 / 10-04 13:25 那轮）：
+        #     · `识别到章节检测任务` 104 次
+        #     · 紧随其后全部是 `Task success`（同秒），中间**无任何答题日志**
+        #     · 全时段 `章节检测题库覆盖率` / `提交答题成功` = **0 条**
+        #     · 平台进度停在 23/49（视频做了、测验一个没做）
+        #   ⇒ 26 个测验全部被这里静默吞掉。
+        #
+        #   现改为**如实返回 ERROR**：没做成就是没做成，宁可让上层记为失败
+        #   （复核会给出"仍有 N 个未完成"的明确结论），也不伪装成成功。
+        #   ⚠️ 顺带修：原写法 `self.tiku.DISABLE or not self.tiku` 在 `tiku is None`
+        #   时会先求值 `.DISABLE` 而抛 AttributeError（顺序反了）。改为先判空。
+        if not self.tiku or getattr(self.tiku, "DISABLE", False):
+            logger.warning(
+                f"[章节检测] 题库不可用（DISABLE={getattr(self.tiku, 'DISABLE', '?')}），"
+                f"该测验**未作答**，如实上报失败 -> {(_course or {}).get('title')}"
+            )
+            return StudyResult.ERROR
 
         # 每个章节检测独立计数：rollback_times 若跨章节残留，会让后续所有章节
         # 满足 "rollback_times >= 1" 从而绕过覆盖率检查强制提交（无答案也提交）。
@@ -1659,11 +2048,27 @@ class Chaoxing:
 
             _ORIGIN_HTML_CONTENT = final_resp.text  # 用于配合输出网页源码, 帮助修复#391错误
 
-            # 2. 设置上一轮错误反馈（供AI重新作答时参考）
-            if feedback_history and hasattr(self.tiku, 'set_work_feedback'):
+            # 2. 设置上一轮错误反馈（供 AI 重新作答时参考）
+            #    这是**有效功能**（何同学 2026-10-01 澄清）：把自己上次答错的题
+            #    连带那个错误答案一起喂给 AI，让它这次避开 —— 多选题重做时尤其有用
+            #    （平台判 `bandui` 不会说哪个选项对，但"这个组合不通过"本身有信息量）。
+            #
+            #    🔴 但必须**每轮无条件调用**（原代码写作 `if feedback_history and ...`，
+            #       只在非空时设置，且全项目没有任何复位点）：
+            #         · 第 0 轮 `feedback_history` 是 None → 顺带清掉**上一个测验**的残留；
+            #         · 重做轮（attempt≥1）拿到真实反馈 → 正常注入。
+            #       否则一次答错的反馈会永久残留，被塞进后续无关题目的 prompt。
+            #
+            #    ⚠️ `work_feedback` 现在**只影响 AI 的提示词**，不再充当
+            #       "跳过 cache / 跳过本地题库"的开关 —— 那个**整卷级**的全局跳过
+            #       已删除，改为由 `wrong` 列表**按题**否决（见 answer.py 的
+            #       `local_tiku_answer` 与 `query_all` 的 cache 分支）。
+            #       病根是：一道题答错就把整卷所有题都拖去问 AI，代价与收益完全不成比例。
+            #
+            #    任务结束后的清空见 `main.py` 的 workid 分支（唯一生产调用点）。
+            if hasattr(self.tiku, 'set_work_feedback'):
                 try:
-                    self.tiku.set_work_feedback(feedback_history)
-                    logger.debug("已将上一轮错误反馈设置到题库")
+                    self.tiku.set_work_feedback(feedback_history or None)
                 except Exception as e:
                     logger.warning(f"设置题库错误反馈失败: {e}")
 
@@ -1880,17 +2285,35 @@ class Chaoxing:
             # 覆盖率只统计"答案确实可用"的题：
             # 之前只看 found_answers（搜到即算），导致格式非法（如带题号的听力答案、
             # 空串）也被算作有效，覆盖率虚高到 100% 后直接提交 —— 平台解析不了 → 0 分。
+            # 2026-09-30 用户要求：**随机兜底的答案也算「填了」**。
+            # 原逻辑只认 answerSource=="cover"，于是「题库没命中 → AI 换模型 →
+            # 随机」这条链填进去的答案被判为"不可提交" → 覆盖率跌破阈值 →
+            # 只暂存不提交 → 平台侧这一节永远显示"未完成"，用户还得手点进去
+            # 自己蒙一次（用户原话：「看着这一节就像没做一样」）。
+            # 现改为 cover / random / ai-retry 三类都算 usable，
+            # 但**单独统计随机占比**，由下面的闸门限制"整卷靠蒙"。
             usable = 0
+            _hit = 0          # 真实命中（题库 / 学习库 / AI 直接给出，格式合法）
+            _guessed_n = 0    # 随机兜底（random / ai-retry）
             for q in questions["questions"]:
                 filled = q["answerField"][f'answer{q["id"]}']
-                if (q.get(f'answerSource{q["id"]}') == "cover"
+                _src = q.get(f'answerSource{q["id"]}')
+                if (_src in ("cover", "random", "ai-retry")
                         and check_submittable(filled, q.get("type"))):
                     usable += 1
+                    if _src == "cover":
+                        _hit += 1
+                    else:
+                        _guessed_n += 1
                 else:
                     logger.warning(
                         f"答案不可提交，本应放弃该题 -> {q['title'][:60]} 填写值={filled!r}")
-            cover_rate = (usable / total_questions) * 100
-            logger.info(f"章节检测题库覆盖率： {cover_rate:.0f}%（可用答案 {usable}/{total_questions}）")
+            cover_rate = (_hit / total_questions) * 100
+            guess_rate = (_guessed_n / total_questions) * 100
+            fill_rate = (usable / total_questions) * 100
+            logger.info(
+                f"章节检测题库覆盖率： {cover_rate:.0f}%（可用答案 {usable}/{total_questions}，"
+                f"填充率 {fill_rate:.0f}%；其中真实命中 {_hit}、随机兜底 {_guessed_n} = {guess_rate:.0f}%）")
             # 提交模式  现在与题库绑定,留空直接提交, 1保存但不提交
             is_manual_mode = (
                     getattr(self.tiku, 'is_manual', False) or
@@ -1903,9 +2326,27 @@ class Chaoxing:
                 questions["pyFlag"] = "1"
             elif is_manual_mode or cover_rate >= self.tiku.COVER_RATE * 100 or self.rollback_times >= 1:
                 questions["pyFlag"] = ""
+            elif (fill_rate >= self.tiku.COVER_RATE * 100
+                  and guess_rate <= getattr(self.tiku, "GUESS_MAX_RATIO", 0.5) * 100):
+                # 覆盖率没达标，但**每题都填上了**（填充率达标），只是其中一部分是
+                # 随机兜底补的、且占比在容忍范围内 → 按用户要求**照常提交**：
+                # 交上去至少有蒙对的机会；不交则平台侧这一节显示"未完成"，
+                # 用户还得手点进去自己选一次。
+                #
+                # ⚠ 必须先卡 fill_rate：否则"一题都没答出来"时 guess_rate = 0
+                #   反而满足"随机占比低"的条件 → 空卷被提交（09-26 的 0 分就是这类）。
+                questions["pyFlag"] = ""
+                logger.info(
+                    f"覆盖率 {cover_rate:.0f}% 低于 {self.tiku.COVER_RATE * 100:.0f}%，"
+                    f"但填充率 {fill_rate:.0f}% 达标、随机兜底只占 {guess_rate:.0f}%"
+                    f"（≤ {getattr(self.tiku, 'GUESS_MAX_RATIO', 0.5) * 100:.0f}%）"
+                    f"-> 按用户要求照常提交")
             else:
                 questions["pyFlag"] = "1"
-                logger.info(f"章节检测题库覆盖率低于{self.tiku.COVER_RATE * 100:.0f}%，不予提交")
+                logger.warning(
+                    f"覆盖率 {cover_rate:.0f}% 不足（填充率 {fill_rate:.0f}%），"
+                    f"随机兜底占 {guess_rate:.0f}% "
+                    f"-> 不予提交（避免空卷或整卷靠蒙）")
             # 组建提交表单
             if questions["pyFlag"] == "1":
                 for q in questions["questions"]:
@@ -2106,11 +2547,13 @@ class Chaoxing:
                     return StudyResult.ERROR
 
             # 4.1 提交后自检：接口返回成功不等于答案被接收，回查服务端回显
+            #     ⚠️ 必须传 q_list —— 此刻 questions["questions"] 已被 del，
+            #        不传的话自检会读到空列表并静默跳过（见 _verify_submit_accepted 说明）
             _work_id = str(questions.get("workId", "") or _job["jobid"].replace("work-", ""))
             _work_answer_id = str(questions.get("workAnswerId", "") or "")
             if self._verify_submit_accepted(
                     _session, _course, _job, _job_info, questions,
-                    _work_id, _work_answer_id) is False:
+                    _work_id, _work_answer_id, q_list) is False:
                 return StudyResult.ERROR
 
             # 5. 若只是保存未提交，无法判断成绩，保持原有行为
@@ -2157,20 +2600,35 @@ class Chaoxing:
         return StudyResult.ERROR
 
     def _verify_submit_accepted(self, _session, _course, _job, _job_info,
-                                questions, work_id, work_answer_id) -> Optional[bool]:
+                                questions, work_id, work_answer_id,
+                                q_list=None) -> Optional[bool]:
         """提交后自检：平台这次到底收没收到答案。
 
         之前只看接口返回的 status，接口成功 ≠ 答案被接收（听力题提交带题号的
         原始文本时接口照样返回成功，但成绩是 0）。这里回查最新一次作答详情，
         用服务端回显的"我的答案"来确认。
 
+        Args:
+            q_list: 提交前的题目列表引用。
+
+        🔴🔴 2026-10-08 **修复自检的第二重失效**（第一重是 `_parse_work_record_detail`
+            缺 `return questions`）：
+            本方法原先用 `questions.get("questions")` 取题目 —— 但调用点在此之前
+            已执行 `del questions["questions"]`（构造提交表单时删的，题目引用存进
+            `q_list`）⇒ 取到**空列表** ⇒ `needs_detail` 恒为 False ⇒
+            **自检在"提交后自检"这行之前就 return None 了，从不发请求、不打日志**。
+            实测证据：全部实例日志中「自检」出现 **0 次**（连 debug 都没有）。
+            修法：显式接收 `q_list`；未传时回退旧行为（保持向后兼容）。
+
         Returns:
             True  - 服务端回显的作答内容非空（答案已生效）
             False - 服务端回显为空（答案未被接收）
             None  - 查不到详情，无法判断（按旧行为放行，避免误判）
         """
+        # 题目列表：优先用调用方传进来的提交前引用
+        _qs = q_list if q_list is not None else questions.get("questions", [])
         needs_detail = any(
-            q.get(f'answerSource{q["id"]}') == "cover" for q in questions.get("questions", [])
+            q.get(f'answerSource{q["id"]}') == "cover" for q in _qs
         )
         if not needs_detail:
             return None
@@ -2226,19 +2684,32 @@ class Chaoxing:
             return None
 
         expected = {
-            str(q["id"]) for q in questions.get("questions", [])
+            str(q["id"]) for q in _qs
             if q.get(f'answerSource{q["id"]}') == "cover"
             and str(q["answerField"].get(f'answer{q["id"]}', "")).strip()
         }
         echoed = {str(d["id"]) for d in detail if str(d.get("my_answer") or "").strip()}
         missing = expected - echoed
-        if missing:
+        if not echoed:
+            # 一题都没回显 ⇒ 明确异常：提交未被平台接收。
+            # （`expected` 非空已由上面的 needs_detail 保证）
             logger.error(
                 f"提交后自检未通过：服务端回显为空，答案疑似未被接收（题目ID {sorted(missing)}）。"
                 f"本题组按失败处理，请人工确认后再重做"
             )
             return False
-        logger.info(f"提交后自检通过：服务端已回显 {len(expected)} 题作答内容")
+        if missing:
+            # 🔴 2026-10-08：**部分**未回显不计失败，只告警。
+            #   原因：平台对部分题型（听力等）不回显"我的答案"，本项目注释已记录该特性；
+            #   若按"缺一题即失败"处理，会把成功提交误判成失败 → 触发整章重试（浪费+风控）。
+            #   而"回显数为 0"才是可与"平台不回显"区分开的明确异常。
+            #   ⚠️ 待观测：若长期出现大量 missing，需重新评估平台回显策略。
+            logger.warning(
+                f"提交后自检：{len(missing)}/{len(expected)} 题未回显"
+                f"（平台可能不回显该题型），已回显 {len(echoed)} 题，判定提交有效"
+            )
+        else:
+            logger.info(f"提交后自检通过：服务端已回显 {len(expected)} 题作答内容")
         return True
 
     def _fetch_work_page_html(self, _session, _course, _job, _job_info, cpi):
@@ -2356,7 +2827,11 @@ class Chaoxing:
                 # （2026-09-11 审查发现）。否则错误答案会一直当"标准答案"复用，
                 # 而听力测验只能做一次，本账号再也没有纠正机会。
                 _my = str(g.get("my_answer") or "").strip()
-                if g.get("mark") != "dui" and _my:
+                # 🔴 2026-10-01 修 bug：原判据是 `mark != "dui"`，于是 mark 解析失败
+                #    得到的 `"unknown"` 也被当成"平台判错" → **把题库里本来正确的答案
+                #    撤掉**（3 天实测 69 次，日志里表现为"沉淀进题库 -26 题"这种负数）。
+                #    只有**明确的**判错/部分对才撤；unknown = 平台没给判定，不清不撤。
+                if g.get("mark") in ("cuo", "bandui") and _my:
                     try:
                         if CacheDAO().get_cache(title) == _my:
                             CacheDAO().remove_cache(title)
@@ -2367,12 +2842,41 @@ class Chaoxing:
                         logger.debug(f"撤下题库答案失败: {e}")
             if g.get("mark") != "dui":
                 all_correct = False
-                feedback.append(
-                    f"- 题目：{title}\n"
-                    f"  你的上次答案：{g.get('my_answer') or '(空)'}"
-                    f"（{'部分正确' if g.get('mark') == 'bandui' else '判定错误'}）\n"
-                    f"  平台已判该答案不通过，请重新分析并给出不同答案"
-                )
+                # 2026-09-29（用户要求）：多选题的「部分正确」线索。
+                # 判 bandui 说明这次选的组合里有对的、但不全；把"至少这些选项里
+                # 有正确的"告诉模型，让它补全而不是换个方向重新猜。
+                _hint = ""
+                if g.get("mark") == "bandui":
+                    try:
+                        _ps = learner.get_partials(title)
+                    except Exception:
+                        _ps = []
+                    _cand = set()
+                    for _p in _ps:
+                        if isinstance(_p.get("score"), (int, float)) and _p["score"] > 0:
+                            _cand |= set(re.findall(r"[A-Za-z]", str(_p.get("ans") or "")))
+                    if _cand:
+                        _hint = ("\n  历史线索：你答过的组合里 " + "、".join(sorted(_cand)) +
+                                 " 之中**至少有一个是正确的**（那次得了部分分），"
+                                 "请在它们基础上**补全**答案，而不是完全另起。")
+                # 🔴 2026-10-01：`unknown`（平台没给判定）**不能**对外宣称
+                #    "平台已判该答案不通过" —— 那是假信息，会逼 AI 把一个可能
+                #    正确的答案改掉（实测那批 unknown 题就是这么被反复重答的）。
+                _mk = g.get("mark") or "unknown"
+                if _mk == "unknown":
+                    feedback.append(
+                        f"- 题目：{title}\n"
+                        f"  你的上次答案：{g.get('my_answer') or '(空)'}\n"
+                        f"  本次未能取到平台判定，请重新核对本题、"
+                        f"给出你最有把握的答案{_hint}"
+                    )
+                else:
+                    feedback.append(
+                        f"- 题目：{title}\n"
+                        f"  你的上次答案：{g.get('my_answer') or '(空)'}"
+                        f"（{'部分正确' if _mk == 'bandui' else '判定错误'}）\n"
+                        f"  平台已判该答案不通过，请重新分析并给出不同答案{_hint}"
+                    )
         total_score = sum(b.get("score") or 0.0 for b in blocks)
         st = learner.stats()
         logger.info(
@@ -2468,10 +2972,21 @@ class Chaoxing:
                     if detail:
                         feedback = []
                         all_correct = True
+                        unknown = 0          # 答案字段没解析出来的题数
                         for q in detail:
+                            # 🔴 2026-10-08 移植上游 PR #626：解析失败**不得**当"对"
+                            #   （两侧同为 '' 时旧代码判 `'' == ''` ⇒ 误判全对 ⇒
+                            #    假成功）。改为：计入 unknown，且不认为全对。
+                            if not q.get("parse_ok", True):
+                                unknown += 1
+                                all_correct = False
+                                continue
                             my_ans = (q.get("my_answer") or "").strip()
                             correct_ans = (q.get("correct_answer") or "").strip()
-                            if my_ans != correct_ans:
+                            # 🔴 归一化后再比：消除 对/true、全半角标点、选项前缀等
+                            #   **纯格式差异**，避免"实际全对却判错"引发无谓重做。
+                            if (normalize_answer_text(my_ans)
+                                    != normalize_answer_text(correct_ans)):
                                 all_correct = False
                                 feedback.append(
                                     f"- 题目：{q.get('title', '')}\n"
@@ -2479,6 +2994,9 @@ class Chaoxing:
                                     f"  你的上次答案：{my_ans or '(空)'}\n"
                                     f"  正确答案：{correct_ans or '(空)'}"
                                 )
+                        if unknown:
+                            logger.warning(f"作答详情有 {unknown} 题答案字段未能解析，"
+                                           f"已跳过这些题的对错判定")
                         m = re.search(r'本次成绩<i>([\d.]+)</i>分', html)
                         score = float(m.group(1)) if m else 0.0
                         return {
@@ -2487,6 +3005,7 @@ class Chaoxing:
                             "score": score,
                             "times": 0,
                             "redoable": False,
+                            "unknown": unknown,
                         }
                 return None
             except Exception as e:
@@ -2558,7 +3077,13 @@ class Chaoxing:
             if not correct_ans:
                 continue      # 题目未返回正确答案，无从判断，不计入比对
             compared += 1
-            if my_ans != correct_ans:
+            # 🔴 2026-10-08 移植上游 PR #626：**归一化后**再比。
+            #   原为直接 `my_ans != correct_ans` —— 页面"对"vs 答案"true"、
+            #   "A."vs "A"、全半角标点等**纯格式差异**会被判成错 ⇒ 无谓重做
+            #   （增加请求量与风控暴露；对"仅允许作答一次"的课程可能直接失败）。
+            #   归一化是确定性的，不改变"真错"的判定，只消除格式噪声。
+            if (normalize_answer_text(my_ans)
+                    != normalize_answer_text(correct_ans)):
                 all_correct = False
                 feedback.append(
                     f"- 题目：{q.get('title', '')}\n"
@@ -2567,9 +3092,28 @@ class Chaoxing:
                     f"  正确答案：{correct_ans or '(空)'}"
                 )
 
-        # 比对不到任何有效答案（platform 未回填详情）时，不能认作全对。
+        # 比对不到任何有效答案（platform 未回填"正确答案"字段）时，不能认作全对。
         # 典型是听力题：字幕/答案不返回，0 分却会被这里误判成"通过"。
+        #
+        # 🔴 2026-10-08 修（**D1 修复引入的副作用**）：
+        #   本函数返回的 `detail` 曾因 `_parse_work_record_detail` 缺 `return` 恒为 None
+        #   ⇒ 调用方一直走"回退到题目页作答块解析"分支（该分支会沉淀学习库/题库）。
+        #   把 `return questions` 补回后主路线开始接管，但平台**通常不返回"正确答案"字段**
+        #   ⇒ 每题的 `correct_ans` 都为空 ⇒ `compared == 0` ⇒ 原本直接 `return None`
+        #   ⇒ **回退分支不再执行 ⇒ 学习库/题库停止沉淀**（实测：acc7 的"沉淀进题库"
+        #      由修复前的 60 次/天 降为 0 次）。
+        #   修法：`compared == 0` 时**同样回退**到题目页作答块解析（该方法不依赖
+        #   "正确答案"字段，用平台判对/判错标记沉淀）。代价是每轮多一次页面请求。
         if compared == 0:
+            logger.warning("章节检测：未取到可比对的有效答案（平台未返回『正确答案』字段），"
+                           "回退到题目页作答块解析")
+            try:
+                _html = self._fetch_work_page_html(_session, _course, _job, _job_info, cpi)
+                _res = self._harvest_work_page_result(_html, q_list)
+                if _res:
+                    return _res
+            except Exception as _e:                                 # noqa: BLE001
+                logger.warning(f"回退题目页解析失败: {_e}")
             logger.warning("章节检测：未取到可比对的有效答案，无法确认是否通过（不按全对处理）")
             return None
 
@@ -2600,10 +3144,28 @@ class Chaoxing:
         if _resp.status_code != 200:
             logger.error(f"阅读任务学习失败 -> [{_resp.status_code}]{_resp.text[:500]}")
             return StudyResult.ERROR
-        else:
+
+        # 🔴 2026-10-04（何同学："不能没做完就报成功"）：
+        #   原实现**只要 HTTP 200 就返回 SUCCESS**，完全不看平台回的 `msg`。
+        #   真机实测 acc4 全部阅读任务都返回 `{"msg":"无效的请求参数","status":false}`
+        #   —— 即**一个阅读都没做成**，但日志写的是 `Task success`，
+        #   界面据此显示"已完成"，平台侧仍是黄点 ⇒ 又一例"假完成"。
+        #   现改为**以 status/msg 为准**：不成功就如实返回 ERROR。
+        #   （注：`readv2` 端点在本平台已不可用，真正原因见 §19 报告 ——
+        #     平台改成了"阅读时长"机制，需另行逆向；此处先保证**如实反映**。）
+        try:
             _resp_json = _resp.json()
-            logger.info(f"阅读任务学习 -> {_resp_json['msg']}")
-            return StudyResult.SUCCESS
+        except Exception as e:                                         # noqa: BLE001
+            logger.warning(f"阅读任务学习 -> 响应非 JSON（{e}），按未完成处理")
+            return StudyResult.ERROR
+
+        _msg = str(_resp_json.get("msg") or "")
+        _ok = _resp_json.get("status") is True
+        logger.info(f"阅读任务学习 -> {_msg}")
+        if not _ok:
+            logger.warning(f"阅读任务**未完成**（平台回：{_msg}）-> 如实上报失败，不伪装成功")
+            return StudyResult.ERROR
+        return StudyResult.SUCCESS
 
     # ======================================================================
     # 作业模块（2026-09-13 新增，独立于章节测验通道）
@@ -2616,7 +3178,7 @@ class Chaoxing:
                 自行勾选"重做"）；默认 False 只返回待完成的。
         """
         _session = SessionManager.get_session()
-        self.rate_limiter.limit_rate()
+        self.rate_limiter.limit_rate(random_time=True, random_max=0.5)
         try:
             works = scan_works(_session, course)
         except (PauseInterrupt, RiskControlError):
@@ -3095,7 +3657,8 @@ class Chaoxing:
         ok_pages = 0
         for i in range(n):
             try:
-                self.rate_limiter.limit_rate()
+                # 🔴 2026-10-02 P1：批量循环里的固定间隔同样加随机（见 get_job_list 注释）
+                self.rate_limiter.limit_rate(random_time=True, random_max=0.5)
             except Exception:
                 pass
             html_text = self._fetch_raw_answer_page(
@@ -3168,7 +3731,7 @@ class Chaoxing:
             return StudyResult.SUCCESS
 
         _session = SessionManager.get_session()
-        self.rate_limiter.limit_rate()
+        self.rate_limiter.limit_rate(random_time=True, random_max=0.5)
         work_name = work.get("name") or work.get("workid")
 
         # 0. 新通道（2026-09-26 新增）：列表页给的是 taskrefId，
@@ -3194,7 +3757,7 @@ class Chaoxing:
 
             # 已完成/已批阅的作业：只有用户明确勾了"重做"才动，否则跳过
             if work.get("redo"):
-                self.rate_limiter.limit_rate()
+                self.rate_limiter.limit_rate(random_time=True, random_max=0.5)
                 try:
                     rr = redo_work(_session, course, detail)
                 except (PauseInterrupt, RiskControlError):
@@ -3482,10 +4045,21 @@ class Chaoxing:
         # 🔴 2026-09-26 修：闸门必须用 **real_rate**（真实答案率）。
         # 用 cover_rate（含"蒙的占位值"）会让闸门永远失效 —— 见上面 18:19 的
         # 线上铁证：一道题都没答上来，却报"覆盖率 100%"直接交卷。
-        if (not self.tiku.SUBMIT) and real_rate < cover_threshold:
-            msg = (f"作业《{work_name}》真实答案率仅 {real_rate * 100:.0f}%"
-                   f"（阈值 {cover_threshold * 100:.0f}%，"
-                   f"{len(guessed)} 题无可靠答案），已保存草稿、未提交")
+        # 2026-09-30 用户要求（与章节测验路径同口径）：随机兜底占比在容忍范围内时，
+        # **允许带随机答案提交** ——「交比不交强，不交的话看着就像没做」。
+        # 只有随机占比过高（整卷靠蒙）才继续拦下、只存草稿。
+        _guess_ratio = (len(guessed) / total) if total else 0
+        _guess_max = getattr(self.tiku, "GUESS_MAX_RATIO", 0.5)
+        # 放行条件 = 「填充率达标」**且**「随机占比不超限」——与章节测验路径同口径。
+        # ⚠ 必须同时卡 cover_rate：否则"一题都没答出来"时 _guess_ratio = 0
+        #   反而满足"随机占比低"的条件 → 空卷被提交（09-26 的 0 分正是此类）。
+        if ((not self.tiku.SUBMIT)
+                and (cover_rate < cover_threshold or _guess_ratio > _guess_max)):
+            msg = (f"作业《{work_name}》真实答案率仅 {real_rate * 100:.0f}%、"
+                   f"答案填充率 {cover_rate * 100:.0f}%"
+                   f"（阈值 {cover_threshold * 100:.0f}%；"
+                   f"{len(guessed)} 题无可靠答案，随机占比 {_guess_ratio * 100:.0f}% "
+                   f"上限 {_guess_max * 100:.0f}%），已保存草稿、未提交")
             logger.warning(msg)
             try:
                 save_res = _do_submit(save_only=True)
@@ -3499,6 +4073,11 @@ class Chaoxing:
             except Exception as e:
                 logger.warning(f"作业《{work_name}》保存草稿异常：{e}")
             raise HomeworkNeedsAttention(msg)
+        elif real_rate < cover_threshold:
+            logger.info(
+                f"作业《{work_name}》真实答案率 {real_rate * 100:.0f}% 未达阈值 "
+                f"{cover_threshold * 100:.0f}%，但随机兜底只占 {_guess_ratio * 100:.0f}%"
+                f"（≤ {_guess_max * 100:.0f}%）-> 按用户要求照常提交")
 
         # 3. 提交
         try:
@@ -3991,9 +4570,200 @@ class Chaoxing:
             logger.warning(f"[考试] 题目 {q.get('id')} 查询失败：{e}")
             return None
         if ans is None or not str(ans).strip():
-            logger.warning(f"[考试] 题目 {q.get('id')} 未获答案 -> "
+            # 🔴 2026-10-03（何同学要求，补全考试链路）：
+            #    顺序必须是「先让 AI 换模型再答 → 仍没有才随机」。
+            #    ⚠️ 作业链路（`:3551`）与章节测验（`:1820` / `:1936`）**都**接了
+            #    `_ai_last_resort`，**唯独考试没接** —— 于是"一个 AI 答不出"
+            #    就直接丢题（2026-10-03 真机：50 题里 1 题因此空着）。
+            #    ① 换模型重答：最多换 3 个槽位，附强制提示词（用户原话
+            #      「一个 AI 返回识别不了，就调第二个 AI」「随机只能是最下下下策」）。
+            _rescue = _ai_last_resort(self.tiku, q)
+            if _rescue:
+                logger.info(f"[考试] 题目 {q.get('id')} 经 AI 换模型重答成功：{_rescue}")
+                return _rescue
+            #    ② 仍没有答案 → 随机兜底：考试只有 1 次机会，空着 = 0 分；
+            #      单选 N 选 1 → 期望 1/N，判断题 → 期望 50% ⇒ 严格优于空着。
+            #      ⚠️ 考试题的 options 是 list[dict]（`{"letter","value","text"}`），
+            #      不能直接喂 `random_answer()`（它按字符串 split 取首字母），
+            #      见 `_random_exam_answer` 的说明。
+            ans = _random_exam_answer(q, _q.get("type") or "")
+            if ans:
+                logger.info(f"[考试] 题目 {q.get('id')} 未获答案 → 随机兜底：{ans}")
+                return ans
+            logger.warning(f"[考试] 题目 {q.get('id')} 未获答案且无选项可随机 -> "
                            f"{(q.get('title') or '')[:50]}")
+            # 🔴 2026-11-06：简答题（题型4）**没有选项**，`_random_exam_answer` 必然
+            #   返回空 ⇒ 该题提交空内容 ⇒ 平台拒绝 ⇒ 连续 3 题触发
+            #   "提交通道异常，提前终止"，**整卷未提交**（实测免疫学作业1：
+            #   答到 203/222 卡在简答题，submitted=false，分数不更新）。
+            #   这里给个占位文本，保证提交通道不被判异常、整卷能收尾；
+            #   主观题本来就要人工/老师判分，占位不影响客观题得分。
+            if _q.get("type") == "shortanswer":
+                logger.info(f"[考试] 题目 {q.get('id')} 为简答题，用占位内容提交以保住整卷")
+                return "略（要点见课堂笔记）"
             return None
+
+        # 🔴🔴 2026-10-12（何同学真机实测反馈）：**判断题一律再过一遍 AI**。
+        #
+        # 实测 acc2《大学生劳动教育》85 题：30 道判断题的答案**100% 来自「全能搜题」**，
+        # 人工核对发现 **11 题答反**：
+        #   · 「恩格斯曾说过"劳动创造了人类本身"」→ 库答"错误"（实为正确）
+        #   · 「端午节与春节、清明节、中秋节并称中国四大传统节日」→ 库答"错误"
+        #   · 「胜任力的冰山模型，水面上的部分是关键因素」→ 库答"正确"
+        #   · 同卷还自相矛盾：「董事长不属于专业技术人员」=正确 与
+        #     「董事长、总经理属于第二大类(=专业技术人员)」=正确 —— 二者不可能同真
+        #
+        # 对照实验（`_diag_judge_ai.py`）：让 AI 独立重答同一批 30 题，
+        # 与库答案**12 题不一致**，其中可人工判定的 10 题 **全部支持 AI、零反例**。
+        # ⇒ 判断题以 AI 为准；单选/多选**不动**（那两类由 TikuAdapter 供给，质量明显更好）。
+        #
+        # ⚠️ 只对 judgement 生效，避免影响其余题型的既有准确率。
+        if str(_q.get("type") or "") == "judgement":
+            # 🔴🔴 2026-10-12 23:2x **回退**：判断题改回「**题库优先**」。
+            #
+            # 教训链（务必读完再改）：
+            #   22:3x 我把「单次 AI 复核」升级成**双模型投票**，理由是代码里
+            #   一条旧结论：「与库答案 12 题不一致，可人工判定的 10 题
+            #   **全部支持 AI、零反例** ⇒ 判断题以 AI 为准」。
+            #   ⇒ 实测 acc1《舞台人生》：**81 分，比修复前的 82 还低 1 分**。
+            #   现场数据：判断题 30 道**全部**被投票覆盖，其中
+            #   **7 道与 tiku.db 的库答案不同** —— 投票把最可靠的信号丢掉了。
+            #
+            #   错在哪：
+            #     ① 那条「AI 全胜」的实验是在**中国历史人文地理**上做的，
+            #        **跨到戏剧艺术就不成立** —— 拿旧实验当普适结论用。
+            #     ② 投票「不一致取首个」= 无条件站 AI，等于**弃掉题库**。
+            #        而 TikuAdapter 的一致率是全部来源里**最高档（89.5%）**。
+            #
+            # ⇒ 现策略（保守、可预期）：
+            #     题库有答案 → **直接用题库**，不再让 AI 覆盖；
+            #     题库没答案 → 才叫 AI 兜底（这是唯一必要的兜底）。
+            #
+            # ⚠️ 保留的两处**真 bug** 修复（与投票无关，它们是干净的修复）：
+            #     · 判断题跳过「选项集合不符」校验（answer.py）
+            #     · 判断题答案同义写法归一（answer.py）
+            _lib = "" if ans is None else str(ans).strip()
+            if _lib:
+                return ans                      # 题库有答案 → 用题库
+            # 题库没答案 → AI 兜底（走原来的单次复核，不投票）
+            try:
+                _ai = _ai_last_resort(self.tiku, q)
+            except Exception as _e:                                  # noqa: BLE001
+                _ai = ""
+            if _ai and str(_ai).strip():
+                logger.info(
+                    f"[考试] 判断题 {q.get('id')} 题库无答案 → AI 兜底 = "
+                    f"{_ai}：{(q.get('title') or '')[:36]}")
+                return _ai
+            return ans              # 两条路都没答案 → 保持题库返回（原样）
+        # 🔴 2026-10-13 **半自动多选题复核**（方案 1）。
+        #
+        #   背景（两天实考数据）：
+        #     · acc2 10-12「AI 覆盖题库」→ **82 分**
+        #     · acc1 10-13「题库优先」   → **89 分**
+        #     ⇒ 无条件让 AI 覆盖题库是**有害**的。
+        #   但多选权重最高（15 题 × 2 分 = 30 分），且题库**确有错**：
+        #     acc1 第 43 题「初唐四杰」库=BC（漏两人），AI 修正为 ABCD ✅
+        #
+        #   ⇒ 折中：**有条件的单次复核**（这才是"半自动"的本意）
+        #       · AI 能映射成本题合法字母 且 ≠ 库 → 采纳 AI
+        #       · AI 映射不出 / 格式非法        → 保留库（不猜）
+        #       · 单选、判断完全不介入
+        #
+        #   🔴🔴 2026-10-13 12:5x **重要修正：只取 1 票，不做两票投票。**
+        #     我先前把它做成 `_vote_raw(n=2)`，何同学指出关键事实：
+        #     **腾讯系列模型共用一个 API Key，连续/并发调用会加剧限流。**
+        #     实测印证：本场 13 道多选**全部**落到"票不足"，日志满是
+        #     `APITimeoutError` + "额度耗尽→切换槽位" ⇒ 第二票几乎取不到，
+        #     复核形同虚设，还**白白多烧一倍配额**（反而拖慢整场）。
+        #     ⇒ 降为单票：调用量减半，行为与 acc1（89 分）实况一致。
+        #     （`_vote_raw` 保留，将来若 AI 配额充裕可再启用两票）
+        if str(_q.get("type") or "") == "multiple" and \
+                getattr(self, "_exam_multi_review", True):
+            try:
+                _cur = "".join(sorted(set(c for c in str(ans or "").upper()
+                                          if c in "ABCD")))
+                _v = _ai_last_resort(self.tiku, q)
+                _m = _map_rescue_answer(str(_v).strip(), q) if _v else ""
+                if _m and all(c in "ABCD" for c in str(_m)):
+                    _m = "".join(sorted(set(str(_m).upper())))
+                    if _m and _m != _cur:
+                        logger.warning(
+                            f"[考试] 多选 {q.get('id')} 库={_cur or '(空)'}"
+                            f" → AI={_m}（采用 AI）："
+                            f"{(q.get('title') or '')[:34]}")
+                        return _m
+                    logger.info(
+                        f"[考试] 多选 {q.get('id')} 库={_cur} 与 AI={_m} "
+                        f"相同 → 保持：{(q.get('title') or '')[:34]}")
+                else:
+                    logger.debug(
+                        f"[考试] 多选 {q.get('id')} AI 未给出合法字母 "
+                        f"→ 保留库={_cur or '(空)'}")
+            except Exception as _e:                                # noqa: BLE001
+                logger.debug("多选题 AI 复核失败（保留库答案）：%s", _e)
+            except Exception as _e:                                # noqa: BLE001
+                logger.debug("多选题 AI 复核失败（保留库答案）：%s", _e)
+        # 🔴🔴 2026-10-12 真机事故（acc2《机器的征途》exam_id=10929608）：
+        #   85 题里**2 题的答案格式非法，平台必然判 0 分**：
+        #     第 50 题（多选）程序答 `NMD` —— 这是**选项内容**不是字母；
+        #                          正确应为 `C`（NMD 对应选项 C）
+        #     第 71 题（判断）程序答 `这是人类航天史上的里程碑` —— AI 返回了
+        #                          **解释性文本**，不是判断值
+        #   根因：题库/AI 返回的答案**没有按题型做格式校验**就直接 return。
+        #   `_map_rescue_answer`（内容→字母映射）只在 `_ai_last_resort` 分支里，
+        #   主流程 `tiku.query` 的返回值从不过这一关。
+        #   ⇒ 提交前按题型加一道**格式闸门**：不合法就修，修不了才回退。
+        _t = str(_q.get("type") or "")
+        _a = "" if ans is None else str(ans).strip()
+        if not _a:
+            return ans
+        if _t == "judgement":
+            if _a in ("正确", "错误", "对", "错", "A", "B"):
+                return _a
+            # 不合法 → 尝试从文本里识别；识别不出则按库答案兜底
+            _fixed = _judge_from_text(_a)
+            if _fixed:
+                logger.warning("[考试] 判断题 %s 答案格式非法 %r → 修正为 %s",
+                               q.get("id"), _a[:30], _fixed)
+                return _fixed
+            logger.warning("[考试] 判断题 %s 答案无法归一 %r → 保持原值",
+                           q.get("id"), _a[:30])
+        elif _t in ("single", "multiple"):
+            # ⚠️🔴 2026-10-12 修正（自测抓到的严重错误）：
+            #   **不能先"提取 A/B/C/D"**。像 `NMD`（第 50 题的正确答案内容）
+            #   整个字符串**全是 A-D 字母** —— 先提字母会得到 `D`，
+            #   而正确答案是 `C`。这比原 bug 更糟（原 bug 只是原样提交）。
+            #   ⇒ 顺序必须是：**先按"纯字母串"判定 → 不是再走内容映射**；
+            #     且"纯字母"要求**每个字母都是本题的合法选项**，
+            #     否则 `NMD` 这种内容串会被误当答案。
+            _opts = q.get("options") or ""
+            try:
+                _legal = {o.get("letter") for o in _opts
+                          if isinstance(o, dict) and o.get("letter")}
+            except TypeError:
+                _legal = set()
+            _up = _a.upper()
+            _is_plain = (bool(_up) and all(c in "ABCD" for c in _up)
+                         and (_legal <= set(_up) if _legal else True))
+            if _is_plain:
+                _letters = "".join(sorted(set(_up)))
+                if _letters != _a:
+                    logger.warning("[考试] %s 题 %s 答案 %r 顺序/重复异常 → 归一为 %s",
+                                   _t, q.get("id"), _a[:30], _letters)
+                return _letters
+            # 不是纯字母（可能是选项内容，如 `NMD`）→ 走内容映射
+            try:
+                from api.base import _map_rescue_answer as _mra
+                _mapped = _mra(_a, q)
+            except Exception:                                          # noqa: BLE001
+                _mapped = ""
+            if _mapped and all(c in "ABCD" for c in str(_mapped)):
+                logger.warning("[考试] %s 题 %s 答案为内容 %r → 映射为 %s",
+                               _t, q.get("id"), _a[:30], _mapped)
+                return _mapped
+            logger.warning("[考试] %s 题 %s 答案 %r 无法映射字母 → 保持原值",
+                           _t, q.get("id"), _a[:30])
         return ans
 
     def study_exam_one(self, course: dict, exam: dict, user_id: str = "",
@@ -4005,12 +4775,21 @@ class Chaoxing:
         Args:
             exam: 考试条目，须含 exam_id（或 test_paper_id）+ enc_task
             auto_submit: True=答完直接交；False=只暂存（审核提交）；
-                         None 时取配置 auto_submit
+                         None 时取配置 `exam_auto_submit`（**缺省 False**）
         """
         from api.exam import run_exam, fetch_exam_list_phone
 
         if auto_submit is None:
-            auto_submit = bool(self.config.get("auto_submit", True))
+            # 🔴 2026-10-12：考试用**专用配置键** `exam_auto_submit`，缺省 False。
+            #    此前读的是作业那个 `auto_submit`（缺省 True）—— 导致"作业自动提交"
+            #    会顺带把只有一次机会的考试也交掉。两者从此互不牵连。
+            # ⚠️ 同日修正：`Chaoxing` **没有 `self.config` 属性**（实测
+            #   `AttributeError`）—— 原写法在此分支必崩。之所以从未暴露：
+            #   所有真实调用点（`web_ui` / `process_exams`）都显式传了
+            #   `auto_submit`，`None` 分支从未被走到。属潜伏 bug。
+            #   改为从 kwargs 里安全取，取不到即按"不交卷"处理（保守）。
+            _cfg = getattr(self, "config", None) or self.kwargs or {}
+            auto_submit = bool(_cfg.get("exam_auto_submit", False))
         # 🔴 2026-09-27 修根因：**考试提交通道必须带真实 uid**。
         # `get_exam_signature(uid, ...)` 把 uid 编进风控签名（`enc_val = f"{uid}"`），
         # `data.userId` 也是它。而整条考试链路此前 user_id 一路是空串 →
@@ -4050,10 +4829,52 @@ class Chaoxing:
                     f"（{'自动交卷' if auto_submit else '仅暂存'}）")
         t0 = time.time()
         try:
-            res = run_exam(SessionManager.get_session(), course, exam,
-                           answer_fn=lambda q: self._exam_answer_fn(q),
-                           user_id=user_id, code=code,
-                           auto_submit=auto_submit)
+            # 🔴 2026-10-12：走 `run_exam_with_dump`，把「题干+完整选项+
+            # 程序最终答案」逐题落盘。这是**唯一**能在不二次进考场的前提下
+            # 拿到选项全文的时机（反复 start 未交卷会被平台限制，已实证）。
+            # 落盘路径取自 kwargs `exam_dump_dir`（`Chaoxing` 无 config 属性）。
+            # 为空则不落盘（行为与从前一致）。
+            _cfg = getattr(self, "config", None) or self.kwargs or {}
+            _dump_dir = str(_cfg.get("exam_dump_dir") or "").strip()
+            # 🔴 2026-11-06：import 必须在**分支外**。原先把 `import api.exam as
+            #   _exam_mod` 放在 `if _dump_dir:` 里面，但下面 `res = ...` 无条件
+            #   使用 `_exam_mod` ⇒ 只要没配落盘目录就
+            #   `UnboundLocalError: cannot access local variable '_exam_mod'`，
+            #   整场考试直接失败（新账号登录时未带 exam_dump_dir 就会踩到）。
+            import api.exam as _exam_mod
+            _dump = ""
+            if _dump_dir:
+                # 直接从 exam 取标识（`want` 只在 enc_task 缺失分支里定义，
+                # 这里复用它会 NameError）
+                _eid = str(exam.get("exam_id") or exam.get("test_paper_id")
+                           or title)
+                _safe = re.sub(r'[\\/:*?"<>|\s]+', "_", _eid)
+                # 🔴 2026-10-13：文件名加**实例前缀**。
+                #   同一门考试会被**多个账号**考（如 acc1 与 acc4 都考了
+                #   大学生劳动教育 exam_id=10984799），此前文件名只有 exam_id
+                #   ⇒ 后跑的那场直接覆盖先跑的，acc1 的逐题落盘已被实测冲掉。
+                #   实例名取自 `CK_DATA_DIR` 的末段（acc1..acc15），为空则不加前缀
+                #   （单实例场景行为不变）。
+                _inst = ""
+                try:
+                    _dd = os.environ.get("CK_DATA_DIR", "").rstrip("\\/")
+                    _tail = _dd.split("\\")[-1].split("/")[-1] if _dd else ""
+                    _inst = _tail if _tail.startswith("acc") else ""
+                except Exception:                                # noqa: BLE001
+                    _inst = ""
+                _dump = os.path.join(
+                    _dump_dir,
+                    f"exam_{_inst + '_' if _inst else ''}{_safe}.jsonl")
+            res = (_exam_mod.run_exam_with_dump(
+                       SessionManager.get_session(), course, exam,
+                       answer_fn=lambda q: self._exam_answer_fn(q),
+                       user_id=user_id, code=code,
+                       auto_submit=auto_submit, dump_path=_dump)
+                   if _dump else
+                   _exam_mod.run_exam(SessionManager.get_session(), course, exam,
+                                      answer_fn=lambda q: self._exam_answer_fn(q),
+                                      user_id=user_id, code=code,
+                                      auto_submit=auto_submit))
         except (PauseInterrupt, RiskControlError):
             raise
         except Exception as e:

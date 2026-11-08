@@ -60,22 +60,61 @@ HISTORY_MAX = 800
 # （internal/controller/search.go）。后果：我们积累的本地题库从未参与
 # 查询，听力题等只能靠随机/AI。
 # 改成 use=local,... → 先查本地库，本地命中即返回；本地没有才落外部题库。
+# 2026-09-29 起保留**实测真正有答案**的源：
+#   · local   —— 本地库 tiku.db（我们自己回灌的「平台已验证」答案）
+#   · buguake —— 不挂科（免费在线源，40 题样本命中 33）
+#   · icodef  —— 一之哥哥题库（40 题样本命中 34，加进来后全链 33→35）
+# 删掉的 wanneng / tikuhai：40 题样本 **0 命中**，都要付费 Token，等于空转。
+#   空转的源不只是没用：8060 是并发查所有源再聚合，无 token 的源每次都要等它
+#   返回，白白拖慢整体响应（今日 35 次「请求异常」多与此有关），也抬高超时概率。
+# ⚠️ icodef 需要限流 Token（免费，公众号「一之哥哥」发送「token」申请）。
+#    Token **不写在这里** —— 见 `_read_icodef_token()`，它从 config.ini 的
+#    [tiku] go_authorization 读（该键本就是官方位置，且 config.ini 已进 .gitignore）。
+# ⚠️ 改了这里要同步改前端两处字面量：id="adapterUrl" 的 value 与 ADAPTER_URL_DEFAULT。
+TIKU_USE = "local,buguake,icodef"
 DEFAULT_ADAPTER_URL = ("http://127.0.0.1:8060/adapter-service/search"
-                       "?use=local,icodef,buguake,wanneng,tikuhai")
+                       "?use=" + TIKU_USE)
+
+
+def _read_icodef_token() -> str:
+    """读 icodef（一之哥哥题库）的限流 Token。
+
+    唯一真源是 config.ini 的 `[tiku] go_authorization` —— 这一项在原始项目里
+    就是「公众号申请到的解除限流 Token」的官方位置，且 config.ini 已被
+    .gitignore 排除，不会把 Token 带进公开仓库。
+    """
+    try:
+        import configparser
+        cp = configparser.ConfigParser()
+        cp.read(os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.ini"),
+                encoding="utf-8")
+        return (cp.get("tiku", "go_authorization", fallback="") or "").strip()
+    except Exception:
+        return ""
 
 
 def _ensure_use_local(url: str) -> str:
-    """确保 TikuAdapter 的 url 带 use=local（本地题库才参与查询）。
+    """归一 TikuAdapter 的 url：确保带 use=，并在用到 icodef 时补上 Token。
 
     2026-09-14：老配置/老档案里的 adapter_url 普遍没带 use 参数，
     TikuAdapter 只在 strings.Contains(use,"local") 时才查本地库，
     漏了它 → 本地题库形同虚设（听力题全搜不到）。这里做写入侧兜底。
     只对 adapter-service 的 url 生效，其它地址原样返回。
+
+    2026-09-29：新增 icodef Token 兜底 —— url 里出现 icodef 但没带
+    `icodefToken` 时，从 config.ini 补上。这样即使界面配置被重置、
+    回落到不含 Token 的默认 url，也不会退化成"空转"。
     """
     u = (url or "").strip()
-    if not u or "adapter-service/search" not in u or "use=" in u:
+    if not u or "adapter-service/search" not in u:
         return u
-    return u + ("&" if "?" in u else "?") + "use=local,icodef,buguake,wanneng,tikuhai"
+    if "use=" not in u:
+        u = u + ("&" if "?" in u else "?") + "use=" + TIKU_USE
+    if "icodef" in u and "icodefToken=" not in u:
+        _tk = _read_icodef_token()
+        if _tk:
+            u = u + "&icodefToken=" + _tk
+    return u
 # 界面配置（账号档案 / 上次参数 / 断续刷记录）随实例数据目录走（2026-09-14）：
 # 多账号各起一份实例时各自一份，别人的界面读不到你的账号密码。
 # config.ini（题库/AI 配置）保持共用，不随实例分家。
@@ -84,7 +123,8 @@ UI_CONFIG_PATH = os.path.join(data_dir(), "ui_config.json")
 # 登录表单里需要记住的字段（含账密与 AI key：本地单用户工具，用户明确要求记住）
 REMEMBER_FIELDS = ("username", "password", "tiku_type", "adapter_url", "token",
                    "ai_fallback", "ai_endpoint", "ai_key", "ai_keys", "ai_model",
-                   "auto_submit", "cover_rate", "speed", "jobs")
+                   "auto_submit", "exam_auto_submit", "cover_rate", "speed", "jobs",
+                   "exam_dump_dir")
 
 # 🔴🔴 2026-09-27 内置 AI Key 池（用户要求：不用在界面上单独配置，登录即自动带上）
 #
@@ -256,9 +296,38 @@ def load_ui_config():
     return cfg
 
 
+_CFG_LOCK = threading.Lock()      # 配置落盘互斥（见 _dump）
+
+
 def _dump(cfg):
-    with open(UI_CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=1)
+    """原子写配置。
+
+    🔴 2026-10-03（第三方审计 P1-8）：原实现直接 `open(path, "w")` 截断再写，
+    而调用方横跨任务线程 / 请求线程 / watchdog 线程（`_save_last_pick`、
+    `_save_resume`、`save_last_params`、`save_profile`、`_persist_live_params`…），
+    全项目**没有配置锁** —— 并发写会留下半截 JSON，下次 `load_ui_config`
+    解析失败就把 profiles（明文账号）/ last_pick / resume / AI Key 全丢掉。
+
+    做法：**配置锁 + 唯一临时名 + fsync + `os.replace`**。
+      · 临时名带 PID / 线程号 → 多线程不会写同一个 tmp（固定名会互踩）；
+      · 锁 → 保证"写 tmp → replace"整体不交错；
+      · `os.replace` 同盘替换在 Windows 上是原子的 → 读方只会看到完整 JSON。
+    失败时**原文件保持不变**（比原来"截断后写一半"安全），并按原语义抛错。
+    """
+    tmp = "%s.%d.%d.tmp" % (UI_CONFIG_PATH, os.getpid(), threading.get_ident())
+    with _CFG_LOCK:
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=1)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, UI_CONFIG_PATH)
+        except OSError:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise
 
 
 # ---- 卡死自愈：记录"待恢复任务"，进程自重启后据此自动续刷 ----
@@ -297,8 +366,11 @@ def _save_resume(courses, config):
     cfg = load_ui_config()
     keep = ("speed", "jobs", "video_course_ids", "work_course_ids",
             "quiz_course_ids", "work_items", "exam_items")
+    # 🔴 2026-10-03：改为**只过滤 None**（键不存在），不再过滤空列表/空字典。
+    #    否则"用户没勾测验"（quiz_course_ids=[]）会被丢掉，落盘后变成
+    #    "没有这个键"，与"参数丢了"无法区分，续跑/错峰启动时无法正确回放。
     thin = {k: (config or {}).get(k) for k in keep
-            if (config or {}).get(k) not in (None, "", [], {})}
+            if (config or {}).get(k) is not None}
     cfg["resume"] = {"course_ids": [str(c.get("courseId", "")) for c in courses],
                      "config": thin, "restarts": _resume_count(),
                      "at": time.strftime("%Y-%m-%d %H:%M:%S")}
@@ -324,12 +396,15 @@ def _save_last_pick(picked, config):
         cfg = load_ui_config()
         keep = ("speed", "jobs", "video_course_ids", "work_course_ids",
                 "quiz_course_ids", "work_items", "exam_items")
+        # 🔴 2026-10-03：同 `_save_resume`，改为只过滤 None，保留空列表语义。
         thin = {k: (config or {}).get(k) for k in keep
-                if (config or {}).get(k) not in (None, "", [], {})}
+                if (config or {}).get(k) is not None}
         cfg["last_pick"] = dict(thin)
         cfg["last_pick"].update({
             "course_ids": [str(c.get("courseId", "")) for c in picked],
-            "speed": (config or {}).get("speed", 2),
+            # 🔴 2026-10-03：默认值由 2 改 1。全项目策略是 speed=1（防平台回溯），
+            #    此前这里缺 speed 时会**往磁盘写 2**，是"配置莫名其妙变 2 倍速"的污染源。
+            "speed": (config or {}).get("speed") or 1.0,
             "jobs": (config or {}).get("jobs", 1),
             "at": time.strftime("%Y-%m-%d %H:%M:%S"),
         })
@@ -414,7 +489,11 @@ def _watchdog():
             continue
 
         th = state.get("work_thread")
-        silent = time.time() - _last_activity
+        # 🔴 静默判据取**两者较新**：
+        #    · `_last_activity` —— 被 `print` 刷新（`QueueRedirector` 捕获）
+        #    · `chaoxing.log` 的 mtime —— 被 loguru 刷新（刷课日志的实际载体）
+        #    只用前者会把正常运行误判成僵死（print 太稀疏，详见 `_task_log_mtime`）。
+        silent = time.time() - max(_last_activity, _task_log_mtime())
 
         alive = bool(th and th.is_alive())
         # 存活时：静默未超硬上限 = 正常（含视频等判定），不重启
@@ -493,6 +572,14 @@ def save_profile(data):
     """账密登录才归档为账号档案（按账号名识别），最新使用的排最前。"""
     cfg = load_ui_config()
     entry = {k: data.get(k) for k in REMEMBER_FIELDS}
+    # 🔴 2026-10-03：speed / jobs **不写进档案**。
+    #    登录表单里没有这两个控件（它们在"任务参数"区，由 `fillParams(last_params)`
+    #    回填），所以 `data.get("speed")` 恒为 None —— 每次登录都会把档案里的
+    #    speed/jobs 刷成 None，造成"改了这里却没生效 / 重启又回落"的误导。
+    #    后端从未读取 profiles 的 speed/jobs；真正的落盘点是
+    #    `last_params` / `last_pick` / `resume.config`（见 `_persist_live_params`）。
+    entry.pop("speed", None)
+    entry.pop("jobs", None)
     name = entry.get("username") or ""
     others = [p for p in cfg.get("profiles", []) if p.get("username") != name]
     cfg["profiles"] = [entry] + others
@@ -544,7 +631,27 @@ _WRITE_PATHS = ("/api/login", "/api/start", "/api/start_last", "/api/pause",
                 "/api/exam/run",          # 开考（消耗唯一一次机会）
                 "/api/exam/extra",        # 增删额外课程登记
                 "/api/exam/sheet",        # 考试答题
-                "/api/teacher/")          # 教师端：发作业 / 建题 / 发布
+                # 2026-10-12：预检本身只读（不开考），但会向平台发请求 ⇒ 同样挡在只读身份之外
+                "/api/exam/precheck",
+                "/api/teacher/",          # 教师端：发作业 / 建题 / 发布
+                # 🔴 2026-10-03 补漏（第三方审计 P1-9）：
+                #    下面这些同样是"真动作/真花钱/真改配置"，此前不在清单里，
+                #    只读身份（viewer / 账密登录的用户）可以直接调用。
+                "/api/courses/refresh",   # 重新拉课程列表（发平台请求）
+                "/api/clear_account",     # 删实例配置（账号/题库/AI Key 全没）
+                "/api/test-ai",           # 发 AI 测试请求（烧 Key 额度）
+                "/api/tasks/scan",        # 扫描任务点
+                "/api/exam/scan",         # 扫描考试
+                "/api/homework/scan",     # 扫描作业
+                "/api/work/redo",         # 🔴 真提交重做，会改平台成绩
+                "/api/work/readback",     # 回读平台已存答案
+                "/api/live_params",       # 改并发/倍速（内部 pause→resume 重建任务）
+                "/api/append_courses",    # 追加课程并重建任务
+                "/api/diag/probe",        # 任意 URL 探测（SSRF 原语）
+                "/api/diag/exec",         # 🔴 在实例进程内执行脚本
+                )
+# 说明：`/api/logout` **故意不列入** —— 登出是用户对自己会话的操作，
+#      把只读身份挡在登出之外没有安全收益，只会让人退不出去。
 
 
 def _is_local_request() -> bool:
@@ -553,13 +660,48 @@ def _is_local_request() -> bool:
     ⚠️ 只看 remote_addr 不够（2026-09-14 教训）：若把实例也用内网穿透直连，
     frpc 就在本机转发，公网流量的源地址同样是 127.0.0.1，会被误判成
     "本机"而跳过登录。因此追加 Host 校验，并留一个 CK_STRICT=1 彻底关闭免登录。
+
+    🔴 2026-10-08 补（何同学反馈"账号密码登录后仍显示全套操作按钮"）：
+    经**网关**（gateway.py `/acc/<n>/`）转发的请求，以**网关判定的"原始是否本机"**
+    为准。原因：网关 `_SKIP_HEADERS` 会剔除 `host`，`requests` 随即补成
+    `Host: 127.0.0.1:{端口}` ⇒ 本函数误判为 True ⇒ 实例一律授予 admin
+    （远程只读用户因此看到全部操作按钮）。
     """
+    if request.headers.get("X-CK-Via-Gateway") == "1":
+        return (request.headers.get("X-CK-Local") or "") == "1"
     if os.environ.get("CK_STRICT") == "1":
         return False
     if (request.remote_addr or "").strip() not in ("127.0.0.1", "::1"):
         return False
     host = (request.host or "").split(":")[0].strip().lower()
     return host in ("127.0.0.1", "localhost", "[::1]", "::1")
+
+
+def _is_cross_site() -> bool:
+    """浏览器发起的**跨站**请求（CSRF 特征）。
+
+    🔴 2026-10-03 加固（第三方审计 P0-1）：本机请求原本直接授予 admin，
+    而浏览器发出的 `text/plain` POST 属"简单请求"、**不触发 CORS 预检** ——
+    于是用户用同一台机器打开任意第三方网页，其中的 JS 就能
+    `fetch('http://127.0.0.1:5000/api/start_last',{method:'POST',…})`
+    以管理员身份启动/暂停刷课、开考、提交重做、执行脚本。
+
+    判据**只认浏览器特征头，缺头一律放行**：
+      · 脚本/工具（`_audit_all.py`、`_restore_instances.py`、curl）不带这两个头；
+      · 网关反代已在 `gateway._SKIP_HEADERS` 中把它们剔除（下游不该看到上游浏览器身份）。
+    所以"缺头即拒"会误伤整套运维链路与网关访问，这里不采用。
+    """
+    if (request.headers.get("Sec-Fetch-Site") or "").strip().lower() == "cross-site":
+        return True
+    origin = (request.headers.get("Origin") or "").strip()
+    if not origin:
+        return False
+    try:
+        from urllib.parse import urlsplit
+        origin_host = (urlsplit(origin).hostname or "").lower()
+    except ValueError:
+        return True                       # Origin 畸形 -> 按跨站处理
+    return origin_host not in ("127.0.0.1", "localhost", "::1")
 
 
 def _auth_tokens() -> dict:
@@ -593,7 +735,21 @@ def _match_profile(user: str, pwd: str) -> bool:
 
 @app.before_request
 def _auth_gate():
+    # 🔴 2026-10-03：CSRF 闸门必须在最前面 —— 本机请求免登录，
+    #    若不先挡掉"浏览器跨站请求"，第三方网页的 JS 就等价于管理员。
+    if _is_cross_site():
+        return jsonify(ok=False, msg="拒绝跨站请求（CSRF 防护）"), 403
     if request.path in ("/login", "/auth", "/favicon.ico"):
+        return None
+    # 🔴 2026-10-08：经网关（gateway.py `/acc/<n>/`）转发的请求 —— 用**网关已认证的角色**。
+    #    实例读不到网关的 session（两个进程 secret_key 不同），必须由网关转告。
+    #    不做这一步的话，网关剔除 Host 后 requests 补成 127.0.0.1 ⇒
+    #    `_is_local_request()` 判 True ⇒ 远程只读用户被当成管理员（界面显示全套按钮）。
+    #    ⚠️ 未识别的角色值（如微伴的 "wb"）一律降为只读 —— 保守且安全。
+    if request.headers.get("X-CK-Via-Gateway") == "1":
+        _r = (request.headers.get("X-CK-Role") or "").strip()
+        g.role = _r if _r in (ROLE_ADMIN, ROLE_USER, ROLE_VIEWER) else ROLE_VIEWER
+        g.who = "经网关"
         return None
     if _is_local_request():
         g.role, g.who = ROLE_ADMIN, "本机"
@@ -617,7 +773,11 @@ def _viewer_guard():
     普通用户身份只能看进度/日志。本机访问仍是 admin，不受影响。
     """
     role = getattr(g, "role", None)
-    if role and role != ROLE_ADMIN and \
+    # 🔴 2026-10-03：加 `method != "GET"` 限定。
+    #    原因：`/api/live_params` 同时有 GET（读实时参数）和 POST（改参数），
+    #    只按路径前缀拦会把只读用户"看参数"也禁掉。所有写操作都是 POST/DELETE，
+    #    所以"非 GET + 命中写清单"才是准确的判据。
+    if role and role != ROLE_ADMIN and request.method != "GET" and \
             any(request.path.startswith(p) for p in _WRITE_PATHS):
         return jsonify(ok=False,
                        msg="当前身份只有查看权限，操作请用管理员口令登录"), 403
@@ -1238,6 +1398,53 @@ log_history: list[str] = []
 _old_stdout = _old_stderr = _old_tqdm_stream = None
 _last_activity = time.time()   # 最近一条日志的时间，用于检测任务静默卡死
 
+# 🔴 2026-10-01 二次修（上一版判错了对象，造成 8 个实例被误杀）：
+#    「哪些线程的日志算『任务还活着』」不能用**白名单**（只认 work_thread）——
+#    实际刷课日志是 **TaskHandler 的 worker 线程**（线程名形如 `Thread-6 (wrapper)`）
+#    写的，而 `work_thread`（web_ui 的 `_work` 主线程）自己几乎不打日志。
+#    ⇒ 白名单写法让 `_last_activity` **永不刷新**，看门狗在 `HARD_STALE_LIMIT=900`
+#      秒后把**完全正常**的任务判成僵死，注入 `PauseInterrupt` 杀掉 `_work`
+#      （state 变 paused=True），而**信号没打到 worker** → worker 成僵尸继续刷。
+#      实测：2026-10-01 20:15 重启的 8 个实例，20:30 前后全部中招。
+#    改用**黑名单**：只排除已知的常驻非任务线程，其余（含 worker）都算任务活动。
+#    被排除的三类必须排斥，否则又会掩盖真卡死：
+#      · `platform-progress`  —— 每 30 秒的心跳，就是它让旧实现永不触发
+#      · `process_request_thread` —— Flask 的请求线程；前端轮询会持续写访问日志
+#      · 保活/写盘类（keep-awake / battery-guard / loguru-writer / tqdm_monitor / _watchdog）
+# ⚠️ 必须用**子串包含**判断，不能用 `startswith` —— Python 线程名是
+#    `Thread-3 (_watchdog)`、`Thread-1386 (process_request_thread)` 这种
+#    `Thread-N (名字)` 格式，`startswith("_watchdog")` 匹配不到括号里的名字。
+_NON_TASK_THREADS = (
+    "platform-progress", "process_request_thread", "keep-awake",
+    "battery-guard", "loguru-writer", "tqdm_monitor", "_watchdog",
+    "MainThread",
+)
+
+
+def _task_log_mtime() -> float:
+    """任务日志 `chaoxing.log` 的最近写入时刻（epoch 秒）。
+
+    🔴🔴 看门狗判「任务是否还活着」**必须**用这个，不能用 `_last_activity`。
+
+    原因（2026-10-01 实测两次才定位）：
+      `QueueRedirector`（stdout 重定向）只捕获 **`print()`** 输出，而刷课过程中
+      几乎全是 loguru 的 `logger.xxx` 调用 —— loguru **直接写文件**，不经过 stdout。
+      ⇒ `_last_activity` 只在极稀疏的 print 时刷新；任务跑起来之后它就**停在
+        启动那一刻**，而 `HARD_STALE_LIMIT=900` → 看门狗 15 分钟后把完全正常的
+        任务判成"僵死"→ 注入 PauseInterrupt 杀掉 `_work`（state 变 paused=True），
+        而信号没打到 worker → **worker 变成僵尸继续刷，实例彻底失控**。
+      实测：2026-10-01 20:15 重启的 8 个实例，20:30 前后全部中招，
+      `resume` 标记还被看门狗的"超重启上限"分支一并清掉。
+
+    `chaoxing.log` 的 mtime 直接反映"日志还在不在写" ——
+    既不依赖线程名，也不依赖 print，且任务真卡死时它同样会停住（判据可靠）。
+    """
+    try:
+        from api.config import data_dir
+        return os.path.getmtime(os.path.join(data_dir(), "chaoxing.log"))
+    except Exception:                                              # noqa: BLE001
+        return 0.0
+
 
 # PauseInterrupt 统一定义在 api/exceptions.py 并由上方导入。
 # 不能在这里再定义一份：暂停时需要把它同时注入到 _work 线程和
@@ -1250,7 +1457,15 @@ RE_START = re.compile(r"开始任务: (.+), 总时长: (\d+)s, 已进行: (\d+)s
 RE_DONE = re.compile(r"(?:任务完成|任务瞬间完成): (.+)")
 RE_EMPTY_DONE = re.compile(r"空页面任务完成 -> (.+)")
 RE_CHAPTER_FINISHED = re.compile(r"章节：(.+) 已完成所有任务点")
-RE_HIT = re.compile(r"获取答案：")  # 失败行是“获取答案失败：”，不会误命中
+RE_HIT = re.compile(r"获取答案(?:（[^）]*）)?：")
+#   🔴 2026-10-08 修：原为 `获取答案：` —— 但**学习库命中**的日志是
+#      `从学习库获取答案（已验证）：…`（"获取答案"后是括号而非冒号），
+#      于是"学习库命中"这一最优质来源**从未被计入** hits，而它的
+#      "未命中"行（先走题库失败）却已被计入 misses ⇒ 两个后果：
+#        ① 界面「题库命中」少算、获取率偏低
+#        ② 与 miss 的题面指纹对不上，**回撤逻辑失效**（残留一批假未命中）
+#      新写法兼容 `获取答案：` 与 `获取答案（…）：`，且仍**不会**误匹配
+#      `获取答案失败：`（"获取答案"后面是"失败"）—— RE_MISS 另在前拦一道。
 RE_MISS = re.compile(r"获取答案失败：")
 RE_RANDOM = re.compile(r"随机选择 -> ")
 RE_COVER = re.compile(r"章节检测题库覆盖率： (\d+)%")
@@ -1261,6 +1476,10 @@ RE_PASS = re.compile(r"章节检测全部正确（成绩 (\S+?)\s*分），通�
 RE_REDO = re.compile(r"章节检测有 (\d+)/(\d+) 题回答错误")
 # unit_scale 会把秒数格式化成 1.70k 这类带后缀的形式，必须兼容
 RE_PBAR = re.compile(r"^(.*?):\s*\d+%\|.*\|\s*([\d.]+[kMG]?)\s*/\s*([\d.]+[kMG]?)\s*$")
+# 每次登录都会打 `当前登录用户: 何光杨`（api/base.py:login）。
+# 2026-10-08 起用于「回放日志时按账号切分」—— 换账号后不能把上个账号的
+# 统计算进界面（何同学明确要求）。
+RE_LOGIN_USER = re.compile(r"当前登录用户[:：]\s*(\S+)")
 
 
 def _fnum(s):
@@ -1296,6 +1515,86 @@ class ProgressTracker:
         # 可能跨课程重名（"1.1 概述"这种），所以不按名字分、只累计总数，
         # 由 raw_done 供 ProgressTracker.snapshot 分给"当前正在刷的那门课"。
         self._point_done = 0
+        # 🔴 2026-10-08：按**题面**去重的集合（命中 / 未命中各一份）。
+        #    见 _parse 里 miss / hit 分支的注释（界面卡片写的是"题数"）。
+        self._hit_keys: set = set()
+        self._miss_keys: set = set()
+        self._replaying = False
+        # 清零后立刻回放「当前账号」已有日志，让界面数字 = 「累计」而非「本次进程」
+        # 见 _replay_logs 的说明（何同学：已提交/命中不该只有个位数）。
+        self._replay_logs()
+
+    def _qkey(self, text: str) -> str:
+        """从「获取答案…」之后的内容里取出**题面**，作为跨来源的唯一键。
+
+        命中行是 `…：{题面} -> {答案}`、失败行是 `…失败：{题面}`，
+        必须剥掉尾部的 ` -> 答案` 才能让同一题在两个分支对上（否则
+        "先失败后回退命中"的回撤判定永远不成立）。
+
+        🔴 2026-10-09 修（实测残留 79 条假未命中）：**必须先剥掉终端控制码**。
+          实时日志走 stdout 的终端 sink，**带颜色码**（文件 sink 不带）——
+            miss 行：`…失败：{题面}\\x1b[0m`  ⇒ key 变成 `{题面}\\x1b[0m`
+            hit  行：`…：{题面} -> {答案}\\x1b[0m` ⇒ rsplit 后 ANSI 被切掉，key 干净
+          ⇒ 两个 key 永远不相等 ⇒ **回撤 100% 失效**，界面「答案获取率」被压低
+          （acc9 显示 79 个未命中，实际 0 个）。文件回放路径没有这个问题，
+          所以"复算=0 而实例=79"——差异只在实时 feed 这条路。
+        """
+        t = strip_ansi(text)
+        t = t.rsplit(" -> ", 1)[0] if " -> " in t else t
+        return t.strip()[:120]
+
+    def _replay_logs(self):
+        """回放本实例日志中**属于当前账号**的部分（让界面数字变成「累计」）。
+
+        为什么需要（2026-10-08 何同学）：
+          卡片文案本身是累计语义（"已提交""题库命中"），但 reset() 每次
+          `/api/start`、resume 都清零 ⇒ 重启后只剩个位数，与同排的
+          「平台进度 62/107」「平台判对」（两者都是累计）并列时自相矛盾。
+
+        为什么按账号切分（何同学明确要求「换账号后不要读以前的账号」）：
+          实例目录是 per 端口、不 per 账号，日志里混着历史账号的记录。
+          日志每行不带账号，但每次登录都会打 `当前登录用户: X` —— 据此
+          知道每段日志归谁；只回放 `X == 当前账号` 的段落。
+          ⚠️ 认不出当前账号（或日志里没有登录行）时**直接放弃回放**：
+             宁可只统计本次运行，也绝不把别的账号的数字算进来。
+        """
+        me = (state.get("account_name") or "").strip()
+        if not me:
+            return
+        import glob as _glob
+        base = (os.environ.get("CK_DATA_DIR") or "").strip()
+        pattern = (os.path.join(base, "chaoxing*.log") if base else
+                   os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "chaoxing*.log"))
+        paths = sorted(_glob.glob(pattern))
+        if not paths:
+            return
+        self._replaying = True
+        try:
+            for p in paths:
+                owner = None
+                try:
+                    f = open(p, encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                with f:
+                    for line in f:
+                        # 字符串包含比正则快得多（先粗筛，再精确取名字）
+                        if "当前登录用户" in line:
+                            mm = RE_LOGIN_USER.search(line)
+                            if mm:
+                                owner = mm.group(1)
+                            continue
+                        if owner != me:      # 不是当前账号（或还没登录）⇒ 跳过
+                            continue
+                        s = line.strip()
+                        if s:
+                            self._parse(s)
+        except Exception as e:                                 # noqa: BLE001
+            # 回放只是"让数字更好看"，绝不能因为一次解析失败影响刷课
+            print(f"日志回放失败（本轮统计从零开始，不影响刷课）: {e}")
+        finally:
+            self._replaying = False
 
     def feed(self, chunk):
         for line in chunk.splitlines():  # splitlines 也按 \r 切，tqdm 行无需特殊处理
@@ -1311,6 +1610,11 @@ class ProgressTracker:
         归属用任务点名反查（_work 建 task 时登记），不靠"最后 begin 的课"。
         """
         self._point_done += 1
+        if self._replaying:
+            # 回放历史日志时**不能**写课程看板：此刻 run_tracker 还挂着上一轮的
+            # rows（_launch 的顺序是 tracker.reset() → run_tracker.reset()），
+            # 会把历史任务点记到本轮某门课头上，看板数字虚高。
+            return
         cid = run_tracker.cid_of_point(point_name)
         if cid and cid in run_tracker.rows:
             run_tracker.rows[cid]["done"] = run_tracker.rows[cid].get("done", 0) + 1
@@ -1321,10 +1625,12 @@ class ProgressTracker:
         elif m := RE_START.search(line):
             # 任务点归属哪门课：多课程时用户必须能一眼看出"现在在刷哪门"。
             # 按任务点名反查（而不是记"最后 begin 的课"—— 并发下必错）
-            nm = m.group(1)
-            self.current = {"name": nm, "total": int(m.group(2)),
-                            "pos": int(m.group(3)),
-                            "course": run_tracker.course_of_point(nm)}
+            # 回放历史日志时不设 current：历史任务不是"当前正在刷"。
+            if not self._replaying:
+                nm = m.group(1)
+                self.current = {"name": nm, "total": int(m.group(2)),
+                                "pos": int(m.group(3)),
+                                "course": run_tracker.course_of_point(nm)}
         elif m := RE_DONE.search(line):
             nm = m.group(1).strip()
             self.done.add(nm)
@@ -1337,16 +1643,33 @@ class ProgressTracker:
             nm = m.group(1).strip()
             self.done.add(nm)
             self._count_point_done(nm)
-        elif RE_MISS.search(line):
-            # 必须放在 RE_HIT 之前判断：失败行也含“获取答案”字样
-            self.misses += 1
-            self.q_total += 1
+        elif (mm := RE_MISS.search(line)):
+            # 必须放在 RE_HIT 之前判断：失败行也含“获取答案”字样。
+            # 🔴 2026-10-08 修（何同学：「界面数据要符合它自己写的设定」）：
+            #    卡片写的是「题库里没收录、改由 AI 补答的**题数**」，
+            #    而原实现每见一行失败就 +1 —— 一道题常被多家题库分别判失败
+            #    （TikuAdapter 失败 → 全能搜题 失败 → 回退命中），于是同一题
+            #    被记成 2 次未命中 ⇒ 「答案获取率」被系统性压低
+            #    （实测 acc11 显示 74.3%，而真实是 **100%** 拿到答案）。
+            #    现按**题面**去重；若该题随后被别家题库答出，下面 hit 分支会撤回。
+            _mk = self._qkey(line[mm.end():])
+            if _mk and _mk not in self._hit_keys and _mk not in self._miss_keys:
+                self._miss_keys.add(_mk)
+                self.misses += 1
+                self.q_total += 1
             self._last_qkey = ""
         elif m := RE_HIT.search(line):
             # 同一题组会打多行（题库命中 + 回退命中 + 多题库汇总），
             # 用题面指纹去重，避免一次答题被算成三次
-            key = line[m.end():m.end() + 120].strip()
-            if key and key != self._last_qkey:
+            key = self._qkey(line[m.end():])
+            if key and key not in self._hit_keys:
+                self._hit_keys.add(key)
+                # 该题先被判「未命中」、随后又被别家题库答出 ⇒ 撤回那条未命中。
+                # 不撤回的话，成功的回退也会被算成失败（分母虚高、获取率偏低）。
+                if key in self._miss_keys:
+                    self._miss_keys.discard(key)
+                    self.misses -= 1
+                    self.q_total -= 1
                 self._last_qkey = key
                 self.hits += 1
                 self.q_correct += 1
@@ -1399,7 +1722,9 @@ class ProgressTracker:
                 "learned_verified": ver, "learned_wrong": wrong,
                 "paused": state["paused"],
                 "resuming": state["resuming"],
-                "stale_secs": int(time.time() - _last_activity),
+                # 与看门狗同口径：取 print 活动与 chaoxing.log 写入中较新的一个
+                "stale_secs": int(time.time() - max(_last_activity,
+                                                    _task_log_mtime())),
                 "current": self.current, "running": state["running"],
                 # 风控中止横幅（2026-09-24）
                 "risk_abort": state.get("risk_abort", ""),
@@ -1570,11 +1895,11 @@ _PLAT_WATCH.start()
 # 的风险，而且从界面上完全看不出来。用户原话："以后新开的实例也要保证和前面
 # 的一样都修好了。"
 # 改成进程启动时自己装载：以后不管谁新开实例、不管用哪种方式启动，行为都一致。
-# 两个脚本自身都是幂等的（_KEEP_AWAKE / _BATT_GUARD_V2 守卫），重复装载安全。
+# 两个脚本自身都是幂等的（_KEEP_AWAKE / _BATT_GUARD_V3 守卫），重复装载安全。
 def _auto_load_guards():
     import runpy
     _here = os.path.dirname(os.path.abspath(__file__))
-    for _fn in ("_keep_awake.py", "_battery_guard_v2.py"):
+    for _fn in ("_keep_awake.py", "_battery_guard_v3.py"):
         _p = os.path.join(_here, _fn)
         if not os.path.exists(_p):
             continue
@@ -1823,7 +2148,14 @@ class QueueRedirector:
             return               # 清洗后只剩控制字符，整行丢弃
         self.history.append(clean)
         global _last_activity
-        _last_activity = time.time()   # 卡死自检依据：正常运行时日志持续在滚动
+        # 🔴 2026-10-01 **二次修**：这里原写成「只认 state["work_thread"]」，
+        #    **判错了对象** —— 详见 `_NON_TASK_THREADS` 上方的长注释。
+        #    一句话：刷课日志是 TaskHandler 的 worker 线程写的，不是 work_thread；
+        #    白名单会让 `_last_activity` 永不刷新，看门狗 900 秒后把正常运行判成
+        #    僵死并杀掉任务（8 个实例实测中招）。改用黑名单排除常驻非任务线程。
+        if not any(k in threading.current_thread().name
+                   for k in _NON_TASK_THREADS):
+            _last_activity = time.time()
         if len(self.history) > HISTORY_MAX:
             del self.history[: len(self.history) - HISTORY_MAX]
 
@@ -2148,6 +2480,20 @@ PAGE = """<!DOCTYPE html>
          background:#f1f5f9; color:#64748b; }
   .trs.ok { background:#ecfdf5; color:#047857; }
   .trs.bad { background:#fff7ed; color:#b45309; }
+  /* 「仅暂存」：考试跑了但**没替你交卷**（默认行为）—— 必须与"成功"区分开，
+     否则用户会以为已经交上去了（2026-10-12）。 */
+  .trs.staged { background:#eef2ff; color:#4338ca; }
+  /* 开考前「预检」结果面板（2026-10-12）：把这场考试的要求一条条摆出来 */
+  #examPre { margin:2px 0 8px; padding:9px 11px; border-radius:9px;
+             background:#f8fafc; border:1px solid #e2e8f0; font-size:12.5px; }
+  #examPre .pch { font-weight:600; color:#334155; margin-bottom:5px; }
+  #examPre .pcr { display:flex; gap:8px; line-height:1.8; }
+  #examPre .pck { flex:none; width:112px; color:#64748b; }
+  #examPre .pcv { flex:1; color:#1f2937; word-break:break-all; }
+  #examPre .ok { color:#047857; font-weight:600; }
+  #examPre .warn { color:#b45309; font-weight:600; }
+  #examPre .pcnote { margin-top:7px; padding-top:7px; border-top:1px dashed #cbd5e1;
+                     color:#475569; line-height:1.75; }
   .trm { font-size:12.5px; color:#92400e; background:#fffbeb;
          border-left:3px solid #fcd34d; padding:6px 9px; margin:3px 0 6px;
          border-radius:0 8px 8px 0; line-height:1.6; word-break:break-all; }
@@ -3054,9 +3400,9 @@ input,select,textarea{will-change:transform}
     <input type="password" id="pwd">
     <div class="row">
       <div><label>播放倍速（1 - 2，平台最高支持 2 倍）</label>
-        <input type="number" id="speed" value="2" min="1" max="2" step="0.5"></div>
-      <div><label>并发章节数（建议 3）</label>
-        <input type="number" id="jobs" value="3" min="1" max="8" step="1"></div>
+        <input type="number" id="speed" value="1" min="1" max="2" step="0.5"></div>
+      <div><label>并发章节数（建议 2）</label>
+        <input type="number" id="jobs" value="1" min="1" max="8" step="1"></div>
     </div>
     <div class="warn">控总量建议：<b>实例数 × 并发章节数 ≤ 8</b>。本机 CPU / 网络 / 题库余量都很大
       （实测 20 并发查题库零错误），真正要留意的是<b>平台风控</b>：触发 403 会自动冷却 10 分钟，
@@ -3071,8 +3417,8 @@ input,select,textarea{will-change:transform}
     </select>
     <div id="adapterBox">
       <label>Adapter 地址</label>
-      <input type="text" id="adapterUrl" value="http://127.0.0.1:8060/adapter-service/search?use=local,icodef,buguake,wanneng,tikuhai">
-      <div class="hint">必须带 <code>?use=local</code>，否则本地题库不参与查询（听力题会全部搜不到）</div>
+      <input type="text" id="adapterUrl" value="http://127.0.0.1:8060/adapter-service/search?use=local,buguake,icodef">
+      <div class="hint">必须带 <code>?use=</code>，否则本地题库不参与查询。当前：<code>local,buguake,icodef</code>（icodef 的 Token 自动从 config.ini 补）</div>
       <div class="chk"><input type="checkbox" id="aiFallback" checked>
         <span>AI 兜底：免费题库搜不到的题自动改用 AI 作答（默认开启，建议保持）</span></div>
     </div>
@@ -3129,6 +3475,10 @@ input,select,textarea{will-change:transform}
       <button class="ghost mini" id="btnRescan" title="重新扫描作业与考试">
         重新扫描
       </button>
+      <button class="ghost mini" id="btnRefreshCourses"
+              title="重新拉取课程列表：平台新发的课会出现在下面。不会重新登录，也不影响已勾选。">
+        刷新课程
+      </button>
     </div>
     <div class="tag ok" id="lastTaskTag" style="display:none;margin-bottom:8px"></div>
     <div class="taskbar hide" id="taskBar">
@@ -3162,7 +3512,11 @@ input,select,textarea{will-change:transform}
     <div class="submitbar" id="submitBar">
       <label class="sw">
         <input type="checkbox" id="autoSubmitMain" checked>
-        <span>自动提交</span>
+        <span>自动提交作业</span>
+      </label>
+      <label class="sw">
+        <input type="checkbox" id="autoSubmitExam">
+        <span>自动提交考试</span>
       </label>
       <span class="hint" id="submitHint">达标即直接交卷，全自动</span>
       <span class="sp"></span>
@@ -3249,9 +3603,39 @@ input,select,textarea{will-change:transform}
         <button class="ghost" id="exAdd">登记课程</button>
       </div>
       <div id="examExtraList" style="margin:2px 0 6px"></div>
+      <!-- 开考前只读预检结果（2026-10-12）：点「预检」后显示在这里 -->
+      <div id="examPre" class="hide"></div>
       <div class="hwlist" id="examList"></div>
       <div class="hwfoot">
         <span class="msg" id="examMsg"></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- 运行中「添加课程」弹窗（2026-10-01 新增）：进度页直接追加课程，
+       不必「返回选课」重选一遍（重选会重建整个任务、容易漏掉原来在刷的课）。 -->
+  <div class="hwmodal hide" id="addModal" role="dialog" aria-modal="true">
+    <div class="hwbox">
+      <div class="hwhead">
+        <strong>添加课程到当前任务</strong>
+        <span class="sp"></span>
+        <span class="tag" id="addCount">共 0 门</span>
+        <button class="ghost" id="addClose">关闭</button>
+      </div>
+      <div class="hwbar">
+        <input type="text" id="addFilter" placeholder="筛选课程（名称 / 课程ID）">
+        <button class="ghost" id="addNone">全不选</button>
+      </div>
+      <div class="hwtip">
+        已在刷的课程会标「已在刷」并默认勾上；<strong>新勾的课程按「视频 + 章节测验」加入</strong>。
+        提交后当前任务会先暂停、再用合并后的清单重新开始
+        —— 已上报的进度不受影响，恢复后从没刷完的地方接着跑。
+      </div>
+      <div class="hwlist" id="addList"></div>
+      <div class="hwfoot">
+        <span class="msg" id="addMsg"></span>
+        <span class="sp"></span>
+        <button class="ghost" id="addRun">加入并继续</button>
       </div>
     </div>
   </div>
@@ -3262,6 +3646,8 @@ input,select,textarea{will-change:transform}
       <span id="stat" class="tag">运行中</span>
       <button id="btnPause" class="hide">暂停刷课</button>
       <button class="ghost" id="btnBack">返回选课</button>
+      <button class="ghost" id="btnAddCourse"
+              title="把别的课并进当前任务，不必返回选课页重选">＋ 添加课程</button>
     </div>
 
     <div class="ov">
@@ -3273,6 +3659,18 @@ input,select,textarea{will-change:transform}
       <div class="pbar"><div class="pfill" id="pFill"></div></div>
       <div class="sub" id="pNote"></div>
       <div class="sub" id="pEta" style="color:#0d9488;font-weight:600"></div>
+      <!-- 🔴 2026-10-13（何同学要求）：**考试独立进度条**，显示在刷课大进度条下方。
+           起因：考试进行中界面只有刷课的 `56/56 100%`，看不出考试跑到第几题，
+           无法判断"到底有没有在跑"。刷题与考试同时勾选时两条并存、互不干扰。 -->
+      <div id="examProgBox" class="hide" style="margin-top:10px">
+        <div style="display:flex;align-items:baseline;gap:8px">
+          <b id="examProgNum">0 / 0</b>
+          <span class="pct" id="examProgPct">0%</span>
+          <span class="cap" id="examProgTitle">考试作答</span>
+        </div>
+        <div class="pbar"><div class="pfill" id="examProgFill"></div></div>
+        <div class="sub" id="examProgNote"></div>
+      </div>
     </div>
 
     <!-- 本轮任务结果（2026-09-28 新增）：把每场考试/作业的成败与原因显示出来。
@@ -3351,6 +3749,8 @@ input,select,textarea{will-change:transform}
 const BASE = "__BASE__";
 const $ = id => document.getElementById(id);
 let courses = [], timer = null, got = -1, pulling = false;
+// 「添加课程」弹窗用：全部课程 + 当前任务已在刷的 courseId
+let addCourses = [], addCur = new Set();
 
 /* ---- 2026-09-24：环境动效与指针反馈 ----
    只写 CSS 变量 / 加 class / 注入临时 span，不改任何既有逻辑与 DOM 结构。
@@ -3496,9 +3896,9 @@ function fixAdapterUrl(u) {
   if (!u) return ADAPTER_URL_DEFAULT;
   if (u.indexOf('adapter-service') === -1) return u;
   if (u.indexOf('use=') !== -1) return u;
-  return u + (u.indexOf('?') === -1 ? '?' : '&') + 'use=local,icodef,buguake,wanneng,tikuhai';
+  return u + (u.indexOf('?') === -1 ? '?' : '&') + 'use=local,buguake,icodef';
 }
-const ADAPTER_URL_DEFAULT = 'http://127.0.0.1:8060/adapter-service/search?use=local,icodef,buguake,wanneng,tikuhai';
+const ADAPTER_URL_DEFAULT = 'http://127.0.0.1:8060/adapter-service/search?use=local,buguake,icodef';
 
 function fillProfile(i) {
   const p = profiles[i];
@@ -3518,7 +3918,11 @@ function fillProfile(i) {
   // 同上：字段缺失时**默认勾上**（只有明确存了 false 才取消）
   $('aiFallback').checked = (p.ai_fallback === undefined || p.ai_fallback === null)
     ? true : !!p.ai_fallback;
+  // 同上：字段缺失时**默认勾上**（只有明确存了 false 才取消）
   $('autoSubmit').checked = p.auto_submit !== false;
+  // 🔴 2026-10-12（何同学要求）：考试开关**独立**，且默认关 —— 只暂存不交卷。
+  //    旧档案没有 exam_auto_submit 字段时一律落到"不交卷"（宁可不交，不要误交）。
+  if ($('autoSubmitExam')) $('autoSubmitExam').checked = p.exam_auto_submit === true;
   updateTikuUI();
   syncSubmitBar();          // 🔴 2026-09-26：切档案也要同步主界面提交开关
 }
@@ -3537,7 +3941,11 @@ function fillParams(p) {
   // 同上：字段缺失时**默认勾上**（只有明确存了 false 才取消）
   $('aiFallback').checked = (p.ai_fallback === undefined || p.ai_fallback === null)
     ? true : !!p.ai_fallback;
+  // 同上：字段缺失时**默认勾上**（只有明确存了 false 才取消）
   $('autoSubmit').checked = p.auto_submit !== false;
+  // 🔴 2026-10-12（何同学要求）：考试开关**独立**，且默认关 —— 只暂存不交卷。
+  //    旧档案没有 exam_auto_submit 字段时一律落到"不交卷"（宁可不交，不要误交）。
+  if ($('autoSubmitExam')) $('autoSubmitExam').checked = p.exam_auto_submit === true;
   updateTikuUI();
   syncSubmitBar();          // 🔴 2026-09-26：登录页参数 → 主界面提交开关
 }
@@ -3555,30 +3963,32 @@ function syncSubmitBar() {
 }
 
 function updateSubmitHint() {
-  const cb = $('autoSubmitMain'), hint = $('submitHint'), tip = $('submitTip');
-  if (!cb || !hint) return;
-  const on = cb.checked;
+  const w = $('autoSubmitMain'), ex = $('autoSubmitExam');
+  const hint = $('submitHint'), tip = $('submitTip');
+  if (!w || !hint) return;
+  const won = w.checked;                  // 作业开关（默认开）
+  const eon = ex ? ex.checked : false;    // 考试开关（2026-10-12 起**默认关** = 只暂存）
   // 🔴 2026-09-26：文案必须**随状态互斥**，不能两种模式都写在一段里。
-  // 之前把「自动提交（默认，推荐）…」和「取消勾选 = 审核提交…」写成两条并列，
-  // 取消勾选后第一句仍显示"自动提交（推荐）"，与当前状态自相矛盾，
-  // 而且两段挤在一起视觉上糊成一团（实测截图确认）。
-  hint.textContent = on ? '达标即直接交卷，全自动' : '只存草稿，不交卷';
-  hint.className = 'hint' + (on ? '' : ' manual');
+  // 🔴 2026-10-12：拆成「作业 / 考试」两条独立开关 —— 考试只有一次机会，
+  //    默认不替用户交卷；作业维持原有的自动提交默认。
+  hint.textContent = `作业 ${won ? '达标即交卷' : '只存草稿'}`
+    + ` ｜ 考试 ${eon ? '达标即交卷' : '只暂存不交卷'}`;
+  hint.className = 'hint' + ((won && eon) ? '' : ' manual');
   const thr = $('coverRateMain');
-  if (thr) thr.title = on
-    ? '覆盖率 ≥ 该门槛才交卷；低于门槛会保存草稿等你处理'
-    : '审核提交模式下本项不生效（一律只存草稿）';
+  if (thr) thr.title = '覆盖率 ≥ 该门槛才交卷；低于门槛会保存草稿等你处理'
+    + '（只对已开启「自动提交」的那一方生效）';
   // 说明行：把"当前模式做什么"写清楚，只保留一条，避免自相矛盾
   const desc = $('submitDesc');
   if (desc) {
-    desc.className = 'submitdesc' + (on ? '' : ' manual');
-    desc.innerHTML = on
-      ? '<b>当前：自动提交</b> —— 答案覆盖率达标就直接交卷，全程无需你介入。<br>'
-        + '<span class="dim">若覆盖率不达标，会保存草稿不交卷，等你自己处理。</span>'
-      : '<b>当前：审核提交</b> —— 只把答案<b>暂存草稿</b>，不点交卷。'
-        + '你自己到学习通核对后再交卷，适合想先看一遍答案、'
-        + '或担心蒙题拉低分数的作业。<br>'
-        + '<span class="dim">（题型与答案仍会正常填入，只是不替你按下交卷键。）</span>';
+    desc.className = 'submitdesc' + ((won && eon) ? '' : ' manual');
+    desc.innerHTML =
+      `<b>作业：${won ? '自动提交' : '审核提交（只存草稿）'}</b> —— `
+      + (won ? '答案覆盖率达标就直接交卷，全程无需你介入。'
+             : '只暂存草稿，你自己到学习通核对后交卷。')
+      + '<br><b>考试：' + (eon ? '自动提交' : '审核提交（只存草稿）') + '</b> —— '
+      + (eon ? '答完达标即自动交卷。'
+             : '<b>默认只暂存草稿、不替你交卷</b>。考试机会在进入考场时已消耗，'
+               + '请到学习通核对后手动交卷。');
   }
 }
 
@@ -3588,6 +3998,8 @@ if ($('autoSubmitMain')) {
     $('autoSubmit').checked = $('autoSubmitMain').checked;
     updateSubmitHint();
   };
+  // 2026-10-12：考试开关独立 —— 不联动登录页（那边是作业链路），改完只刷新提示。
+  if ($('autoSubmitExam')) $('autoSubmitExam').onchange = updateSubmitHint;
   $('coverRateMain').oninput = () => { $('coverRate').value = $('coverRateMain').value; };
   updateSubmitHint();
 }
@@ -3794,6 +4206,41 @@ $('btnLogin').onclick = async () => {
 $('btnRescan').onclick = () => {
   Object.keys(taskPick).forEach(k => delete taskPick[k]);
   taskScan();
+};
+
+// 刷新课程列表（2026-09-30 用户要求）：平台刚发的课原先刷不出来，
+// 只能「切换账号」重登才看得到。这里给一个专职按钮。
+// ⚠️ 与「重新扫描」区分：那个扫的是作业和考试，不动课程列表。
+$('btnRefreshCourses').onclick = async () => {
+  const b = $('btnRefreshCourses');
+  if (b.disabled) return;
+  const old = b.textContent;
+  b.disabled = true; b.dataset.busy = '1'; b.textContent = '刷新中…';
+  try {
+    const r = await fetch(BASE + '/api/courses/refresh', { method: 'POST' })
+      .then(x => x.json());
+    if (!r.ok) { alert(r.msg || '刷新失败'); return; }
+    const oldIds = courses.map(c => String(c.courseId));
+    // 保留「课程仍在」的勾选（taskKey 首段就是 courseId，键稳定）
+    const keep = {};
+    Object.keys(taskPick).forEach(k => {
+      if (oldIds.includes(k.split('|')[0])) keep[k] = taskPick[k];
+    });
+    courses = r.courses || [];
+    Object.keys(taskPick).forEach(k => delete taskPick[k]);
+    Object.assign(taskPick, keep);
+    render();
+    flashDone(b, 900);
+    const added = courses.filter(c => !oldIds.includes(String(c.courseId)));
+    if (added.length) {
+      alert('课程已刷新：新增 ' + added.length + ' 门\\n\\n'
+            + added.map(c => '· ' + c.title).join('\\n'));
+    }
+  } catch (e) {
+    alert('刷新失败：' + (e && e.message || e));
+  } finally {
+    b.disabled = false; delete b.dataset.busy; b.textContent = old;
+  }
 };
 
 // ---- 课程列表 ----
@@ -4156,13 +4603,44 @@ if ($('courseFilter')) $('courseFilter').oninput = applyFilter;
 })();
 
 // ---- 切换账号：清掉服务端登录态，回登录页 ----
+// 🔴 2026-10-07（何同学定案）：原实现只打 `/api/logout`，而 logout **故意保留**
+//    磁盘上的 `last_pick` / `resume` —— 于是**同一实例换登另一个账号时，
+//    新号会继承上一个号的选课勾选与续刷标记**，界面看起来"还用着之前的进度"。
+//    现在改为**两步询问**：先确认要换账号，再让用户选"是否连进度一起清掉"。
+//      · 选「清进度」→ 调 `/api/clear_account`（把 profiles/last_params/
+//        last_pick/resume 一并抹掉，回到全新未配置状态）
+//      · 选「保进度」→ 仍走 `/api/logout`（只清登录态，保留勾选与续刷）
+//    注意：任务运行中 clear_account 会被后端拒绝（返回 ok:false），
+//    此时降级为 logout 并提示用户先停止任务。
 $('btnLogout').onclick = async () => {
   if (!confirm('切换账号？当前登录状态会清除（正在刷课的任务不受影响）。')) return;
   const b = $('btnLogout');
   b.disabled = true; b.dataset.busy = '1';
-  try { await fetch(BASE + '/api/logout', {method: 'POST'}); } catch (e) {}
+  // ⚠️ 换行一律用数组 join —— 本文件是 Python 源码，字符串里的 \n 会被
+  //    Python 先解析成真实换行，写进 JS 就成了跨行字符串（语法错误）。
+  //    用 join 拼接最稳，不依赖转义层级。
+  const clearProg = confirm([
+    '是否同时清空该实例的「选课勾选 / 续刷进度」？',
+    '',
+    '· 点「确定」= 一起清掉（相当于换一个全新账号使用）',
+    '· 点「取消」= 保留进度（只切换登录状态，下次登录仍看到原来的勾选）',
+    '',
+    '⚠️ 同一实例换登不同账号时，建议「确定」——否则新号会继承上一个号的进度。',
+  ].join(String.fromCharCode(10)));
+  let ok = true, m = '';
+  try {
+    const path = clearProg ? '/api/clear_account' : '/api/logout';
+    const r = await fetch(BASE + path, {method: 'POST'});
+    const j = await r.json().catch(() => ({}));
+    if (j && j.ok === false) {
+      // 典型：任务运行中，clear_account 被拒 → 降级 logout，保住"能切号"
+      m = j.msg || '清空失败';
+      ok = false;
+      await fetch(BASE + '/api/logout', {method: 'POST'}).catch(() => {});
+    }
+  } catch (e) { /* 网络异常：仍回登录页 */ }
   b.disabled = false; delete b.dataset.busy;
-  $('msg1').textContent = '';
+  $('msg1').textContent = ok ? '' : (m + '（已切换登录状态，进度未清）');
   await loadProfiles();   // 重新拉一遍档案（可能刚归档了新账号）
   showStep(1);
 };
@@ -4475,8 +4953,10 @@ function examRender() {
         <label class="nm" style="cursor:pointer">${hwEsc(e.title)}</label>
         ${t0 ? `<span class="hwsc">${hwEsc(t0)}</span>` : ''}
         <span class="st ${dn ? 'done' : 'todo'}">${hwEsc(st)}</span>
-        ${(!dn && e.exam_id) ? `<button class="ghost" data-run="${hwEsc(key)}"
-             style="margin-left:8px">单独开考</button>` : ''}
+        ${(!dn && e.exam_id) ? `<button class="ghost" data-ck="${hwEsc(key)}"
+             style="margin-left:8px" title="只读：看清这场考试有什么要求（不开考、不消耗作答机会）">预检</button>
+           <button class="ghost" data-run="${hwEsc(key)}"
+             style="margin-left:6px">单独开考</button>` : ''}
       </div>`;
     });
   };
@@ -4493,6 +4973,7 @@ function examRender() {
 
 async function examScan() {
   $('examModal').classList.remove('hide');
+  examPrecheckClear();               // 重扫就清掉上一次的预检结果
   $('examMsg').textContent = '正在扫描全部课程的考试…（只读，不会提交任何东西）';
   examData = null; examRender();
   try {
@@ -4515,16 +4996,19 @@ async function examRun(key) {
   const cid = p[0] || '', clz = p[1] || '', eid = p[2] || '', cpi = p[3] || '';
   const title = p.slice(4).join('|') || '这场考试';
   if (!cid || !eid) { $('examMsg').textContent = '这条考试信息不完整，无法开考'; return; }
+  const _ae = $('autoSubmitExam') ? $('autoSubmitExam').checked : false;
   if (!confirm('确认开考《' + title + '》？\\n\\n⚠ 考试通常只有一次机会，'
-      + '作答机会消耗后无法恢复。\\n\\n（默认自动交卷；可在主界面关掉'
-      + '「自动提交」改为只暂存）')) return;
+      + '作答机会消耗后无法恢复。\\n\\n提交方式：'
+      + (_ae ? '自动交卷（答完即交）'
+             : '审核提交 —— 只暂存草稿，不替你交卷，你到学习通核对后手动交')
+      + '\\n（可在主界面「自动提交考试」勾选来切换）')) return;
   $('examMsg').textContent = '正在启动考试任务…';
   try {
     const j = await fetch(BASE + '/api/exam/run', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({
         items: [{courseid: cid, clazzid: clz, cpi: cpi, exam_id: eid, title: title}],
-        auto_submit: true
+        auto_submit: _ae
       })
     }).then(r => r.json());
     if (j.ok) {
@@ -4544,7 +5028,73 @@ async function examRun(key) {
   } catch (e) { $('examMsg').textContent = '启动失败：' + e; }
 }
 
+// 开考前只读预检（2026-10-12）：看清这场考试的要求。**不开考、不消耗作答机会**。
+async function examPrecheck(key) {
+  const p = String(key).split('|');
+  const cid = p[0] || '', clz = p[1] || '', eid = p[2] || '', cpi = p[3] || '';
+  const title = p.slice(4).join('|') || '这场考试';
+  if (!cid || !eid) { $('examMsg').textContent = '这条考试信息不完整，无法预检'; return; }
+  $('examMsg').textContent = `正在预检《${title}》…（只读，不会开考）`;
+  try {
+    const j = await fetch(BASE + '/api/exam/precheck', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({courseid: cid, clazzid: clz, cpi: cpi,
+                            exam_id: eid, title: title})
+    }).then(r => r.json());
+    if (!j.ok) { $('examMsg').textContent = '预检失败：' + (j.msg || ''); return; }
+    showExamPrecheck(title, j);
+    $('examMsg').textContent = '预检完成（未开考，作答机会未消耗）';
+  } catch (e) { $('examMsg').textContent = '预检失败：' + e; }
+}
+
+function showExamPrecheck(title, j) {
+  const box = $('examPre');
+  if (!box) return;
+  // true=需要 / false=不需要 / null=未知（未开考时封面页不渲染这三项，
+  // 此时写"否"是假信息 —— 2026-10-12 修正）
+  const yn = v => v === true ? '<span class="warn">是</span>'
+    : (v === false ? '否'
+       : '<span style="color:#94a3b8">未知（开考后才可见）</span>');
+  const row = (k, v) => `<div class="pcr"><span class="pck">${k}</span>` +
+    `<span class="pcv">${v}</span></div>`;
+  let h = `<div class="pch">预检结果：《${hwEsc(title)}》` +
+    `<span style="font-weight:400;color:#94a3b8"> · 只读，未开考</span></div>`;
+  h += row('能否进入', j.can_enter
+    ? '<span class="ok">现在可以进入</span>'
+    : `<span class="warn">暂时不行</span> —— ${hwEsc(j.reason || '')}`);
+  if (j.state) h += row('平台状态', hwEsc(j.state));
+  if (j.student) h += row('考生', hwEsc(j.student));
+  if (j.start_time) h += row('开始时间', hwEsc(j.start_time));
+  if (j.end_time) h += row('截止时间', hwEsc(j.end_time));
+  h += row('人脸识别', yn(j.face_need) +
+    (j.face_need ? ' <span style="color:#b45309">（本程序不处理，会跳过）</span>' : ''));
+  h += row('人机验证', yn(j.captcha_need) +
+    (j.captcha_need ? ' <span style="color:#b45309">（程序会尝试自动过滑块）</span>' : ''));
+  h += row('考试码', yn(j.exam_code_need) +
+    (j.exam_code_need ? ' <span style="color:#b45309">（开考时须填老师给的码）</span>' : ''));
+  if ((j.limits || []).length) {
+    h += '<div class="pcnote"><b>提示</b><br>' +
+      j.limits.map(x => '· ' + hwEsc(x)).join('<br>') + '</div>';
+  }
+  if ((j.unknown || []).length) {
+    h += '<div class="pcnote"><b>封面页探不到、需进考场才知道</b>：' +
+      j.unknown.map(hwEsc).join('、') +
+      '<br><span style="color:#64748b">（「离开作答页面」计数是浏览器端行为检测，' +
+      '本程序走协议不执行 JS，不会产生离开记录；平台只在' +
+      '<b>考试截止时间</b>到点时自动交卷。）</span></div>';
+  }
+  box.innerHTML = h;
+  box.classList.remove('hide');
+}
+
+function examPrecheckClear() {
+  const box = $('examPre');
+  if (box) { box.classList.add('hide'); box.innerHTML = ''; }
+}
+
 $('examList').onclick = ev => {
+  const c = ev.target.closest('[data-ck]');
+  if (c) { examPrecheck(c.getAttribute('data-ck')); return; }
   const b = ev.target.closest('[data-run]');
   if (b) examRun(b.getAttribute('data-run'));
 };
@@ -4681,8 +5231,9 @@ function taskRenderCourse(idx) {
         .test(st);
       const cls = done ? 'done' : 'todo';
 
-      // ---- 重做信息（只有「已完成」类作业才有意义）----
-      // 次数来自详情页 redoTimes = 总上限 + 额外 - 已用
+      // ---- 重做信息（作业用 redotimes；考试用 can_retest）----
+      // 作业：次数来自详情页 redoTimes = 总上限 + 额外 - 已用
+      // 考试：列表页只能拿到「有没有重考按钮」，次数在交卷页（允许 N 次/已 M 次）
       // 取分规则 tip："最高成绩"=重做考低了不亏 ／ "本次成绩"=重做覆盖（考低就亏）
       let redoBar = '';
       if (type === 'work' && done && !/已过期|已取消|已关闭/.test(st)) {
@@ -4713,6 +5264,31 @@ function taskRenderCourse(idx) {
             data-i="${idx}" data-t="${type}" data-k="${k}"
             ${noLeft || left === null ? 'disabled' : ''}
             >重做</button>
+        </div>`;
+      }
+      // 🔴 2026-11-07：**考试重做**（何同学要求）。
+      //   考试只有在平台开「重考」时才显示按钮；次数在列表页拿不到，
+      //   有 retest_allowed/retest_used 就显示，没有就只显示"可重考"。
+      if (type === 'exam' && it.can_retest) {
+        const sc = (it.score === '' || it.score === null ||
+                    it.score === undefined) ? '' : String(it.score);
+        let badge = '<span class="rd-n">可重考</span>';
+        if (it.retest_allowed !== undefined && it.retest_allowed !== null) {
+          const used = Number(it.retest_used || 0);
+          const left = Math.max(0, Number(it.retest_allowed) - used);
+          badge = left > 0
+            ? `<span class="rd-n">还可重考 <b>${left}</b> 次</span>`
+            : '<span class="rd-n out">已无重考次数</span>';
+        }
+        redoBar = `<div class="rd-bar">
+          ${sc ? `<span class="rd-sc">得分 <b>${escapeHtml(sc)}</b></span>` : ''}
+          ${badge}
+          <span class="rd-rule risky" title="重考会覆盖上一次成绩">⚠ 覆盖上次成绩</span>
+          <button class="ghost mini ex-retest" data-i="${idx}" data-k="${k}"
+            >重考</button>
+          <button class="ghost mini ex-getans" data-i="${idx}" data-k="${k}"
+            title="从「试卷详情」提取正确答案并写入题库（仅平台允许查看时有内容）"
+            >提取答案</button>
         </div>`;
       }
 
@@ -4812,6 +5388,60 @@ function taskRenderCourse(idx) {
       b.disabled = false; b.textContent = old;
     }
   });
+  // 🔴 2026-11-07：考试「重考」「提取答案」（何同学要求）
+  box.querySelectorAll('.ex-retest').forEach(b => b.onclick = async ev => {
+    ev.preventDefault(); ev.stopPropagation();
+    const i = b.dataset.i, k = +b.dataset.k;
+    const dd = taskByCourse(courseIdOf(i));
+    const it = dd && dd.exams ? dd.exams[k] : null;
+    if (!it) return;
+    if (!window.confirm(
+      `确认重考《${it.title || it.name}》？\n\n`
+      + `· 重考会**覆盖上一次的作答与分数**\n`
+      + `· 建议先点「提取答案」，把正确答案存进题库再重考\n`
+      + `· 设置好后，点「开始」勾上这场考试即可作答\n\n继续吗？`)) return;
+    const old = b.textContent;
+    b.disabled = true; b.textContent = '设置中…';
+    try {
+      const r = await fetch(BASE + '/api/exam/retest', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          courseid: courseIdOf(i), exam_id: it.exam_id,
+          paper_id: it.test_paper_id || it.paper_id || it.exam_id,
+          relation_id: it.test_user_relation_id || it.relation_id})}
+      ).then(x => x.json());
+      alert(r.ok ? ('重考已就绪：' + (r.msg || '')) : ('失败：' + (r.msg || '')));
+      if (r.ok) refreshCourses();
+    } catch (e) { alert('请求失败：' + e); }
+    finally { b.disabled = false; b.textContent = old; }
+  });
+
+  box.querySelectorAll('.ex-getans').forEach(b => b.onclick = async ev => {
+    ev.preventDefault(); ev.stopPropagation();
+    const i = b.dataset.i, k = +b.dataset.k;
+    const dd = taskByCourse(courseIdOf(i));
+    const it = dd && dd.exams ? dd.exams[k] : null;
+    if (!it) return;
+    if (!window.confirm(
+      `从《${it.title || it.name}》提取正确答案？\n\n`
+      + `· 只有平台**允许查看答案**时才有内容，不允许会明确失败（不猜）\n`
+      + `· 提取到的答案会写进题库，重考时直接命中\n\n继续吗？`)) return;
+    const old = b.textContent;
+    b.disabled = true; b.textContent = '提取中…';
+    try {
+      const r = await fetch(BASE + '/api/exam/answers', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          courseid: courseIdOf(i), exam_id: it.exam_id,
+          paper_id: it.test_paper_id || it.paper_id || it.exam_id,
+          relation_id: it.test_user_relation_id || it.relation_id})}
+      ).then(x => x.json());
+      alert(r.ok ? `${r.msg}\n已写入题库 ${r.imported} 题`
+                 : ('提取失败：' + (r.msg || '')));
+    } catch (e) { alert('请求失败：' + e); }
+    finally { b.disabled = false; b.textContent = old; }
+  });
+
   box.querySelectorAll('.cd-all').forEach(b => b.onclick = ev => {
     ev.preventDefault(); ev.stopPropagation();
     const on = b.dataset.on === '1';
@@ -5058,11 +5688,17 @@ $('btnStart').onclick = async () => {
     + `\\n考试通常只有一次机会，作答机会消耗后无法恢复。`;
   // 🔴 2026-09-26：确认框必须显式告知**提交方式**。
   // 自动提交下蒙的答案会被直接交出去（判低分），这一步是最后的知情机会。
+  // 作业提交方式（默认开）—— 随 /api/start 一起提交给 build_tiku 的 SUBMIT。
   const _auto = $('autoSubmitMain') ? $('autoSubmitMain').checked : true;
+  // 考试提交方式（2026-10-12 起**默认关** = 只暂存不交卷，何同学要求）。
+  const _autoExam = $('autoSubmitExam') ? $('autoSubmitExam').checked : false;
   const _thr = parseFloat(($('coverRateMain') || {}).value) || 0.9;
-  detail += _auto
-    ? `\\n\\n提交方式：自动提交（覆盖率 ≥ ${Math.round(_thr * 100)}% 即直接交卷）`
-    : `\\n\\n提交方式：审核提交（只暂存草稿，不交卷，你自己到学习通核对后交卷）`;
+  detail += `\\n\\n提交方式（作业）：`
+    + (_auto ? `自动提交（覆盖率 ≥ ${Math.round(_thr * 100)}% 即交卷）`
+             : '审核提交（只暂存草稿）');
+  if (neItem) detail += `\\n提交方式（考试）：`
+    + (_autoExam ? '自动交卷'
+                 : '审核提交 —— 只暂存草稿，不替你交卷（自己到学习通核对后交）');
   if (!confirm(`即将开始：视频 ${nv} 门 · 测验 ${nq} 门 · 作业 ${nw} 门\\n\\n`
                + names + more + detail + '\\n\\n确认无误？')) return;
   const idx = picked.map(x => x.i);
@@ -5080,6 +5716,9 @@ $('btnStart').onclick = async () => {
         // 否则 build_tiku 的 SUBMIT 只能沿用**登录时**缓存的旧值，
         // 用户在主界面改开关完全不起作用（"改了没用"）。
         auto_submit: _auto,
+        // 🔴 2026-10-12：考试提交开关随启动一起提交 —— 后端把它写进 last_params，
+        //    刷新/重启后由 fillParams 恢复；考试侧链路不读 `auto_submit`。
+        exam_auto_submit: _autoExam,
         cover_rate: _thr,
         video: picked.filter(x => x.video).map(x => x.i),
         quiz: picked.filter(x => x.quiz).map(x => x.i),
@@ -5099,6 +5738,9 @@ $('btnStart').onclick = async () => {
         work_items: workItems,
         exam_items: examItems})}).then(r => r.json());
     if (!r.ok) { $('msg2').textContent = r.msg || '启动失败'; return; }
+    // 🔴 2026-10-13：后端已直接开考（只勾考试）⇒ 清掉待接续清单，
+    //    否则 `maybeRunExam` 会在考试跑完后**再开一次**（浪费作答机会）。
+    if (r.exam_launched) { pendingExam = null; pendingExamAsked = true; }
     showStep(3);
     got = -1; $('log').textContent = '';
     startPull();
@@ -5118,6 +5760,92 @@ function startPull() {
 $('btnBack').onclick = () => {
   clearInterval(timer); timer = null;
   showStep(2);
+};
+
+// ===== 运行中「添加课程」（2026-10-01）=====
+// 用户原话：「这个界面只有一个返回选课，如果我想添加课程接在上面的，
+//   只能返回选课重新选…直接在这里加个添加的。」
+// 流程：拉「全部课程 + 当前任务清单」→ 勾选 → POST /api/append_courses
+//      后端先暂停当前任务，再用「原清单 ∪ 新课」重建（已上报进度不回滚）。
+function addRender() {
+  const q = ($('addFilter').value || '').trim().toLowerCase();
+  const rows = addCourses.filter(c =>
+    !q || String(c.title || '').toLowerCase().includes(q)
+    || String(c.courseId).includes(q));
+  $('addCount').textContent = '共 ' + rows.length + ' 门';
+  if (!rows.length) {
+    $('addList').innerHTML = '<div class="hwtip">没有匹配的课程</div>';
+    return;
+  }
+  $('addList').innerHTML = rows.map(c => {
+    const id = String(c.courseId);
+    const on = addCur.has(id);
+    return '<label class="hwi">'
+      + '<input type="checkbox" class="ck-add" data-id="' + id + '"'
+      + (on ? ' checked' : '') + '>'
+      + '<span class="nm">' + escapeHtml(c.title || '')
+      + ' <span class="n">' + escapeHtml(id) + '</span></span>'
+      + (on ? '<span class="st done">已在刷</span>'
+            : '<span class="st todo">可添加</span>')
+      + '</label>';
+  }).join('');
+}
+
+$('btnAddCourse').onclick = async () => {
+  $('addModal').classList.remove('hide');
+  $('addMsg').textContent = '';
+  $('addFilter').value = '';
+  $('addList').innerHTML = '<div class="hwtip">正在读取课程列表…</div>';
+  try {
+    const [rc, rp] = await Promise.all([
+      fetch(BASE + '/api/courses').then(r => r.json()),
+      fetch(BASE + '/api/current_pick').then(r => r.json()),
+    ]);
+    if (!rc.ok) {
+      $('addList').innerHTML =
+        '<div class="hwtip">' + escapeHtml(rc.msg || '读取课程失败') + '</div>';
+      return;
+    }
+    addCourses = rc.courses || [];
+    addCur = new Set(((rp || {}).course_ids || []).map(String));
+    addRender();
+  } catch (e) {
+    $('addList').innerHTML = '<div class="hwtip">读取失败：'
+      + escapeHtml(String(e)) + '</div>';
+  }
+};
+$('addClose').onclick = () => $('addModal').classList.add('hide');
+$('addModal').onclick = ev => {
+  if (ev.target === $('addModal')) $('addModal').classList.add('hide');
+};
+$('addFilter').oninput = addRender;
+$('addNone').onclick = () => {
+  $('addList').querySelectorAll('input.ck-add').forEach(x => { x.checked = false; });
+};
+
+$('addRun').onclick = async () => {
+  const ids = Array.from($('addList').querySelectorAll('input.ck-add'))
+    .filter(x => x.checked).map(x => x.dataset.id);
+  const fresh = ids.filter(id => !addCur.has(id));
+  if (!fresh.length) { $('addMsg').textContent = '没有新勾的课程'; return; }
+  const b = $('addRun');
+  if (b.disabled) return;
+  b.disabled = true;
+  $('addMsg').textContent = '正在加入…任务会暂停几秒再继续';
+  try {
+    const r = await fetch(BASE + '/api/append_courses', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ course_ids: fresh }) }).then(x => x.json());
+    if (!r.ok) { $('addMsg').textContent = r.msg || '加入失败'; return; }
+    $('addModal').classList.add('hide');
+    showStep(3);
+    got = -1; $('log').textContent = '';
+    startPull();
+  } catch (e) {
+    $('addMsg').textContent = '请求失败: ' + e;
+  } finally {
+    b.disabled = false;
+  }
 };
 
 $('btnLog').onclick = () => {
@@ -5206,10 +5934,14 @@ function renderProgress(p) {
   // 平台数据拉不到时才退回程序自报，并在下面明确标注，避免又被当成真实进度。
   const pf = p.platform || {};
   const useReal = pf.total > 0;
-  const dn = useReal ? pf.done : p.done, tt = useReal ? pf.total : p.total;
+  // 程序自报口径（平台数据还没取到）下分母可能为 0 —— 没有「共 N 个章节任务点」
+  // 那行时确实会这样，而此时 p.done 是**累计**完成数 ⇒ 会出现 "117 / 0"。
+  // 分母缺失就拿完成数当分母（显示满格），不让界面出现无意义的比例。
+  const dn = useReal ? pf.done : p.done;
+  const tt = useReal ? pf.total : (p.total || p.done);
   $('pDone').textContent = dn;
   $('pTotal').textContent = tt;
-  const pct = tt ? Math.round(dn / tt * 100) : 0;
+  const pct = tt ? Math.min(100, Math.round(dn / tt * 100)) : 0;
   $('pFill').style.width = pct + '%';
   $('pPct').textContent = pct + '%';
   const note = $('pNote');
@@ -5248,14 +5980,21 @@ function renderProgress(p) {
   $('nMiss').textContent = p.misses;
   const _rn = p.random_n || 0;
   if ($('nMissLabel')) {
+    // 卡片上那个数字是**未命中的题数**，"随机 N" 只是其中"连 AI 都没答出来、
+    // 只能蒙"的一小部分。原写法「题库未命中·随机1」会被读成"143 个随机"，
+    // 这里明确成括号补充（2026-10-08 何同学指出歧义）。
     $('nMissLabel').textContent = _rn
-      ? ('题库未命中·随机' + _rn) : '题库未命中';
+      ? ('题库未命中（其中随机 ' + _rn + '）') : '题库未命中';
   }
   $('nSub').textContent = p.submitted;
   $('nSave').textContent = p.saved;
   $('nCover').textContent = p.last_cover == null ? '-' : p.last_cover + '%';
   $('nScore').textContent = p.accuracy == null ? '-' : p.accuracy + '%';
-  $('sPass').textContent = (p.passed || p.redo) ? '通过' + p.passed + '章 · 重做' + p.redo + '轮' : '';
+  // "重做 N 轮"只在真的有重做时才显示 —— `RE_REDO` 依赖的日志格式
+  // （`章节检测有 N/M 题回答错误`）在真实日志里从未出现，恒为 0，
+  // 常驻一个 "重做 0 轮" 没有信息量还容易让人以为"该重做却没做"（2026-10-08）。
+  $('sPass').textContent = (p.passed || p.redo)
+    ? ('通过' + p.passed + '章' + (p.redo ? ' · 重做' + p.redo + '轮' : '')) : '';
   const lv = p.learned_verified || 0, lw = p.learned_wrong || 0;
   if ($('nReal')) {
     $('nReal').textContent = (lv + lw) ? Math.round(lv / (lv + lw) * 100) + '%' : '-';
@@ -5424,9 +6163,13 @@ function renderTaskResult(p) {
   let html = er.error ? '<div class="trerr">任务异常：' + esc(er.error) + '</div>' : '';
   html += items.map(r => {
     const ok = r.ok !== false;
+    // 🔴 2026-10-12：考试「只暂存未交卷」必须单独标出来 —— 它 ok=true（跑完了），
+    //    submitted=false（我们没替你交）。都显示"成功"会让用户误以为已交卷。
+    const staged = ok && r.submitted === false;
+    const cls = !ok ? 'bad' : (staged ? 'staged' : 'ok');
+    const label = !ok ? '未完成' : (staged ? '仅暂存·待交卷' : '成功');
     return '<div class="tri"><span class="trn">' + esc(r.title) + '</span>' +
-           '<span class="trs ' + (ok ? 'ok' : 'bad') + '">' +
-           (ok ? '成功' : '未完成') + '</span></div>' +
+           '<span class="trs ' + cls + '">' + label + '</span></div>' +
            (r.msg ? '<div class="trm">' + esc(r.msg) + '</div>' : '');
   }).join('');
   list.innerHTML = html;
@@ -5473,7 +6216,8 @@ async function launchPendingExam(flat) {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({
         items: flat,
-        auto_submit: $('autoSubmitMain') ? $('autoSubmitMain').checked : true,
+        // 2026-10-12：考试走**专用开关** `autoSubmitExam`，缺省 = 不提交（只暂存）。
+        auto_submit: $('autoSubmitExam') ? $('autoSubmitExam').checked : false,
       })
     }).then(r => r.json());
     if (!r.ok) { $('msg3').textContent = r.msg || '开考失败'; return; }
@@ -5526,6 +6270,27 @@ function applyRunState(p) {
   maybeRunExam(p);          // 任务结束后：接过勾选的考试继续跑（启动时已确认过）
 }
 
+/* 🔴 2026-10-13：考试独立进度条。与刷课大进度条**互不干扰** ——
+   刷题由 renderProgress 画，考试由本函数画，各写各的 DOM。
+   rr = /api/exam/status 的 result。 */
+function renderExamProgress(rr) {
+  const box = $('examProgBox');
+  if (!box) return;
+  const d = Number((rr || {}).done || 0);
+  const t = Number((rr || {}).total || 0);
+  if (!d && !t) { box.classList.add('hide'); return; }   // 没考试在跑就收起来
+  box.classList.remove('hide');
+  $('examProgNum').textContent = d + ' / ' + (t || '?');
+  const pct = t ? Math.min(100, Math.round(d / t * 100)) : 0;
+  $('examProgFill').style.width = pct + '%';
+  $('examProgPct').textContent = t ? pct + '%' : '…';
+  $('examProgTitle').textContent =
+    '考试作答' + ((rr || {}).title ? ' · ' + rr.title : '');
+  $('examProgNote').textContent = t
+    ? '考试默认只暂存草稿，不替你交卷（需自己去学习通核对后交）'
+    : '正在读取总题数…';
+}
+
 async function pull() {
   if (pulling) return;
   pulling = true;
@@ -5539,6 +6304,17 @@ async function pull() {
     }
     renderProgress(r.progress);
     applyRunState(r.progress);
+    // 🔴 2026-10-13：当前任务是考试时，画**独立考试进度条**；
+    //   切回刷课则收起考试条。**完全不碰刷课大进度条**（两条并存不冲突）。
+    try {
+      const _isExam = (r.progress || {}).task_name === '考试作答';
+      if (_isExam) {
+        const es = await fetch(BASE + '/api/exam/status').then(x => x.json());
+        renderExamProgress(es.result || {});
+      } else {
+        renderExamProgress(null);
+      }
+    } catch (e) { /* 进度显示失败不该影响任务 */ }
     // 任务结束就停掉轮询省资源，但要把 timer 置空 —— applyRunState 靠
     // `!timer` 判断要不要重新拉起（暂停后继续刷课的场景）
     if (!r.running && !r.paused && !(r.progress || {}).resuming) {
@@ -5636,6 +6412,36 @@ def api_courses():
     return jsonify(ok=True, courses=_view_course_dicts())
 
 
+@app.post("/api/courses/refresh")
+def api_courses_refresh():
+    """重新拉取课程列表 —— 平台新发的课不必再「切换账号」重登才能看到。
+
+    2026-09-30 用户要求（原话）：
+      「进入这种刷完了、但是又有新的课程出现的课程，进去之后无法刷新课程。
+        就比如他刚发的课程，我今天刚发了一个劳动教育，然后我进去之后
+        怎么也刷不出来，只能切换账号重新登录才能刷出来。
+        应该要在这个界面插上一个课程刷新的按钮，而不是上面的那个重新扫描，
+        是扫描作业和考试的。」
+
+    为什么原先刷不出：`state["courses"]` 只在**登录时**填一次
+    （`/api/login` → `_do_login`），之后所有视图都读这份缓存，
+    平台侧新增的课程不会自动出现。
+
+    ⚠️ 与 `/api/tasks/scan`（重新扫描）区分：那个扫的是**作业和考试**，
+    只在课程列表为空时才顺带拉一次课程；本接口专职刷课程。
+    """
+    if not state["logged_in"]:
+        return jsonify(ok=False, msg="请先登录")
+    try:
+        courses = state["chaoxing"].get_course_list()
+    except Exception as e:                                     # noqa: BLE001
+        return jsonify(ok=False, msg=f"读取课程失败：{e}")
+    if not courses:
+        return jsonify(ok=False, msg="平台没返回课程（可能是登录已过期，试试重新登录）")
+    state["courses"] = courses
+    return jsonify(ok=True, courses=_view_course_dicts())
+
+
 @app.post("/api/login")
 def api_login():
     data = request.get_json(force=True) or {}
@@ -5674,12 +6480,31 @@ def _do_login(data):
 
     try:
         tiku = build_tiku(tiku_type, data)
+        # 🔴 2026-11-07：DummyTiku = 一个题库都没配上 ⇒ 答题全走随机/AI，
+        #   而且是**静默**的（日志只写「随机兜底」，看不出根因）。
+        #   实测代价：免疫学作业1 一次重做 201 题里 165 题全错。
+        #   这里明确告警，别再让"没配题库"看起来像"程序答错了"。
+        if type(tiku).__name__ == "DummyTiku" or getattr(tiku, "DISABLE", False):
+            logger.warning("题库未配置（tiku_type=%r）→ 答题将退化为随机/纯 AI",
+                           tiku_type)
+            state["tiku_warn"] = "未配置题库，答题会退化为随机或纯 AI"
+        else:
+            state["tiku_warn"] = ""
+        # 🔴 2026-10-12：考试题目落盘目录（题干+完整选项+程序答案）。
+        #   考试正确率此前无法核算（日志只有字母、没有选项全文），而要拿
+        #   选项只能"再进一次考场"——反复 start 未交卷会被平台限制。
+        #   ⇒ 趁本场在考场内落盘，是零额外风险的取数时机。
+        #   空值 = 不落盘，行为与从前完全一致。
+        _dump_dir = str(data.get("exam_dump_dir") or "").strip()
+        _extra = {"query_delay": 1.0, "work_max_retries": 3}
+        if _dump_dir:
+            _extra["exam_dump_dir"] = _dump_dir
         if username and password:
             cx = Chaoxing(account=Account(username, password), tiku=tiku,
-                          query_delay=1.0, work_max_retries=3)
+                          **_extra)
             res = cx.login()
         else:
-            cx = Chaoxing(tiku=tiku, query_delay=1.0, work_max_retries=3)
+            cx = Chaoxing(tiku=tiku, **_extra)
             res = cx.login(login_with_cookies=True)
             if res["status"]:
                 res["msg"] = "cookies 登录成功"
@@ -5751,6 +6576,22 @@ def _sanitize_work_items(items):
         if clean:
             out[cid] = clean
     return out
+
+
+def _ui_default_jobs() -> int:
+    """启动参数 `jobs` 的兜底值：回读登录时保存的 `last_params.jobs`。
+
+    🔴 2026-10-01 修 bug：`data` 里没带 jobs 时（自动恢复 / start_last /
+    作业启动等路径都会走到），旧代码硬编码 `or 1` —— 于是界面上设好的
+    "并发章节数 2" 在这些路径上**悄悄退化成 1**（实测 8 个实例里 6 个
+    `worker_num=1`，而 ui_config 里写的是 2）。更糟的是这个 1 会被写回
+    `resume.config` / `last_pick`，从此**永久固定**，怎么改配置都不生效。
+    """
+    try:
+        v = (load_ui_config().get("last_params") or {}).get("jobs")
+        return max(1, int(v))
+    except Exception:
+        return 1
 
 
 def _do_start(indices, data):
@@ -5838,8 +6679,45 @@ def _do_start(indices, data):
     if not picked:
         return False, "未选中任何课程"
 
+    # 🔴🔴 2026-10-13 修（何同学实测反馈，"我压根无法自己启动考试"）：
+    #   **只勾了考试** ⇒ 直接开考，不进刷课链路。
+    #
+    #   症状：勾「☐视频 ☐章节测验 ☐作业 ☑考试」后点开始，界面一直显示
+    #         「视频节点」/「已完成」，考试迟迟不启动（实测 acc4 连续 3 分钟
+    #         每 30s 读一次章节列表，考试相关日志一条都没有）。
+    #   原因：考试按设计是「刷课/作业**跑完后**接着开考」，前端
+    #         `maybeRunExam` 要等 `running=false` 才接续；而只勾考试时
+    #         `walk_course_ids` 与 `only_kinds` 都为空 ⇒ 刷课链路空转数分钟
+    #         ⇒ 考试被无限排在后面，用户看到的却是"在刷视频"。
+    #   修法：没有任何刷课/作业内容时，直接 `_launch_exam_only`。
+    #   （勾了刷课/作业时保持原逻辑：先刷后考，不变。）
+    if exam_items and not (video_ids or quiz_ids or work_ids):
+        _flat = []
+        for _cid, _arr in exam_items.items():
+            for _it in _arr or []:
+                _flat.append({
+                    "courseid": str(_cid),
+                    "clazzid": _it.get("clazzid") or "",
+                    "cpi": _it.get("cpi") or "",
+                    "exam_id": str(_it.get("taskrefid") or ""),
+                    "title": _it.get("name") or "考试",
+                    "enc_task": _it.get("enc_task") or "",
+                })
+        _flat = [x for x in _flat if x["exam_id"]]
+        if not _flat:
+            return False, "没有有效的考试条目"
+        try:
+            _launch_exam_only(
+                _flat, auto_submit=bool(data.get("exam_auto_submit")))
+        except Exception as _e:                                  # noqa: BLE001
+            return False, f"启动考试失败：{type(_e).__name__}: {_e}"
+        # 标记给 api_start 回传前端：让它清掉 pendingExam，避免跑完后再开一次
+        state["exam_launched_by_start"] = True
+        return True, f"已直接开考 {len(_flat)} 场（本次未勾视频/测验/作业）"
+
     cfg = {"speed": min(2.0, max(1.0, float(data.get("speed") or 1.0))),
-           "jobs": max(1, int(data.get("jobs") or 1)),
+           # jobs 缺失时回读 ui_config（见 _ui_default_jobs 的说明），别再硬兜 1
+           "jobs": max(1, int(data.get("jobs") or _ui_default_jobs())),
            "notopen_action": "retry", "retry_interval": 1.0}
     # 🔴 2026-09-26 新增：主界面「提交方式」必须能覆盖登录时缓存的配置。
     # 背景：`build_tiku` 的 SUBMIT / COVER_RATE 来自**登录那一刻**保存的
@@ -5877,6 +6755,17 @@ def _do_start(indices, data):
         cfg["work_items"] = work_items
     if exam_items:
         cfg["exam_items"] = exam_items
+    # 🔴 2026-10-27（何同学要求）：把"勾了考试的课程"交底给 `_work`。
+    #   课程考试要**刷完课才解锁** —— 点「开始」那一刻扫到的是未解锁状态，
+    #   拿到的 enc_task 也会失效，所以那份 exam_items 开不了考。
+    #   ⇒ 先记下"哪几门课要考"，刷课结束后按课重扫、拿新签名再开考。
+    #   注意：用 exam_course_ids（前端按勾选给）而不是 exam_items.keys()，
+    #   因为考试未解锁时 exam_items 可能就是空的。
+    _exam_cids = {str(x) for x in (data.get("exam_course_ids") or [])}
+    _exam_cids |= set(exam_items.keys())
+    if _exam_cids:
+        cfg["exam_course_ids"] = sorted(_exam_cids)
+        cfg["exam_auto_submit"] = bool(data.get("exam_auto_submit", False))
     _launch(picked, cfg)
     return True, ""
 
@@ -5999,7 +6888,41 @@ def api_logout():
     state["chaoxing"] = None
     state["courses"] = []
     state["logged_in"] = False
+    # 🔴 2026-10-01：原先漏了这两个 —— 登出后 `account_name` 残留，
+    #    网关上该实例仍显示上一个账号的姓名（看着像"已登录"）。
+    state["account_name"] = ""
+    state["account_user"] = ""
     return jsonify(ok=True)
+
+
+@app.post("/api/clear_account")
+def api_clear_account():
+    """🔴 2026-10-01 新增（何同学要求）：**彻底清空该实例的账号信息**。
+
+    与 /api/logout 的区别：logout 只清内存里的登录态，磁盘上 ui_config.json 里的
+    档案（profiles / last_params / last_pick / resume）都还在，下次打开页面会回填。
+    本接口把磁盘上这些账号痕迹一并抹掉，让实例回到"全新未配置"状态。
+    """
+    if state["running"]:
+        return jsonify(ok=False, msg="任务正在运行，请先停止再清空")
+    # 内存
+    state["chaoxing"] = None
+    state["courses"] = []
+    state["logged_in"] = False
+    state["account_name"] = ""
+    state["account_user"] = ""
+    state["last_courses"] = []
+    state["last_config"] = {}
+    state["resume"] = None
+    # 磁盘：只删账号相关键，保留题库/AI 等公共配置
+    try:
+        cfg = load_ui_config()
+        for k in ("profiles", "last_params", "last_pick", "resume"):
+            cfg.pop(k, None)
+        _dump(cfg)
+    except Exception as e:
+        return jsonify(ok=False, msg=f"清理配置失败：{e}")
+    return jsonify(ok=True, msg="已清空该实例的账号信息")
 
 
 @app.post("/api/test-ai")
@@ -6947,10 +7870,76 @@ def api_teacher_work_list():
         return jsonify(ok=False, msg=f"{type(e).__name__}: {e}")
 
 
-def _launch_exam_only(items, auto_submit=True):
+def _maybe_run_exams_after_work(courses, config):
+    """刷课/作业跑完后：重扫本次课程的考试，把**新解锁**的「待做」考试接着做。
+
+    为什么需要（2026-10-27 何同学实测）：**课程考试要「刷完课」才解锁**。
+    点「开始」那一刻扫描到的是未解锁状态，`enc_task` 也随之失效 ——
+    前端 pendingExam 里那份清单根本开不了考（表现为：刷完就结束，没有考试）。
+
+    安全边界（考试机会不可逆，必须收窄）：
+      · 只处理 `exam_course_ids` 里的课：用户没勾考试的课**绝不**擅自开考
+      · 只挑 `status == "待做"`，未解锁/已完成/已过期一律跳过
+      · `auto_submit` 沿用本次启动传入的值（默认 False = 只暂存不交卷）
+
+    返回 True = 已把控制权交给考试线程，调用方的 finally **不要再改 running**。
+    """
+    want = {str(x) for x in (config.get("exam_course_ids") or [])}
+    if not want:
+        return False
+    cx = state.get("chaoxing")
+    if cx is None:
+        return False
+    targets = [c for c in (courses or []) if _course_id(c) in want]
+    if not targets:
+        return False
+    try:
+        print(f"\n[考试] 刷课结束，重扫 {len(targets)} 门课的考试"
+              f"（课程考试要刷完才解锁）…")
+        res = cx.scan_exams_all(targets)
+    except Exception as e:                                       # noqa: BLE001
+        print(f"[考试] 重扫失败（不影响刷课成果）：{type(e).__name__}: {e}")
+        return False
+
+    items = []
+    for c in (res or {}).get("courses") or []:
+        cid = str(c.get("courseid") or c.get("courseId") or "")
+        if cid not in want:
+            continue
+        for e in (c.get("exams") or []):
+            if str(e.get("status") or "") != "待做":
+                continue
+            items.append({
+                "courseid": cid,
+                "clazzid": str(c.get("clazzid") or c.get("clazzId") or ""),
+                "cpi": str(c.get("cpi") or ""),
+                "exam_id": str(e.get("exam_id") or ""),
+                "title": e.get("title") or "考试",
+                "enc_task": e.get("exam_enc") or e.get("enc_task") or "",
+            })
+    items = [x for x in items if x["exam_id"]]
+    if not items:
+        print("[考试] 重扫后仍没有「待做」的考试 —— 可能还未解锁，"
+              "或该课考试已完成/已过期。")
+        return False
+
+    print(f"[考试] 发现 {len(items)} 场待做考试，接着开考："
+          + "、".join((x["title"] or "")[:18] for x in items))
+    try:
+        _launch_exam_only(items,
+                          auto_submit=bool(config.get("exam_auto_submit")))
+    except Exception as e:                                       # noqa: BLE001
+        print(f"[考试] 开考失败：{type(e).__name__}: {e}")
+        return False
+    return True
+
+
+def _launch_exam_only(items, auto_submit=False):
     """启动一个"只做指定考试"的任务（走 Chaoxing.process_exams）。
 
     每个 item：{courseid, exam_id(或 taskrefid), enc_task, title}
+    ⚠️ `auto_submit` 缺省 **False**（2026-10-12 何同学要求）：
+       考试只有一次机会，默认只暂存草稿、不替用户交卷。
     """
     groups: dict = {}
     for it in items:
@@ -7011,6 +8000,11 @@ def _launch_exam_only(items, auto_submit=True):
     state["task_start"] = time.time()
 
     def _worker():
+        # 🔴 2026-10-27：考试可能连跑几小时（85 题 + 滑块），**必须自己持有防睡眠**。
+        #   起因：这条链路是由 `_work` 结束后转交过来的，而 `_work` 的 finally
+        #   会 `_prevent_sleep(False)`（那是**线程级**请求）⇒ 若不在这里重新持有，
+        #   刷课一结束防睡眠就失效，考试跑到一半系统休眠 → 进程被冻结。
+        _prevent_sleep(True)
         try:
             cx = state.get("chaoxing")
             if cx is None:
@@ -7042,6 +8036,7 @@ def _launch_exam_only(items, auto_submit=True):
             state["exam_result"] = {"done": 0, "skipped": 0,
                                     "error": f"{type(e).__name__}: {e}"}
         finally:
+            _prevent_sleep(False)
             state["running"] = False
             state["task_name"] = ""
 
@@ -7057,12 +8052,91 @@ def _launch_exam_only(items, auto_submit=True):
     return t
 
 
+@app.post("/api/exam/retest")
+def api_exam_retest():
+    """把指定考试设为「重考」（等价在页面上点那个「重考」按钮）。
+
+    入参：{courseid, exam_id, relation_id, paper_id?, clazzid?}
+    ⚠️ 每次重考都会**覆盖上一次作答**，前端必须确认。
+    """
+    if not state["logged_in"]:
+        return jsonify(ok=False, msg="请先登录")
+    data = request.get_json(force=True) or {}
+    cid = str(data.get("courseid") or "")
+    course = next((c for c in (state["courses"] or [])
+                   if _course_id(c) == cid), None)
+    if course is None:
+        return jsonify(ok=False, msg=f"找不到课程 {cid}（请刷新课程列表）")
+    try:
+        from api.exam import set_retest
+        res = set_retest(state["chaoxing"].get_session(), course, data)
+    except Exception as e:                                       # noqa: BLE001
+        return jsonify(ok=False, msg=f"{type(e).__name__}: {e}")
+    logger.info("[重考] 课程 %s 考试 %s → %s", cid,
+                data.get("exam_id"), res.get("msg"))
+    return jsonify(**res)
+
+
+@app.post("/api/exam/answers")
+def api_exam_answers():
+    """提取「试卷详情」里的正确答案，写入学习库（供后续重考全对）。
+
+    ⚠️ 安全边界：**只有平台允许查看答案时才有内容**。拿不到就明确失败，
+       绝不做反推/猜测 —— 这也是何同学 2026-11-07 的要求。
+
+    入参：{courseid, exam_id, relation_id, paper_id?, write: true}
+    返回：{ok, question_count, with_answer, imported, msg}
+    """
+    if not state["logged_in"]:
+        return jsonify(ok=False, msg="请先登录")
+    data = request.get_json(force=True) or {}
+    cid = str(data.get("courseid") or "")
+    course = next((c for c in (state["courses"] or [])
+                   if _course_id(c) == cid), None)
+    if course is None:
+        return jsonify(ok=False, msg=f"找不到课程 {cid}")
+    try:
+        from api.exam import fetch_exam_answer_page, parse_answer_page
+        res = fetch_exam_answer_page(state["chaoxing"].get_session(),
+                                     course, data)
+    except Exception as e:                                       # noqa: BLE001
+        return jsonify(ok=False, msg=f"{type(e).__name__}: {e}")
+    if not res.get("ok"):
+        # 明确告诉用户"这门考试看不了答案"，而不是给个空结果
+        return jsonify(ok=False, msg=res.get("msg") or "无法获取答案页",
+                       question_count=0)
+
+    items = parse_answer_page(res["html"])
+    with_ans = [x for x in items if (x.get("right") or "").strip()]
+    imported = 0
+    if data.get("write", True) and with_ans:
+        try:
+            from api.learned import LearnedAnswers
+            la = LearnedAnswers()
+            for x in with_ans:
+                # 写学习库：mark="dui" ⇒ 同时写 verified（后续 query 直接命中）
+                opts_str = "\n".join(o.get("text") or ""
+                                     for o in (x.get("options") or []))
+                la.record(x["title"], x["right"], "dui", options=opts_str)
+            imported = len(with_ans)
+        except Exception as e:                                   # noqa: BLE001
+            logger.warning("[答案提取] 写入学习库失败：%s", e)
+    logger.info("[答案提取] %s 共 %d 题，有答案 %d，已入库 %d",
+                data.get("exam_id"), len(items), len(with_ans), imported)
+    return jsonify(ok=True, question_count=len(items),
+                   with_answer=len(with_ans), imported=imported,
+                   msg=f"提取 {len(items)} 题，其中 {len(with_ans)} 有答案")
+
+
 @app.post("/api/exam/run")
 def api_exam_run():
     """按用户勾选的考试清单逐场执行。
 
-    🔴 **每场都是真金白银的一次作答机会**，前端必须逐场 confirm，
-    且默认「自动交卷」（用户明确要求）；取消勾选则只暂存不交卷。
+    🔴 **每场都是真金白银的一次作答机会**，前端必须逐场 confirm。
+
+    ⚠️ `auto_submit` **缺省 False**（2026-10-12 何同学要求）：默认「只暂存草稿、
+    不替用户交卷」，要自动交卷必须前端显式传 `auto_submit: true`
+    （对应主界面「自动提交考试」开关）。
     """
     if not state["logged_in"]:
         return jsonify(ok=False, msg="请先登录")
@@ -7072,7 +8146,8 @@ def api_exam_run():
     items = data.get("items") or []
     if not items:
         return jsonify(ok=False, msg="请至少勾选一场考试")
-    auto_submit = bool(data.get("auto_submit", True))
+    # 🔴 2026-10-12：缺省 **False** = 只暂存不交卷（考试只有一次机会，默认不冒险）。
+    auto_submit = bool(data.get("auto_submit", False))
     try:
         _launch_exam_only(items, auto_submit=auto_submit)
     except Exception as e:
@@ -7082,15 +8157,95 @@ def api_exam_run():
 
 @app.get("/api/exam/status")
 def api_exam_status():
-    """考试任务进度（前端轮询）。"""
+    """考试任务进度（前端轮询）。
+
+    🔴 2026-10-13：考试**进行中**也必须能读到"已答 N 题"。
+    原实现只有任务结束才填 `done`，进行中恒为 0 ⇒ 界面看不出考试在不在跑
+    （何同学实测：只能看到刷课的 `56/56 100%`）。
+    """
+    r = dict(state.get("exam_result") or {})
+    try:
+        from api import exam as _em
+        p = _em.get_exam_progress()
+        _d = int(p.get("done") or 0)
+        if _d > int(r.get("done") or 0):
+            r["done"] = _d
+        if _d:
+            r["total"] = int(p.get("total") or 0)
+            r["title"] = r.get("title") or p.get("title") or ""
+    except Exception:                                            # noqa: BLE001
+        pass
     return jsonify(running=bool(state.get("running")),
                    task_name=state.get("task_name") or "",
-                   result=state.get("exam_result") or {})
+                   result=r)
+
+
+@app.post("/api/exam/precheck")
+def api_exam_precheck():
+    """**只读**预检：开考前看清这场考试的要求。**不消耗作答机会**。
+
+    入参：{courseid, exam_id, enc_task?, clazzid?, cpi?, title?, userid?}
+
+    🔴 与 `/api/exam/sheet` 的区别（重要）：
+       那个接口为了读答题卡会调 `start_exam` —— **等于真进考场**；
+       本接口只 GET 封面页，**绝不开考**，可以放心反复调用。
+    """
+    if not state["logged_in"]:
+        return jsonify(ok=False, msg="请先登录")
+    data = request.get_json(force=True) or {}
+    cid = str(data.get("courseid") or data.get("courseId") or "")
+    eid = str(data.get("exam_id") or data.get("taskrefid") or "")
+    if not (cid and eid):
+        return jsonify(ok=False, msg="缺少 courseid / exam_id")
+    # 课程对象：优先取已登录列表，找不到就用条目自带的 clazzid/cpi 兜底
+    # （班级型课程不在 state["courses"] 里，与 `_launch_exam_only` 同一套处理）
+    courses = (state.get("courses") or [])
+    course = next((c for c in courses if str(c.get("courseId")) == cid), None)
+    if not course:
+        clz = str(data.get("clazzid") or data.get("clazzId") or "")
+        if not clz:
+            return jsonify(ok=False, msg="找不到该课程，且条目未提供 clazzid")
+        course = {"courseId": cid, "clazzId": clz,
+                  "cpi": str(data.get("cpi") or ""),
+                  "title": str(data.get("title") or "")}
+    try:
+        from api.exam import fetch_exam_list_phone, precheck_exam
+        from api.base import SessionManager
+        sess = SessionManager.get_session()
+        uid = str(data.get("userid") or "")
+        try:
+            uid = uid or str(state["chaoxing"].get_uid() or "")
+        except Exception:                                            # noqa: BLE001
+            pass
+        enc_task = str(data.get("enc_task") or "")
+        if not enc_task:
+            for it in fetch_exam_list_phone(sess, course, uid):
+                if str(it.get("exam_id")) == eid:
+                    enc_task = it.get("enc_task") or ""
+                    break
+        if not enc_task:
+            return jsonify(ok=False,
+                           msg="拿不到 enc_task（该考试当前不可进入）")
+        info = precheck_exam(sess, course, eid, enc_task, uid)
+        info["ok"] = True
+        logger.info(f"[考试预检] 《{info.get('title') or data.get('title') or eid}》"
+                    f"state={info.get('state')} can_enter={info.get('can_enter')} "
+                    f"face={info.get('face_need')} captcha={info.get('captcha_need')} "
+                    f"code={info.get('exam_code_need')}")
+        return jsonify(info)
+    except Exception as e:                                           # noqa: BLE001
+        return jsonify(ok=False, msg=f"预检失败：{type(e).__name__}: {e}")
 
 
 @app.post("/api/exam/sheet")
 def api_exam_sheet():
-    """**只读**诊断：读某场考试的答题卡状态（不消耗作答机会、不提交）。
+    """读某场考试的答题卡状态。
+
+    🔴🔴 **会真进考场**（内部调 `start_exam` 拿 enc），**可能消耗/占用作答机会**。
+       2026-10-12 修正旧 docstring —— 它此前写"不消耗作答机会"，是**错的**，
+       照它调用很可能白白用掉一次机会。
+       ⇒ 现在的调用顺序是：想先看清要求请用 `/api/exam/precheck`（纯只读）；
+         本接口只在**确认过要作答**之后才用。
 
     入参：{"courseid":"…","exam_id":"…","enc_task":"…"}
     """
@@ -7099,6 +8254,11 @@ def api_exam_sheet():
     data = request.get_json(force=True) or {}
     cid = str(data.get("courseid") or "")
     eid = str(data.get("exam_id") or data.get("taskrefid") or "")
+    # 🔴 2026-10-12：防止误调 —— 必须显式 confirm，否则直接拒绝。
+    if not data.get("confirm"):
+        return jsonify(ok=False, msg="本接口会真进考场（可能消耗作答机会）；"
+                                     "请改用 /api/exam/precheck 预检，"
+                                     "或显式传 confirm=true 表示确认要作答。")
     if not (cid and eid):
         return jsonify(ok=False, msg="缺少 courseid / exam_id")
     courses = state["courses"] or []
@@ -7111,6 +8271,7 @@ def api_exam_sheet():
         from api.base import SessionManager
         sess = SessionManager.get_session()
         uid = str(data.get("userid") or "")
+        logger.warning(f"[考试] ⚠ 调用 /api/exam/sheet（会进考场）exam_id={eid}")
         # 补 enc_task
         enc_task = data.get("enc_task") or ""
         if not enc_task:
@@ -7192,7 +8353,7 @@ def _launch_homework_only(items):
     if not courses:
         raise ValueError("选中的课程不在课程列表里")
 
-    cfg = {"speed": 1.0, "jobs": 1, "notopen_action": "retry",
+    cfg = {"speed": 1.0, "jobs": _ui_default_jobs(), "notopen_action": "retry",
            "retry_interval": 1.0,
            "video_course_ids": [], "quiz_course_ids": [],
            "walk_course_ids": [], "only_kinds": [],
@@ -7204,7 +8365,18 @@ def _launch_homework_only(items):
 @app.post("/api/start")
 def api_start():
     data = request.get_json(force=True) or {}
+    # 🔴 2026-10-12：考试提交开关的落盘点。
+    #    它只存在于主界面（登录表单里没有），`/api/login` 的 save_last_params
+    #    存不到它 ⇒ 刷新页面就回落成默认。这里随每次「开始」写进 last_params，
+    #    与作业侧 `auto_submit` 的持久化语义一致。
+    if "exam_auto_submit" in data:
+        save_last_params({"exam_auto_submit": bool(data.get("exam_auto_submit"))})
     ok, msg = _do_start(data.get("indices") or [], data)
+    # 🔴 2026-10-13：`_do_start` 可能已**直接开考**（只勾考试的情形）。
+    #    标记回传前端，让它清掉 pendingExam —— 否则考试跑完后
+    #    `maybeRunExam` 会再开一次（同一场考试被开考两次 = 浪费机会）。
+    if state.pop("exam_launched_by_start", False):
+        return jsonify(ok=True, msg=msg, exam_launched=True)
     if not ok and state["running"]:
         # 任务已经在跑（典型：看门狗自动恢复抢先启动，用户又点了开始）。
         # 对用户而言目标状态已经达成，必须返回 ok=True 让前端切进进度页；
@@ -7347,6 +8519,83 @@ def _run_homeworks(courses, work_ids, work_items=None):
         print("   （答案覆盖率不足或平台拒绝提交时，程序不会硬交，避免整份 0 分）")
 
 
+_AUDIT_MAX_ROUNDS = 2   # 收尾复核后最多补刷的轮次（防死循环的硬上限）
+
+
+def _chapter_flat_points(points):
+    """把 `get_course_point` 的返回展平成节点列表（含子节点，滤掉无标题项）。"""
+    flat, stack = [], list((points or {}).get("points") or [])
+    while stack:
+        it = stack.pop(0)
+        flat.append(it)
+        stack.extend(it.get("points") or [])
+    return [x for x in flat if (x.get("title") or "").strip()]
+
+
+def _audit_and_resume(courses, config, walk_ids, state):
+    """🔴 2026-10-03（何同学要求）：任务收尾**轻量复核** + 按需继续。
+
+    为什么需要：`JobProcessor.run()` 返回只代表"任务队列跑完了"，
+    **不等于平台侧真的刷完** —— 实测 acc2 安全人机有 15 个节点在平台仍是黄点
+    （根因见 HANDOFF §16：平台侧完成记录丢失 + 程序跳过 isPassed=true 的卡）。
+
+    轻量设计（对应"不要太过繁重、影响其他"）：
+      · 每轮只发 **课程数** 次请求（`get_course_point`，与任务开始时同量级）
+      · 只为**未完成的节点**重建任务，不重扫整门课
+      · 最多补刷 `_AUDIT_MAX_ROUNDS` 轮；**一旦无进展立即停** ——
+        平台侧计数矛盾导致的"怎么刷都不动"会被这条挡住，不会死循环
+      · 不做浏览器渲染、不并发、不新开线程、不写额外状态
+      · 整个过程包在调用方的 try 里，异常不影响主流程
+    """
+    chaoxing = state.get("chaoxing")
+    if not chaoxing:
+        return
+    prev = None
+    for rnd in range(1, _AUDIT_MAX_ROUNDS + 1):
+        bad = []          # [(course, [未完成节点])]
+        for c in courses:
+            cid = _course_id(c)
+            if walk_ids is not None and cid not in walk_ids:
+                continue
+            try:
+                pts = _chapter_flat_points(chaoxing.get_course_point(
+                    c.get("courseId"), c.get("clazzId"), c.get("cpi")))
+            except Exception as e:                                 # noqa: BLE001
+                print(f"  [复核] 《{c.get('title', '')}》章节读取失败（跳过）: "
+                      f"{type(e).__name__}")
+                continue
+            rest = [p for p in pts if not p.get("has_finished")]
+            if rest:
+                bad.append((c, rest))
+
+        total = sum(len(r) for _, r in bad)
+        if total == 0:
+            print("[复核] ✅ 平台侧已无未完成节点")
+            return
+        print(f"[复核] 平台仍有 {total} 个未完成节点，涉及 {len(bad)} 门课")
+        for c, r in bad:
+            print(f"        《{c.get('title', '')}》 {len(r)} 个")
+        if prev is not None and total >= prev:
+            print(f"[复核] 与上一轮（{prev} 个）相比**无进展** → 停止补刷"
+                  f"（平台侧计数问题，程序侧已无手段）")
+            return
+        prev = total
+
+        tasks = [ChapterTask(point=p, index=i, course=c)
+                 for c, r in bad for i, p in enumerate(r)]
+        if not tasks:
+            return
+        print(f"[复核] 第 {rnd} 轮补刷，共 {len(tasks)} 个章节任务点\n")
+        proc = JobProcessor(chaoxing, tasks, config)
+        state["job_processor"] = proc
+        try:
+            proc.run()
+        except Exception as e:                                     # noqa: BLE001
+            print(f"[复核] 补刷异常: {type(e).__name__}: {e}")
+            return
+        print(f"[复核] 第 {rnd} 轮补刷结束")
+
+
 def _work(courses, config):
     # 🔴 2026-09-28：防睡眠请求**必须在这个长期线程里持有**，不能放 _launch()。
     # SetThreadExecutionState 的请求是线程级的，Flask 请求线程处理完 /api/start
@@ -7432,6 +8681,15 @@ def _work(courses, config):
             state["job_processor"] = proc   # 暂停时据此中断所有 worker 线程
             proc.run()
             print("\n刷课任务执行结束")
+            # 🔴 2026-10-03（何同学要求）：任务结束 ≠ 平台侧真的刷完。
+            #    "每次任务显示已经结束之后进行一次审查，从平台处核实是否全部刷完了；
+            #     如果有没刷完的，再重新继续。"
+            #    轻量实现见 `_audit_and_resume`：每轮仅"课程数"次请求，最多 2 轮，
+            #    无进展即停；异常一律吞掉，**绝不影响后面的作业阶段**。
+            try:
+                _audit_and_resume(courses, config, walk_ids, state)
+            except Exception as e:                                 # noqa: BLE001
+                print(f"[复核] 异常（不影响主流程）: {type(e).__name__}: {e}")
         elif not work_ids:
             # 既没有刷课任务、也没勾选作业：保持旧行为（保留恢复标记后返回）
             print("没有可执行任务。常见原因：课程已全部完成、章节尚未开放、登录状态失效。")
@@ -7452,6 +8710,10 @@ def _work(courses, config):
             print("未勾选作业，跳过作业阶段")
 
         print("\n全部任务执行结束，请到学习通核对进度。")
+        # 🔴 2026-10-27（何同学要求）：刷完课后重扫考试并接着做。
+        #   课程考试要刷完才解锁，启动时那份清单的 enc_task 已经失效。
+        if _maybe_run_exams_after_work(courses, config):
+            state["exam_handoff"] = True
         _clear_resume()   # 正常跑完：清掉待恢复标记，下次启动不再自动续刷
     except RiskControlError as e:
         # 风控熔断：必须同时关掉自动恢复，否则看门狗/重启会立刻再撞上去，
@@ -7509,7 +8771,10 @@ def _work(courses, config):
         _prevent_sleep(False)
         state["job_processor"] = None
         stop_capture()
-        state["running"] = False
+        # 🔴 2026-10-27：若控制权已交给考试线程，这里**不能**把 running 置 False。
+        #   否则前端会以为任务结束 → 看不到考试进度；考试线程自己结束时才置 False。
+        if not state.pop("exam_handoff", False):
+            state["running"] = False
 
 
 @app.get("/api/live_params")
@@ -7614,10 +8879,14 @@ def api_live_params_post():
     return jsonify(ok=True, changed=changed, need_restart=need_restart, restarted=restarted)
 
 
-@app.post("/api/pause")
-def api_pause():
+def _pause_now():
+    """向任务线程注入暂停异常。返回 (ok, msg)。
+
+    与 `/api/pause` 分离出来是给「添加课程」用：追加课程要重建任务，
+    必须先停掉当前这轮（`_do_start` 在 running 时会直接拒绝）。
+    """
     if not state["running"] or state["paused"]:
-        return jsonify(ok=False, msg="当前没有可暂停的任务")
+        return False, "当前没有可暂停的任务"
     # 项目代码里没有检查点可插，只能向线程注入异常；注入在下一个
     # Python 字节码边界生效，视频挂机循环每秒都在跑，通常秒级停下。
     #
@@ -7637,7 +8906,11 @@ def api_pause():
         if t.is_alive():
             targets.append(t)
     if not targets:
-        return jsonify(ok=False, msg="任务恰好已结束，无需暂停")
+        # 🔴 2026-10-01 修：这里原本写的是 `return jsonify(...)` —— 返回的是
+        #    Flask Response，而本函数契约是 `(ok, msg)`。调用方 `api_pause` 做
+        #    `ok, msg = _pause_now()` 解包时会抛 TypeError → 暂停接口 500，
+        #    「添加课程」和「运行参数」两条链路也会连带崩在这里。
+        return False, "任务恰好已结束，无需暂停"
 
     injected = 0
     for t in targets:
@@ -7652,26 +8925,120 @@ def api_pause():
         except Exception:
             pass
     if injected == 0:
-        return jsonify(ok=False, msg="暂停信号注入失败，请重试或直接关闭窗口")
+        return False, "暂停信号注入失败，请重试或直接关闭窗口"
     # 立即置位，避免 worker 退出与前端轮询之间出现"看着还在跑"的窗口
     state["paused"] = True
-    return jsonify(ok=True)
+    return True, ""
 
 
-@app.post("/api/resume")
-def api_resume():
+@app.post("/api/pause")
+def api_pause():
+    ok, msg = _pause_now()
+    return jsonify(ok=ok, msg=msg)
+
+
+def _resume_now():
+    """恢复暂停中的任务。返回 (ok, msg)。与 `/api/resume` 共用。"""
     if state["running"] or not state["paused"]:
-        return jsonify(ok=False, msg="没有可恢复的任务")
+        return False, "没有可恢复的任务"
     picked, config = state["last_courses"], state["last_config"]
     if not picked:
-        return jsonify(ok=False, msg="找不到上次选课记录，请返回选课页重新开始")
+        return False, "找不到上次选课记录，请返回选课页重新开始"
     state["paused"] = False
     state["running"] = True
     state["risk_abort"] = ""
     th = threading.Thread(target=_work, args=(picked, config), daemon=True)
     state["work_thread"] = th
     th.start()
-    return jsonify(ok=True)
+    return True, ""
+
+
+@app.post("/api/resume")
+def api_resume():
+    ok, msg = _resume_now()
+    return jsonify(ok=ok, msg=msg)
+
+
+# ==================== 运行中「添加课程」（2026-10-01）====================
+# 背景（用户原话）：「这个界面只有一个返回选课，如果我想添加课程接在上面的，
+#   只能返回选课重新选，它不会显示，直接在这里加个添加的。」
+# 即：进度页没有追加课的入口，退回选课页重选既麻烦、又容易漏掉原来在刷的课。
+#
+# 实现要点：TaskHandler 只在启动时读一次课程清单，所以追加**必须重建任务**
+#   → 先 `_pause_now()` 停掉当前这轮（只中断当前任务点，已上报的进度不回滚），
+#     再用「原清单 ∪ 新课」重新 `_do_start`。
+
+def _current_pick_ids():
+    """当前任务里的 courseId 集合（供「添加课程」弹窗标注"已在刷"）。"""
+    return {_course_id(c) for c in (state.get("last_courses") or [])}
+
+
+@app.get("/api/current_pick")
+def api_current_pick():
+    return jsonify(ok=True, course_ids=sorted(_current_pick_ids()),
+                   running=bool(state["running"]))
+
+
+@app.post("/api/append_courses")
+def api_append_courses():
+    """把新选的课程并进当前任务，不必退回选课页重选。
+
+    新增课程按「视频 + 章节测验」加入；作业维度只在当前任务**不是**
+    "精确清单模式"时才一并纳入（否则等于替用户决定做哪几份作业）。
+    """
+    if not state["logged_in"]:
+        return jsonify(ok=False, msg="请先登录")
+    data = request.get_json(force=True) or {}
+    add = [str(x) for x in (data.get("course_ids") or []) if str(x)]
+    if not add:
+        return jsonify(ok=False, msg="未选择任何课程")
+
+    known = {_course_id(c) for c in _view_courses()}
+    cur = _current_pick_ids()
+    if not cur:
+        return jsonify(ok=False, msg="当前没有正在跑的任务，请先回选课页开始")
+    new_ids = [i for i in add if i in known and i not in cur]
+    if not new_ids:
+        return jsonify(ok=False, msg="选中的课程都已经在刷了")
+
+    cfg = dict(state.get("last_config") or {})
+
+    def _merge(key):
+        return sorted({str(x) for x in (cfg.get(key) or [])} | set(new_ids))
+
+    payload = {"video_course_ids": _merge("video_course_ids"),
+               "quiz_course_ids": _merge("quiz_course_ids"),
+               "jobs": cfg.get("jobs") or 1,
+               "speed": cfg.get("speed") or 1.0}
+    if not (cfg.get("work_items") or {}):
+        payload["work_course_ids"] = _merge("work_course_ids")
+    # 精确清单原样保留：不带它 `_run_homeworks` 会退化成"整门课全做"，
+    # 等于把范围偷偷放大到用户没勾的作业上。
+    if cfg.get("work_items"):
+        payload["work_items"] = cfg["work_items"]
+    if cfg.get("exam_items"):
+        payload["exam_items"] = cfg["exam_items"]
+
+    was_running = bool(state["running"])
+    if was_running:
+        ok, msg = _pause_now()
+        if not ok:
+            return jsonify(ok=False, msg=msg)
+        deadline = time.time() + 30
+        while state["running"] and time.time() < deadline:
+            time.sleep(0.2)
+        if state["running"]:
+            # 暂停没落地就硬开会撞上"已有任务在运行"，先恢复原任务再报错
+            state["paused"] = False
+            return jsonify(ok=False, msg="暂停超时，请稍后重试")
+
+    ok, msg = _do_start([], payload)
+    if not ok:
+        # 追加失败不能把任务就这么停着 —— 恢复原任务
+        if was_running and state["paused"]:
+            _resume_now()
+        return jsonify(ok=False, msg=msg or "追加失败")
+    return jsonify(ok=True, added=len(new_ids), total=len(cur) + len(new_ids))
 
 
 @app.post("/api/start_last")
@@ -7698,8 +9065,28 @@ def api_start_last():
         ok, msg, _ = _do_login(data)
         if not ok:
             return jsonify(ok=False, msg=f"自动登录失败：{msg}")
-    ok, msg = _do_start([], {"video_course_ids": ids, "work_course_ids": [],
-                             "speed": lp.get("speed", 2),
+    # 🔴 2026-10-03 修 bug：这里**必须回放 `quiz_course_ids`**。
+    #    此前只回放 video_course_ids → `_do_start` 里 quiz_ids 变成 [] →
+    #    only_kinds 只剩 {"video"} → `process_job` 把所有章节测验静默跳过（还按成功计），
+    #    紧接着 `_save_last_pick` 回写又会把 last_pick 里的测验抹掉
+    #    → 之后每次错峰启动 / 续跑都只刷视频，**自我强化、永久失效**。
+    #    实测后果：2026-10-03 全部 8 个实例的 quiz_course_ids 均为空，
+    #    被回溯后重刷的章节只补了视频、测验全程没做，平台上表现为"黄点"。
+    ok, msg = _do_start([], {"video_course_ids": ids,
+                             "quiz_course_ids": lp.get("quiz_course_ids") or [],
+                             # 🔴 2026-10-03 补漏（第三方审计 P1-1）：原为硬编码 `[]`。
+                             #    与 quiz 那次事故**完全同构**：`_do_start` 里
+                             #    `work_ids` 直接取这个值，虽然后面有
+                             #    `work_ids |= set(work_items.keys())` 兜底，但
+                             #    "勾了作业课、没勾具体份"（work_items 为空）时，
+                             #    作业阶段会被静默跳过，且 `_save_last_pick`
+                             #    随即把 `work_course_ids: []` 回写固化。
+                             "work_course_ids": lp.get("work_course_ids") or [],
+                             # 🔴 2026-10-03：默认值由 2 改 1。
+                             #    `last_pick` 缺 speed 时按 2 倍速跑会触发平台回溯，
+                             #    与"全局 speed=1"策略冲突（`_do_start` 的
+                             #    `min(2.0,max(1.0,…))` 夹不掉 2，会真的生效）。
+                             "speed": lp.get("speed") or 1.0,
                              "jobs": lp.get("jobs", 1),
                              # 🔴 把"逐份作业清单"一并回放，否则错峰启动会
                              # 把精确选择放大成整门课全做
@@ -7734,11 +9121,18 @@ def api_shutdown():
 
     修复：默认只关自己；只有显式带 ?all=1（网关的"停止所有服务"/一键全停）
     才连题库一起杀。
+
+    🔴 2026-10-04 新增 `?keep_resume=1`：网关的「停止所有服务」做了优雅化
+    （先逐个 pause 再停），需要**保留续跑依据**，否则下次开机不会自动续刷。
+    不带该参数时行为与原来完全一致（清 resume）。实例页自己的「退出服务」
+    依旧不传 → 仍然是"我主动退出这一台，下次别自动跑"。
     """
     kill_tiku = str(request.args.get("all") or "").strip() in ("1", "true", "yes")
+    keep_resume = str(request.args.get("keep_resume") or "").strip() in ("1", "true", "yes")
 
     def _bye():
-        _clear_resume()   # 用户主动停止：下次启动不自动续刷
+        if not keep_resume:
+            _clear_resume()   # 用户主动停止：下次启动不自动续刷
         if kill_tiku:
             try:
                 subprocess.run(["taskkill", "/F", "/IM", "tikuAdapter.exe"],
@@ -7767,6 +9161,14 @@ def api_diag_exec():
     import os as _os
     if not path or not _os.path.isfile(path):
         return jsonify(ok=False, msg=f"脚本不存在：{path}")
+    # 🔴 2026-10-03 安全加固：原判据**只看 basename 前缀**，docstring 里声称的
+    #    "仅允许工作区下"根本没实现 → 传 `D:\任意目录\_x.py` 照样执行
+    #    （等价于任意代码执行入口）。现在要求脚本必须落在项目根内。
+    #    注意：不删除本接口 —— `_audit_all.py` / `_chk_speed.py` / `_diag_silent.py`
+    #    等运维工具全靠它在**实例进程内**读真实状态，删了整个巡检链路会失效。
+    _root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))   # 项目根
+    if not _os.path.realpath(path).startswith(_os.path.realpath(_root) + _os.sep):
+        return jsonify(ok=False, msg="只允许执行项目目录内的临时脚本")
     if not _os.path.basename(path).startswith("_"):
         return jsonify(ok=False, msg="只允许执行以下划线开头的临时脚本")
     import io as _io
@@ -7789,9 +9191,22 @@ def _port_listeners(port=None):
     """返回当前监听**本实例端口**的 PID 集合（中文系统 netstat 是 GBK 编码）。
 
     多实例支持：只认自己的端口，否则会把别的账号那份实例也杀掉。
+
+    🔴 2026-10-08 加固（何同学遇到 `NETSTAT.EXE 应用程序无法正常启动(0xc0000142)`）：
+      原实现**没有异常保护**，而本函数在 `__main__` 启动流程里被
+      `_kill_other_instances()` 调用 ⇒ netstat 一旦启动失败（DLL 初始化失败，
+      系统层面的偶发问题）就会把 OSError 抛进启动流程 ⇒ **实例直接起不来**。
+      现与 `gateway.py` 的同名实现对齐：失败即返回空集合；
+      并加 `CREATE_NO_WINDOW` 避免拉起控制台宿主。
     """
     port = port or PORT
-    raw = subprocess.run(["netstat", "-ano"], capture_output=True).stdout
+    try:
+        raw = subprocess.run(
+            ["netstat", "-ano"], capture_output=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+    except Exception as e:                                          # noqa: BLE001
+        logger.warning(f"查询端口监听进程失败（忽略，不影响刷课）: {e}")
+        return set()
     out = raw.decode("gbk", errors="ignore")
     pids = set()
     for line in out.splitlines():
@@ -7807,14 +9222,26 @@ def _kill_other_instances():
     """清掉除自己以外、占用**本实例端口**的进程，避免两个进程抢同一端口。
 
     多实例支持：只针对自己的端口，不会误杀别的账号那份实例。
+
+    🔴 2026-10-08：整段加异常保护 —— 本函数在启动流程里调用，
+    系统工具（netstat/taskkill）偶发启动失败时**不得**把实例拖垮。
     """
     killed = []
-    for pid in _port_listeners():
+    try:
+        listeners = _port_listeners()
+    except Exception as e:                                          # noqa: BLE001
+        logger.warning(f"枚举端口占用进程失败（忽略）: {e}")
+        return killed
+    for pid in listeners:
         if pid == os.getpid():
             continue
-        subprocess.run(["taskkill", "/F", "/PID", str(pid)],
-                       capture_output=True,
-                       creationflags=subprocess.CREATE_NO_WINDOW)
+        try:
+            subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                           capture_output=True,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except Exception as e:                                      # noqa: BLE001
+            logger.warning(f"清理残留进程 {pid} 失败（忽略）: {e}")
+            continue
         killed.append(pid)
     return killed
 
