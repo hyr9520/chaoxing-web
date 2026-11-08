@@ -16,7 +16,8 @@
 
 | 文档 | 内容 | 什么时候看 |
 |---|---|---|
-| [docs/PITFALLS.md](docs/PITFALLS.md) | **踩坑记录 18 条 + 上线自检清单** | **换机器部署 / 接手项目，第一份读这个** |
+| **[docs/DEPLOY.md](docs/DEPLOY.md)** | **新机器部署手册**：给 AI 的提示词、部署步骤、**部署后必须补什么**（AI Key / 题库 / tikuAdapter）、自检清单 | **换电脑部署，先看这个** |
+| [docs/PITFALLS.md](docs/PITFALLS.md) | 踩坑记录 18 条（现象→根因→修法）+ 上线自检命令 | 遇到怪问题先查这里 |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 进程模型、代码分层、两条答题通道、答案优先级、考试状态机、数据流 | 要改代码前 |
 
 > `docs/` 里的文档**全部脱敏**（无账号、姓名、学校、密钥）。
